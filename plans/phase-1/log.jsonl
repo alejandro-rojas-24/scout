@@ -1,3 +1,5 @@
 {"ts":"2026-09-28T01:23:44Z","agent":"orchestrator","model":"opus","step":"PLAN","task_id":null,"status":"spawn","note":"spawn planner round 1; repo empty"}
 {"ts":"2026-09-28T01:37:34Z","agent":"planner","model":"opus","step":"PLAN","task_id":null,"status":"done","note":"plan.md + T001-T015 + later.md; HF hosts blocked by proxy (CONNECT 403), pins deferred to EXIT"}
 {"ts":"2026-09-28T01:37:34Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"validator round 1, fresh context: context + plan.md + tasks only"}
+{"ts":"2026-09-28T01:41:58Z","agent":"validator","model":"opus","step":"VALIDATE","task_id":null,"status":"REVISE","note":"round 1: 0 blocker, 5 major, 10 minor"}
+{"ts":"2026-09-28T01:41:58Z","agent":"orchestrator","model":"opus","step":"REVISE","task_id":null,"status":"handoff","note":"round 1 findings -> planner"}
