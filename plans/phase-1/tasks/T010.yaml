@@ -1,0 +1,75 @@
+id: T010
+title: Scan orchestration - intake for hub/local, sharded, multi-component, MoE, with staged log and atomic output
+depends_on: [T005, T009]
+files:
+  - scout/scan.py
+  - tests/test_scan.py
+route: opus
+spec_complete: true
+interface: |
+  scout/scan.py:
+    @dataclass(frozen=True)
+    class ScanResult:
+        cards: list[CardPaths]; totals: dict[str, int]; elapsed_s: float; revision_sha: str; repo: str
+
+    def parse_target(target: str) -> tuple[str, str, str | None]
+        # ("local", abs_path, None) | ("hub", repo_id, revision_or_None)
+    def make_source(target: str, log: ByteLog, *, client: httpx.Client | None = None,
+                    endpoint: str | None = None, token: str | None = None) -> Source
+    def scan(target: str, out_dir: pathlib.Path, log: ByteLog, *, client: httpx.Client | None = None,
+             endpoint: str | None = None, token: str | None = None, max_workers: int = 8) -> ScanResult
+behavior: |
+  parse_target:
+    1. If os.path.isdir(target) -> ("local", str(Path(target).resolve()), None).
+    2. Else split on the LAST "@": repo, rev (rev None if there is no "@" or it is empty). repo must match
+       scout.hub.REPO_RE, else ValueError(f"not a directory or owner/name[@rev]: {target}").
+  scan:
+    1. t0 = time.monotonic(); scanned_at = UTC now, ISO-8601 with "Z". log.stage(RESOLVE); source = make_source(...); source.resolve().
+       files = {f.path: f.size}.
+    2. Units: if "model_index.json" in files: pipeline = parse_model_index(source.read_file("model_index.json"))
+       (ValueError -> ScoutError). For each component, in order: try select_weight_files(file list, comp.name)
+       -> unit (comp.name, selection) and comp.has_weights = True. On NoSafetensorsError: has_weights False, and if
+       any weight-extension file exists in that dir, add warning f"{name}: non-safetensors weights skipped" to that
+       pipeline's warnings list (carried into each Card's structure.warnings). AmbiguousWeightsError propagates.
+       If no component has weights -> NoSafetensorsError("pipeline has no safetensors components").
+       If there is no model_index.json: one unit (None, select_weight_files(files, "")) with pipeline None.
+    3. For each unit with index_path: raw = source.read_file(index_path); (shard_files, total) = parse_index(raw, subdir).
+       Every shard must be in files, else ScoutError(f"index lists missing file {f}"). Units without an index have
+       shard_files = [single_path] and total None. Still in RESOLVE.
+    4. log.stage(HEADERS). Read every header of every unit concurrently: ThreadPoolExecutor(max_workers), submit
+       read_header(source, f, files[f]) for all files, and collect with as_completed. On the first exception,
+       cancel the pending futures, wait for the running ones, and re-raise.
+    5. log.stage(META). model_card = parse_model_card(source.read_file("README.md")), read once.
+       Per unit: cfg_path = "config.json" if subdir == "" else f"{subdir}/config.json";
+       config = parse_config(source.read_file(cfg_path), cfg_path).
+    6. Per unit: structure = analyze(all tensors of the unit's headers); append the pipeline warnings. If total is not None
+       and sum nbytes != total, append warning f"index total_size {total} != tensor bytes {s}".
+    7. log.stage(REPORT). Build ALL BuiltCards in memory first (elapsed_s = monotonic - t0 at build time). Then call write_card
+       for each and log.note("card_written", str(json_path)) after each. If any write fails, delete the cards already written
+       by this scan (both files), then re-raise.
+    8. Return ScanResult(totals=log.totals, ...). Close the HubSource if scan created its client.
+    9. On any exception before step 7, no file is created under out_dir. log.note("error", f"{type(e).__name__}: {e}") is
+       emitted, then re-raise. Never catch WeightReadRefused/ReadThresholdExceeded to continue.
+decisions: []
+acceptance:
+  tests:
+    - "Hub tests use FakeHub + client=hub.client(), endpoint=HUB; local tests use tmp dirs; all offline"
+    - "test_scan_dense_sharded_hub: write_dense_repo(n_shards=3) -> 1 card; n_tensors/params match the fixture; totals.weight == 0; totals.header == sum(8+N); every fakehub.cdn_reads range ends <= 8+N of its file; the stage_start order is RESOLVE,HEADERS,META,REPORT"
+    - "test_scan_local_folder: same repo scanned as a local path -> revision_kind local-content-hash, key.repo startswith 'local:', weight 0"
+    - "test_scan_moe: write_moe_repo -> expert_groups[0].n_experts == 4; stacks[0].block_moe all True"
+    - "test_scan_pipeline: write_pipeline_repo -> exactly 3 cards (text_encoder, transformer, vae); pipeline.components has scheduler/tokenizer has_weights False; text_encoder index_path 'text_encoder/model.safetensors.index.json' and index_total_size == tensor_bytes_total; transformer stack 'transformer_blocks' depth 3; all cards share revision_sha and model_card"
+    - "test_scan_no_readme: readme=None -> model_card.present False; the scan succeeds"
+    - "test_scan_gated: FakeHub gated without token -> GatedRepoError; out_dir is empty; with token -> success"
+    - "test_scan_network_retry: inject reset once on a shard -> success with a retry event"
+    - "test_scan_network_fail: inject reset times=10 on a shard -> NetworkError; out_dir empty; an error event exists"
+    - "test_scan_bin_only: a repo with config.json + pytorch_model.bin -> NoSafetensorsError; totals.weight == 0"
+    - "test_scan_threshold: ByteLog(threshold_bytes=200) on the dense repo -> ReadThresholdExceeded; out_dir empty"
+    - "test_no_extra_files: monkeypatch HOME and TMPDIR to empty tmp dirs; after the scan they are still empty and out_dir holds only *.card.json/*.tensors.parquet"
+    - "test_parse_target: table including 'Org/M@main', 'Org/M', an existing dir, and 'bad' -> ValueError"
+  commands:
+    - pytest -q tests/test_scan.py
+    - pytest -q
+out_of_scope:
+  - reuse of existing Cards/caching (Phase 4)
+  - any weight read, sampled or otherwise (Phase 2)
+invariants_touched: [1, 2, 6]

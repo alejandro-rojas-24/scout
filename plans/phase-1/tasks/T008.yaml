@@ -1,0 +1,89 @@
+id: T008
+title: Structure analysis - repeated-block stacks, MoE expert collapsing, block signatures
+depends_on: [T006]
+files:
+  - scout/structure.py
+  - tests/test_structure.py
+route: opus
+spec_complete: true
+interface: |
+  scout/structure.py:
+    EXPERT_CONTAINERS: tuple[str, ...] = ("experts",)
+    STACK_MARK = "#"
+    EXPERT_MARK = "*"
+
+    @dataclass(frozen=True)
+    class TensorPlace:
+        collapsed_name: str; stack_prefix: str | None; block_index: int | None; expert_index: int | None
+
+    @dataclass(frozen=True)
+    class Stack:
+        prefix: str; depth: int; indices: list[int]; block_params: list[int]; block_signatures: list[str]
+        block_moe: list[bool]; block_n_experts: list[int | None]
+
+    @dataclass(frozen=True)
+    class ExpertGroup:
+        template: str; n_experts: int; n_instances: int; params_per_expert: int
+        tensors_per_expert: int; homogeneous: bool
+
+    @dataclass(frozen=True)
+    class Structure:
+        stacks: list[Stack]; expert_groups: list[ExpertGroup]; places: dict[str, TensorPlace]
+        params_total: int; n_tensors: int; params_by_dtype: dict[str, int]; warnings: list[str]
+        def to_dict(self) -> dict      # {"stacks":[asdict], "expert_groups":[asdict], "warnings":[...]} (no places)
+
+    def place(name: str) -> TensorPlace          # pure, no stack-validity check (see step 4)
+    def analyze(tensors: Iterable[TensorInfo]) -> Structure
+behavior: |
+  1. Duplicate tensor names across the input -> DuplicateTensorError(name).
+  2. place(name): segs = name.split(".").
+     a. Expert: find the FIRST i with segs[i] in EXPERT_CONTAINERS and i+1 < len(segs) and segs[i+1].isdigit().
+        Then expert_index = int(segs[i+1]) and segs[i+1] = "*".
+     b. Stack: find the FIRST k with segs[k].isdigit() (the expert position is already "*"). Then
+        stack_prefix = ".".join(segs[:k]), block_index = int(segs[k]) and segs[k] = "#".
+     c. collapsed_name = ".".join(segs).
+  3. analyze: compute a place for every tensor. Candidate stacks = group by stack_prefix; a prefix is a Stack only if it
+     has >= 2 distinct block indices.
+  4. For tensors whose prefix has exactly 1 distinct index: restore the literal index in collapsed_name (replace
+     that "#" with the digit) and set stack_prefix = block_index = None in their final TensorPlace.
+     Their expert collapse is kept.
+  5. Stack fields: indices = sorted distinct; depth = len(indices);
+     block_params[i] = sum of numel over the tensors of that block;
+     block_moe[i] = any tensor in the block has expert_index is not None;
+     block_n_experts[i] = number of distinct expert indices in the block, or None if not moe.
+     block_signatures[i] = sha1 over "\n".join(sorted(set(lines))), first 12 hex chars. lines are, for each tensor
+     in the block: f"{rel}|{dtype}|{list(shape)}", where rel = the collapsed_name with the leading f"{prefix}.#." removed.
+     Per distinct expert template in the block also add f"{template_rel}|experts={n}", where template_rel = rel up to
+     and including the "*" segment. Stacks are sorted by (-sum(block_params), prefix).
+  6. Expert groups: key = the collapsed_name truncated after the "*" segment (e.g. "model.layers.#.mlp.experts.*").
+     instance key = (stack_prefix, block_index) (None, None allowed).
+     n_instances = number of distinct instance keys. Per instance, n_i = distinct expert indices.
+     n_experts = max n_i; if the n_i differ, add a warning f"{template}: expert count varies {sorted(set(n_i))}".
+     tensors_per_expert = number of distinct rel names after the "*" within the group.
+     homogeneous = every (instance, expert) has the identical set of (suffix_after_star, dtype, shape);
+     if not, add a warning f"{template}: heterogeneous experts".
+     params_per_expert = total group params // (sum over instances of n_i); if that is not an exact division,
+     homogeneous=False and add a warning. Groups are sorted by template.
+  7. params_total = sum numel; n_tensors = count; params_by_dtype = {dtype: sum numel}, sorted keys.
+  8. The module is pure: no IO, no logging.
+decisions: []
+acceptance:
+  tests:
+    - "test_place: 'model.layers.3.mlp.experts.17.up_proj.weight' -> ('model.layers.#.mlp.experts.*.up_proj.weight','model.layers',3,17); 'lm_head.weight' -> no stack"
+    - "test_dense_fixture: dense_tensors(n_layers=4): 1 stack model.layers depth 4, 1 distinct signature, no expert groups, params_total == params_of"
+    - "test_moe_fixture: moe_tensors(n_layers=3,n_experts=4,hidden=8,moe_inter=4): 1 stack depth 3; 1 group 'model.layers.#.mlp.experts.*' with n_experts 4, n_instances 3, tensors_per_expert 3, params_per_expert 3*8*4, homogeneous; block_moe all True; block_n_experts [4,4,4]"
+    - "test_nested_indices: vae names encoder.down_blocks.{0,1}.resnets.{0,1}.conv1.weight -> stack 'encoder.down_blocks' depth 2; collapsed 'encoder.down_blocks.#.resnets.0.conv1.weight' etc. (inner index stays literal)"
+    - "test_single_index_not_stack: 'visual.merger.mlp.0.weight' only -> no stack, collapsed name keeps '0'"
+    - "test_noncontiguous_indices: indices [0,2] -> depth 2, indices [0,2]"
+    - "test_heterogeneous_experts: one expert with a different shape -> homogeneous False + warning"
+    - "test_varying_expert_count: layer0 has 4 experts, layer1 has 2 -> warning, n_experts 4"
+    - "test_signature_differs: a layer with an extra bias tensor gets a different signature"
+    - "test_duplicate: DuplicateTensorError"
+    - "test_scale: moe_tensors(n_layers=48, n_experts=128, hidden=8, moe_inter=4) (18867 tensors) analyzes in < 2 s"
+  commands:
+    - pytest -q tests/test_structure.py
+    - pytest -q
+out_of_scope:
+  - fused 3-D expert tensors, shared_expert detection (later.md)
+  - dataflow inference
+invariants_touched: [6]

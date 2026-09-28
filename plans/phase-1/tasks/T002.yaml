@@ -1,0 +1,103 @@
+id: T002
+title: ByteLog, byte classification, error types
+depends_on: [T001]
+files:
+  - scout/errors.py
+  - scout/bytelog.py
+  - tests/test_bytelog.py
+route: opus
+spec_complete: true
+interface: |
+  scout/errors.py:
+    class ScoutError(Exception)                      # base; attribute exit_code: int = 1
+    class WeightReadRefused(ScoutError)              # exit_code 5
+    class ReadThresholdExceeded(ScoutError)          # exit_code 5; attrs requested:int, total:int, threshold:int
+    class StageOrderError(ScoutError)
+    class GatedRepoError(ScoutError)                 # exit_code 3
+    class RepoNotFoundError(ScoutError)              # exit_code 3
+    class RevisionMismatch(ScoutError)
+    class NetworkError(ScoutError)                   # exit_code 4
+    class RangeNotSupported(ScoutError)              # exit_code 4
+    class HeaderError(ScoutError)
+    class NoSafetensorsError(ScoutError)
+    class AmbiguousWeightsError(ScoutError)
+    class DuplicateTensorError(ScoutError)
+
+  scout/bytelog.py:
+    class Stage(enum.IntEnum): RESOLVE=1 HEADERS=2 META=3 SAMPLED_READ=4 FULL_DOWNLOAD=5 COMPUTE=6 COMPARE=7 REPORT=8 PURGE=9
+    class ByteClass(str, enum.Enum): META="meta" HEADER="header" WEIGHT="weight"
+    WEIGHT_EXTENSIONS: tuple[str, ...] = (".safetensors",".bin",".pt",".pth",".ckpt",".gguf",".h5",".msgpack",".onnx",".pb",".npz",".pkl")
+    DEFAULT_THRESHOLD_BYTES: int = 64 * 1024 * 1024
+    COUNTING: str = "http-body-bytes-yielded"
+
+    def classify_range(path: str, start: int, end_exclusive: int, header_len: int | None) -> dict[str, int]
+        # returns {"meta":a,"header":b,"weight":c}, with a+b+c == end_exclusive-start
+
+    @dataclass(frozen=True)
+    class LogEvent:
+        seq: int; ts: float; stage: str; event: str; source: str | None; path: str | None; url: str | None
+        range: tuple[int, int] | None; status: int | None; bytes: int; bytes_by_class: dict[str, int]
+        attempt: int; elapsed_ms: float; note: str | None; totals: dict[str, int]
+        def to_dict(self) -> dict          # JSON-safe; range becomes list or None
+
+    class ByteLog:
+        def __init__(self, threshold_bytes: int = DEFAULT_THRESHOLD_BYTES,
+                     on_event: Callable[[LogEvent], None] | None = None) -> None
+        threshold_bytes: int
+        @property current_stage -> Stage | None
+        @property totals -> dict[str, int]           # copy
+        @property events -> list[LogEvent]           # copy
+        def events_since(self, seq: int) -> list[LogEvent]
+        def stage(self, stage: Stage) -> LogEvent
+        def set_header_len(self, path: str, header_len: int) -> None
+        def header_len(self, path: str) -> int | None
+        def preflight(self, path: str, start: int, end_exclusive: int) -> None
+        def record(self, *, event: str, source: str | None, path: str | None, url: str | None,
+                   start: int | None, nbytes: int, status: int | None, attempt: int = 1,
+                   elapsed_ms: float = 0.0, note: str | None = None) -> LogEvent
+        def note(self, event: str, note: str, path: str | None = None) -> LogEvent   # 0-byte events: error, refused, card_written
+        def to_card_dict(self) -> dict   # {"counting": COUNTING, "threshold_bytes", "totals", "events": [e.to_dict()]}
+behavior: |
+  1. classify_range: let p = path.lower().
+     - If p ends with ".safetensors": bytes in [0,8) are header; if header_len N is not None, bytes in [8, 8+N)
+       are header and bytes >= 8+N are weight; if N is None, all bytes >= 8 are weight.
+     - Else, if p ends with any other WEIGHT_EXTENSIONS entry: all bytes are weight.
+     - Else: all bytes are meta (this includes "*.safetensors.index.json", "@api/revision" and README.md).
+     Raise ValueError if start < 0 or end_exclusive < start.
+  2. ByteLog is thread-safe: one threading.Lock guards seq, totals, events and header lens.
+     seq starts at 1 and increments per event.
+  3. stage(s): raise StageOrderError if current_stage is not None and s < current_stage. Otherwise set it and
+     emit event "stage_start" with bytes 0. Calling it again with the same stage is allowed (no-op event
+     still emitted).
+  4. preflight(path, start, end): c = classify_range(path, start, end, self.header_len(path)).
+     If c["weight"] > 0: emit a "refused" event with note f"weight bytes {c['weight']} in {path}[{start}:{end}]"
+     and raise WeightReadRefused with the same text.
+     If totals.meta + totals.header + (end-start) > threshold_bytes: emit a "refused" event with note
+     f"threshold: requested={end-start} total={t} threshold={thr} disk=0 reason=non-weight read budget"
+     and raise ReadThresholdExceeded(requested, total, threshold) with that message.
+     Preflight never records bytes.
+  5. record(...): the range is [start, start+nbytes), with start None treated as 0. Classify it with the
+     header_len known at record time; add the result to totals; build a LogEvent with stage = current_stage.name
+     (or "NONE" if no stage yet), ts = time.time(), bytes = nbytes, bytes_by_class = the classification,
+     range = (start, start+nbytes) if start is not None else None, totals = a snapshot after the update.
+     event must be "fetch" or "retry" (else ValueError). Append it and call on_event outside the lock.
+     Exceptions raised by on_event propagate.
+  6. note(event, note, path): event must be in {"error","refused","card_written"}; emits a 0-byte event.
+  7. to_card_dict returns JSON-serializable data only.
+decisions: []
+acceptance:
+  tests:
+    - "classify_range table: safetensors with N=None: [0,8)->header 8, [0,16)-> header 8 + weight 8; with N=100: [8,108) all header, [100,120) -> header 8 + weight 12; model.bin [0,4) -> weight 4; config.json -> meta; model.safetensors.index.json -> meta; MODEL.SAFETENSORS is treated case-insensitively"
+    - "preflight raises WeightReadRefused for ('a.safetensors', 8, 9) before set_header_len, and does not after set_header_len(…, 1); a refused event is logged and totals are unchanged"
+    - "threshold: ByteLog(threshold_bytes=100); record 90 meta bytes; preflight of 11 bytes raises ReadThresholdExceeded with requested/total/threshold attrs; preflight of 10 passes"
+    - "stage order: HEADERS then RESOLVE raises StageOrderError; RESOLVE, HEADERS, META, REPORT succeeds"
+    - "thread safety: 8 threads x 1000 record() calls of 1 meta byte -> totals.meta == 8000, seqs unique and contiguous 1..N"
+    - "record of a mixed range counts weight honestly (weight > 0 in totals); record never raises on weight"
+    - "on_event receives every event in order; to_card_dict round-trips through json.dumps"
+  commands:
+    - pytest -q tests/test_bytelog.py
+    - pytest -q
+out_of_scope:
+  - any network or file IO
+  - interactive confirmation (Phase 2 download gate)
+invariants_touched: [1, 2]

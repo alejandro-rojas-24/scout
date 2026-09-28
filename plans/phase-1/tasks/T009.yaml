@@ -1,0 +1,80 @@
+id: T009
+title: Card v0 - build, atomic write (JSON + Parquet), load
+depends_on: [T002, T006, T007, T008]
+files:
+  - scout/card.py
+  - tests/test_card.py
+  - tests/helpers/cards.py
+route: opus
+spec_complete: true
+interface: |
+  scout/card.py:
+    SCHEMA_VERSION = "card.v0"
+    STATS_SLOTS: tuple[str, ...] = ("tensor_stats", "spectral_topk", "sigma_curves", "tokenizer_minhash", "attribution")
+    PARQUET_SCHEMA: pyarrow.Schema   # exactly the columns and types of plan.md section 4.3, in that order
+    NULL_STAT_COLUMNS: tuple[str, ...] = ("stat_mean", "stat_std", "stat_fro_norm", "stat_spectral_topk", "stat_sigma_curve")
+
+    @dataclass(frozen=True)
+    class CardPaths:
+        json_path: pathlib.Path; parquet_path: pathlib.Path
+
+    @dataclass(frozen=True)
+    class BuiltCard:
+        card: dict; table: pyarrow.Table; paths: CardPaths    # paths are the target locations (not yet written)
+
+    def repo_slug(repo: str) -> str
+    def component_slug(component: str | None) -> str
+    def card_paths(out_dir: pathlib.Path, repo: str, revision_sha: str, component: str | None) -> CardPaths
+    def build_card(*, source: Source, component: str | None, pipeline: PipelineInfo | None,
+                   config: ConfigInfo, model_card: ModelCardInfo, headers: list[SafetensorsHeader],
+                   file_sizes: dict[str, int | None], index_path: str | None, index_total_size: int | None,
+                   structure: Structure, log: ByteLog, scanned_at: str, elapsed_s: float,
+                   out_dir: pathlib.Path) -> BuiltCard
+    def write_card(built: BuiltCard) -> CardPaths
+    def load_card(json_path: pathlib.Path) -> tuple[dict, pyarrow.Table]
+behavior: |
+  1. repo_slug: for "local:<abs>" -> "local__" + re.sub(r"[^A-Za-z0-9._-]", "_", abs.strip("/")); otherwise repo.replace("/", "__").
+     component_slug(None) = "_model", else the component name.
+     card_paths = out_dir/repo_slug/revision_sha/f"{slug}.card.json" and f"{slug}.tensors.parquet".
+  2. build_card produces a dict with EXACTLY the keys of plan.md section 4.2, in that order:
+     - key {repo: source.repo, revision_sha, component}
+     - source {kind, requested_revision, revision_kind, local_path, endpoint}
+     - scan {scanned_at, scout_version: scout.__version__, elapsed_s}
+     - model_card = model_card.to_dict(); config = config.to_dict(); pipeline = pipeline.to_dict() or None
+     - weights: format "safetensors", index_path, index_total_size; files sorted by path, each
+       {path, size_bytes: file_sizes.get(path), header_len, data_bytes, n_tensors, metadata};
+       n_tensors, params_total, params_by_dtype (from structure); tensor_bytes_total = sum nbytes
+     - structure = structure.to_dict()
+     - stats = {slot: None for slot in STATS_SLOTS}
+     - fetch_log = log.to_card_dict() (snapshot at build time)
+     - tensors_parquet = parquet_path.name
+     The card must json.dumps without a custom encoder.
+  3. Table rows: one per tensor across all headers, sorted by (file, data_begin). Columns per PARQUET_SCHEMA:
+     repo, revision_sha, component ("" if None), name, collapsed_name/stack_prefix/block_index/expert_index from
+     structure.places[name], file, dtype, shape (list), numel, nbytes, data_begin, data_end; all stat_* are null.
+     Build it with pyarrow.Table.from_pydict(..., schema=PARQUET_SCHEMA). Then replace the schema metadata with
+     {b"schema_version", b"repo", b"revision_sha", b"component"} (component "" for None).
+  4. write_card: mkdir parents. Write JSON (indent=2, ensure_ascii=False, UTF-8) to f"{json_path}.tmp-{pid}", then
+     os.replace. Write parquet (pyarrow.parquet.write_table, compression "zstd") to a temp name, then os.replace.
+     Parquet first, then JSON, so a JSON file never points at a missing parquet. On any exception, remove the temp
+     files and re-raise. Write nothing else, anywhere.
+  5. load_card: json.load plus pyarrow.parquet.read_table(json_path.parent / card["tensors_parquet"]). Raise ScoutError if
+     schema_version != "card.v0".
+decisions: []
+acceptance:
+  tests:
+    - "tests/helpers/cards.py: def build_fixture_card(root: Path, out_dir: Path, component: str | None = None) -> BuiltCard. It uses LocalSource + ByteLog (stages RESOLVE, HEADERS, META, REPORT) + select_weight_files/parse_index + read_header + parse_config/parse_model_card + analyze + build_card, with no scan.py. T011 reuses it."
+    - "test_keys_exact: set(card) == the set from plan 4.2; key/weights/structure subkeys exact; stats values all None"
+    - "test_parquet_schema: table.schema equals PARQUET_SCHEMA (ignoring metadata); rows == n_tensors; every stat column null_count == num_rows; metadata contains schema_version card.v0"
+    - "test_paths: hub repo 'Org/M' + sha -> out/Org__M/<sha>/_model.card.json; a component 'vae' -> vae.card.json; local slug has no '/'"
+    - "test_roundtrip: write_card then load_card gives an equal dict and an equal table"
+    - "test_atomic: monkeypatch pq.write_table to raise -> no files left under out_dir (glob '**/*' has no files)"
+    - "test_fetch_log_embedded: card['fetch_log']['totals']['weight'] == 0 and events non-empty, with counting 'http-body-bytes-yielded'"
+    - "test_only_card_files: after write_card, out_dir holds exactly 2 files"
+  commands:
+    - pytest -q tests/test_card.py
+    - pytest -q
+out_of_scope:
+  - Card cache/store and dedup (Phase 4)
+  - filling any stats slot
+invariants_touched: [1, 2]

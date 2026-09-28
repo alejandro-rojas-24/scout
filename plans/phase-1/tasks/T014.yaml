@@ -1,0 +1,48 @@
+id: T014
+title: Frontend - no-build page with live byte log, graph view and depth strips (D1)
+depends_on: [T013]
+files:
+  - scout/web/index.html
+  - scout/web/app.js
+  - tests/test_web_static.py
+route: opus
+spec_complete: false      # visual layout choices are left to the implementer; record them in decisions
+interface: |
+  scout/web/index.html: a single page; the required element ids are
+    #target (input), #scan (button), #status, #counter-meta, #counter-header, #counter-weight, #log (scrolling list),
+    #cards (container with one section per view)
+  scout/web/app.js: plain ES2020, no imports, no external URLs, no build step. Exposes nothing global except via an IIFE.
+  Talks only to POST /api/scans and GET /api/scans/{id}?since=N (T013).
+behavior: |
+  1. Clicking Scan (or pressing Enter in #target) POSTs {"target"}. On 202 it polls GET /api/scans/{id}?since=lastSeq every 250 ms
+     until status is done or error. Each new event is appended to #log using the same one-line format as the CLI's
+     format_event; the log auto-scrolls. #status shows running/done/error, elapsed_s (1 decimal) and the error message.
+  2. The byte counter shows totals.meta, totals.header and totals.weight from each poll. #counter-weight gets class "nonzero"
+     (red) if weight > 0, else "zero" (green) and the text "weight 0 B". The counter is visible from the first poll.
+  3. For each view in views (on done), render a section containing:
+     a. The title, and a "claimed by model card" box: base_model (list), license, tags, pipeline_tag; "no model card" if
+        present is false.
+     b. A summary line: params_total (human units: K/M/B with 2 decimals), n_tensors, number of stacks and expert groups,
+        weight bytes read.
+     c. Depth strips: one SVG per strip, one rect per cell. Width is proportional to the available width, with a minimum of
+        4 px per cell. Fill is by signature: the most common signature is neutral grey; the others get distinct hues from a
+        fixed 8-colour list. MoE cells get a hatch/marker. Tooltip (<title>): index, params, signature, n_experts. Label "prefix · depth".
+     d. The graph: an SVG left-to-right tree built from nodes (parent links). x = depth * 180 px; y = the leaf order * 22 px.
+        Stack and expert_group nodes are drawn with a double outline and their "×N" label. "tensor" nodes are hidden by default
+        behind a "show tensors" checkbox (their shape/dtype goes in <title>). Clicking a module node collapses or expands its
+        subtree. The SVG scrolls inside its container; there is no page-level horizontal scroll.
+  4. Plain CSS in index.html. Must honour prefers-color-scheme (light/dark variables). No external fonts or CDNs.
+  5. All text is inserted with textContent (no innerHTML with data), because tensor names come from untrusted headers.
+acceptance:
+  tests:
+    - "tests/test_web_static.py: index.html contains every required id; app.js contains '/api/scans' and 'since='; neither file contains 'http://' or 'https://' (except the SVG namespace 'http://www.w3.org/2000/svg'); app.js does not contain 'innerHTML'"
+    - "served through make_server (from T013) GET / -> 200 and GET /app.js -> 200 application/javascript"
+  commands:
+    - pytest -q tests/test_web_static.py
+    - pytest -q
+  manual:
+    - "scout serve; scan a local write_moe_repo fixture dir; confirm: live log lines appear, weight counter 'weight 0 B' green, 'layers ×N' and 'experts ×4' nodes, one depth strip; screenshot noted in log.jsonl"
+out_of_scope:
+  - diff view, attribution colouring, any npm/build tooling, JS unit test frameworks
+invariants_touched: [2, 5]
+decisions: []

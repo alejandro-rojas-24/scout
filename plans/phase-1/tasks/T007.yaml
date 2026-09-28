@@ -1,0 +1,78 @@
+id: T007
+title: Model card, config and model_index parsing
+depends_on: [T001]
+files:
+  - scout/metadata.py
+  - tests/test_metadata.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/metadata.py:
+    @dataclass(frozen=True)
+    class ModelCardInfo:
+        present: bool; base_model: list[str]; base_model_relation: str | None; license: str | None
+        license_name: str | None; tags: list[str]; pipeline_tag: str | None; library_name: str | None
+        parse_error: str | None
+        def to_dict(self) -> dict        # asdict + {"claimed": True}
+
+    @dataclass(frozen=True)
+    class ConfigInfo:
+        present: bool; path: str; model_type: str | None; architectures: list[str]; class_name: str | None
+        raw: dict | None; parse_error: str | None
+        def to_dict(self) -> dict
+
+    @dataclass
+    class PipelineComponent:
+        name: str; library: str | None; class_name: str | None; has_weights: bool = False
+
+    @dataclass
+    class PipelineInfo:
+        pipeline_class: str | None; components: list[PipelineComponent]
+        model_index_path: str = "model_index.json"
+        def to_dict(self) -> dict
+
+    def parse_model_card(raw: bytes | None) -> ModelCardInfo
+    def parse_config(raw: bytes | None, path: str) -> ConfigInfo
+    def parse_model_index(raw: bytes) -> PipelineInfo
+behavior: |
+  parse_model_card:
+    1. raw None -> ModelCardInfo(present=False, base_model=[], relation None, license None, license_name None,
+       tags [], pipeline_tag None, library_name None, parse_error None).
+    2. text = raw.decode("utf-8", errors="replace").lstrip("﻿"). lines = text.splitlines().
+       If the first non-empty line.strip() != "---": present=True, all fields empty, parse_error=None (no front matter).
+       Otherwise the front matter is the lines up to the next line whose .strip() == "---". If there is none:
+       parse_error="unterminated front matter".
+    3. data = yaml.safe_load(front matter). On a YAMLError or a non-dict: present=True, empty fields,
+       parse_error=f"{type(e).__name__}: {e}" or "front matter is not a mapping".
+    4. base_model: str -> [s.strip()]; list -> [str(x).strip() for x in the list if x is not None]; else [].
+       tags: list -> [str(x) for x]; str -> [s]; else [].
+       license, license_name, pipeline_tag, library_name, base_model_relation: str(v) if v is not None, else None.
+       If license is a list, join with ",".
+    5. Values are recorded verbatim as claims. Nothing is verified.
+  parse_config(raw, path):
+    1. None -> present=False, empty. JSON error or non-dict -> present=True, parse_error set, raw None.
+    2. model_type = raw.get("model_type"); architectures = list of str (else []); class_name = raw.get("_class_name").
+  parse_model_index(raw):
+    1. j = json.loads(raw). On a JSON error or a non-dict, raise ValueError(f"model_index.json: {e}"). Do not import
+       scout.errors; T010 wraps this in ScoutError.
+       pipeline_class = j.get("_class_name").
+    2. For key, value in j.items() in file order: skip keys starting with "_". If value is a list of length 2 and
+       both entries are None -> skip. If it is a list of length 2 -> PipelineComponent(key, value[0], value[1]).
+       Otherwise skip.
+acceptance:
+  tests:
+    - "test_card_full: DEFAULT_README from st_fixtures -> license apache-2.0, base_model ['Org/Base-Model'], tags ['test']"
+    - "test_card_base_model_str: 'base_model: Org/X' -> ['Org/X']"
+    - "test_card_missing: None -> present False"
+    - "test_card_no_front_matter: '# hi' -> present True, parse_error None, empty fields"
+    - "test_card_bad_yaml: '---\\n: [\\n---' -> parse_error set, no exception"
+    - "test_card_lying_base_model: the value is preserved verbatim; to_dict()['claimed'] is True"
+    - "test_config: Qwen-like and diffusers-like (_class_name) configs; invalid JSON"
+    - "test_model_index: st_fixtures pipeline -> components [scheduler,text_encoder,tokenizer,transformer,vae] in order; safety_checker skipped"
+  commands:
+    - pytest -q tests/test_metadata.py
+    - pytest -q
+out_of_scope:
+  - verifying base_model against weights (Phase 3)
+  - tokenizer parsing (Phase 2)
+invariants_touched: [5]

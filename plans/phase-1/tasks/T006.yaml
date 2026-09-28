@@ -1,0 +1,83 @@
+id: T006
+title: Safetensors header reader + weight-file selection + index parsing
+depends_on: [T004]
+files:
+  - scout/safetensors_header.py
+  - tests/test_safetensors_header.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/safetensors_header.py:
+    MAX_HEADER_LEN: int = 100_000_000
+    DTYPE_BYTES: dict[str, int] = {"F64":8,"F32":4,"F16":2,"BF16":2,"I64":8,"I32":4,"I16":2,"I8":1,
+                                   "U64":8,"U32":4,"U16":2,"U8":1,"BOOL":1,"F8_E4M3":1,"F8_E5M2":1,"F8_E8M0":1}
+    CANONICAL_INDEX: tuple[str, ...] = ("model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json")
+    CANONICAL_SINGLE: tuple[str, ...] = ("model.safetensors", "diffusion_pytorch_model.safetensors")
+
+    @dataclass(frozen=True)
+    class TensorInfo:
+        name: str; dtype: str; shape: tuple[int, ...]; numel: int; nbytes: int
+        file: str; data_begin: int; data_end: int
+
+    @dataclass(frozen=True)
+    class SafetensorsHeader:
+        path: str; header_len: int; metadata: dict[str, str]; tensors: tuple[TensorInfo, ...]; data_bytes: int
+
+    @dataclass(frozen=True)
+    class WeightSelection:
+        index_path: str | None       # repo-relative
+        single_path: str | None      # repo-relative, set when there is no index
+
+    def read_header(source: Source, path: str, file_size: int | None) -> SafetensorsHeader
+    def select_weight_files(files: list[RepoFile], subdir: str) -> WeightSelection
+    def parse_index(raw: bytes, subdir: str) -> tuple[list[str], int | None]
+behavior: |
+  read_header:
+    1. b = source.read_range(path, 0, 8); N = int.from_bytes(b, "little").
+    2. If N == 0 or N > MAX_HEADER_LEN -> HeaderError(f"{path}: header length {N} out of range").
+       If file_size is not None and 8 + N > file_size -> HeaderError.
+    3. source.log.set_header_len(path, N)    # must happen before the next read, or preflight refuses it
+    4. hb = source.read_range(path, 8, N); header = json.loads(hb.decode("utf-8")) (on error: HeaderError). It must be a dict.
+    5. metadata = header.pop("__metadata__", {}) or {}; it must be a dict, and values are coerced with str().
+    6. For each (name, entry): require keys dtype (str), shape (list of ints >= 0), data_offsets ([b, e], ints,
+       0 <= b <= e). Otherwise HeaderError naming the tensor. numel = prod(shape) (1 for []), nbytes = e - b.
+       If dtype is in DTYPE_BYTES and nbytes != numel*DTYPE_BYTES[dtype] -> HeaderError.
+       Unknown dtypes are accepted as-is.
+    7. Sort the tensors by (data_begin, data_end, name). Contiguity: the first begin == 0 and each begin == the
+       previous end (zero-size tensors allowed); otherwise HeaderError("non-contiguous offsets").
+       data_bytes = the last end (0 if there are no tensors).
+    8. If file_size is not None and 8 + N + data_bytes != file_size -> HeaderError(f"{path}: size mismatch").
+    9. Return SafetensorsHeader with tensors in sorted order and file=path.
+  select_weight_files(files, subdir):
+    1. Consider only files directly in subdir: those whose path's parent equals subdir ("" = root, no "/" in the path).
+       Let names = the set of basenames.
+    2. First of CANONICAL_INDEX in names -> WeightSelection(index_path=join(subdir,name), single_path=None).
+    3. Else the first of CANONICAL_SINGLE in names -> WeightSelection(None, join(subdir,name)).
+    4. Else others_idx = sorted names ending ".safetensors.index.json"; if exactly 1 -> use it as the index.
+    5. Else others = sorted names ending ".safetensors"; if exactly 1 -> single.
+    6. If there are 0 index files and 0 safetensors: raise NoSafetensorsError(f"{subdir or '.'}: no safetensors;
+       found {sorted weight-extension files}"), using scout.bytelog.WEIGHT_EXTENSIONS to list them.
+    7. Else raise AmbiguousWeightsError(listing the candidates).
+    join(subdir, name) = name if subdir == "" else f"{subdir}/{name}".
+  parse_index(raw, subdir):
+    1. j = json.loads(raw); weight_map = j["weight_map"] (dict), else HeaderError.
+    2. files = sorted(set(join(subdir, v) for v in weight_map.values())).
+    3. total = j.get("metadata", {}).get("total_size"); int(total) if not None, else None.
+    4. Return (files, total).
+acceptance:
+  tests:
+    - "use LocalSource + ByteLog on fixtures from tests/helpers/st_fixtures.py"
+    - "test_read_header_ok: tensors, shapes, numel, and nbytes match the fixture spec; header_len == value returned by write_safetensors; totals.header == 8+N; totals.weight == 0"
+    - "test_size_mismatch: file_size+1 -> HeaderError"
+    - "test_corrupt_len: file whose first 8 bytes encode 2**40 -> HeaderError, and only 8 bytes were read"
+    - "test_noncontiguous: a hand-built header with a gap -> HeaderError"
+    - "test_dtype_size_mismatch: BF16 [2,2] with offsets [0,4] -> HeaderError"
+    - "test_select: tables for root index, root single, component dir with diffusion_pytorch_model.safetensors, variant-only dir with exactly 1 'model.fp16.safetensors' -> single, two variants -> Ambiguous, .bin-only -> NoSafetensorsError listing pytorch_model.bin, files in nested subdirs are ignored"
+    - "test_parse_index: files are prefixed with subdir; total_size is parsed; missing metadata -> None"
+  commands:
+    - pytest -q tests/test_safetensors_header.py
+    - pytest -q
+out_of_scope:
+  - reading tensor data (forbidden)
+  - parallelism
+invariants_touched: [2, 6]

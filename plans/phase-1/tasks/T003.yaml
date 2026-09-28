@@ -1,0 +1,63 @@
+id: T003
+title: FakeHub test transport (httpx.MockTransport emulating Hub API, resolve redirects, CDN ranges, failures)
+depends_on: [T001]
+files:
+  - tests/helpers/fakehub.py
+  - tests/test_fakehub.py
+route: sonnet
+spec_complete: true
+interface: |
+  tests/helpers/fakehub.py:
+    HUB = "https://hub.test"
+    CDN = "https://cdn.test"
+
+    class FakeHub:
+        def __init__(self) -> None
+        def add_repo(self, repo_id: str, root: pathlib.Path, sha: str = "a" * 40,
+                     gated: bool = False, token: str | None = None) -> None
+        def inject(self, path: str, mode: str, times: int = 1, after_bytes: int = 0) -> None
+            # mode in {"reset", "503", "ignore_range"}; path is repo-relative; applies to CDN requests of that path
+        def transport(self) -> httpx.MockTransport
+        def client(self) -> httpx.Client        # httpx.Client(transport=self.transport(), follow_redirects=True)
+        requests: list[httpx.Request]          # every request, in order
+        cdn_reads: list[tuple[str, str | None, int]]   # (repo-relative path, Range header or None, bytes served)
+behavior: |
+  1. add_repo stores repo_id -> (root, sha, gated, token). Files are every regular file under root
+     (recursive), relpath with "/" separators, excluding names starting with ".".
+  2. GET {HUB}/api/models/{owner}/{name}/revision/{rev} (any query string):
+     - unknown repo -> 401 JSON {"error": "Repository Not Found"}
+     - rev not in {"main", sha} -> 404 JSON {"error": "Revision Not Found"}
+     - else 200 JSON {"id": repo_id, "sha": sha, "gated": ("manual" if gated else False),
+       "siblings": [{"rfilename": rel, "size": file size} for each file sorted by rel]}
+  3. GET {HUB}/{owner}/{name}/resolve/{rev}/{path...}:
+     - unknown repo -> 401; rev != sha -> 404; file missing -> 404 JSON {"error":"Entry not found"}
+     - gated and request Authorization != f"Bearer {token}" -> 401 with header "X-Error-Code: GatedRepo"
+       and JSON {"error": "Access to model is restricted"}
+     - path ends with ".safetensors" -> 302 with Location f"{CDN}/{sha}/{path}" (a different host, so httpx
+       drops the Authorization header on redirect)
+     - otherwise serve the file from HUB directly with the same range semantics as the CDN (step 4)
+  4. GET {CDN}/{sha}/{path}: find the file by sha+path across repos (404 if missing).
+     Range header "bytes=a-b" (inclusive) -> 206, body = data[a:b+1], headers Content-Range
+     f"bytes {a}-{min(b,len-1)}/{len}" and Content-Length. No Range -> 200 full body.
+     Apply injections for this path first (each decrements `times`; drop it at 0):
+       "503": return 503 with an empty body
+       "reset": respond with status 206 and the normal headers, but a body stream (httpx.SyncByteStream subclass)
+                that yields the first `after_bytes` bytes of the would-be body and then raises
+                httpx.ReadError("connection reset")
+       "ignore_range": return 200 with the FULL file body, whatever the Range
+     Append (path, range header, bytes actually yielded or intended) to cdn_reads.
+  5. Record every request in self.requests before handling it.
+  6. Response bodies are never compressed (no Content-Encoding header).
+acceptance:
+  tests:
+    - "test_api_revision: siblings/sha/gated are correct; unknown repo 401; bad rev 404"
+    - "test_range_via_redirect: client.get(resolve url of a .safetensors, headers Range bytes=0-7) -> final 206, 8 bytes, the redirect happened (2 requests recorded), Authorization absent on the CDN request"
+    - "test_gated: 401 without token, 206 with the correct Bearer token"
+    - "test_inject_reset: streaming read raises httpx.ReadError after exactly after_bytes bytes; second request succeeds"
+    - "test_inject_ignore_range: 200 and full length"
+    - "uses tests.helpers.st_fixtures.write_dense_repo for data"
+  commands:
+    - pytest -q tests/test_fakehub.py
+out_of_scope:
+  - any scout/ production code
+invariants_touched: [2]

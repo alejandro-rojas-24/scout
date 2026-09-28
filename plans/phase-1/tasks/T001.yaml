@@ -1,0 +1,136 @@
+id: T001
+title: Project scaffold + synthetic safetensors fixture writer
+depends_on: []
+files:
+  - pyproject.toml
+  - scout/__init__.py
+  - tests/__init__.py
+  - tests/conftest.py
+  - tests/helpers/__init__.py
+  - tests/helpers/st_fixtures.py
+  - tests/test_st_fixtures.py
+  - .gitignore
+route: sonnet
+spec_complete: true
+interface: |
+  pyproject.toml:
+    [build-system] requires = ["hatchling"]; build-backend = "hatchling.build"
+    [project] name = "scout"; version = "0.1.0"; requires-python = ">=3.11"
+      dependencies = ["httpx>=0.27", "pyarrow>=15", "pyyaml>=6"]
+      [project.optional-dependencies] dev = ["pytest>=8"]
+      [project.scripts] scout = "scout.cli:main"
+    [tool.hatch.build.targets.wheel] packages = ["scout"]   # scout/web/* is included as package data
+    [tool.pytest.ini_options]
+      testpaths = ["tests"]
+      addopts = "-m 'not network'"
+      markers = ["network: requires huggingface.co access (exit check only)"]
+
+  scout/__init__.py:  __version__ = "0.1.0"
+
+  .gitignore: __pycache__/, *.egg-info/, .pytest_cache/, cards/, dist/, build/
+
+  tests/helpers/st_fixtures.py:
+    DTYPE_BYTES: dict[str, int] = {"F64":8,"F32":4,"F16":2,"BF16":2,"I64":8,"I32":4,"I16":2,"I8":1,"U8":1,"BOOL":1}
+    FILL_BYTE: int = 0xAB
+    TensorSpec = tuple[str, tuple[int, ...]]            # (dtype, shape)
+
+    def safetensors_bytes(tensors: dict[str, TensorSpec], metadata: dict[str, str] | None = None) -> bytes
+    def write_safetensors(path: pathlib.Path, tensors: dict[str, TensorSpec], metadata: dict[str, str] | None = None) -> int
+        # returns header_len N
+    def dense_tensors(n_layers: int = 2, hidden: int = 8, inter: int = 16, vocab: int = 32,
+                      heads: int = 2, kv_heads: int = 1, head_dim: int = 4, tie: bool = False,
+                      dtype: str = "BF16", prefix: str = "model") -> dict[str, TensorSpec]
+    def moe_tensors(n_layers: int = 2, n_experts: int = 4, hidden: int = 8, moe_inter: int = 4,
+                    vocab: int = 32, heads: int = 2, kv_heads: int = 1, head_dim: int = 4,
+                    dtype: str = "BF16") -> dict[str, TensorSpec]
+    def write_sharded(root: pathlib.Path, tensors: dict[str, TensorSpec], n_shards: int,
+                      stem: str = "model") -> dict
+        # returns {"files": [relnames], "header_lens": {relname: N}, "total_size": int}
+    def write_dense_repo(root: pathlib.Path, n_shards: int = 2, readme: str | None = DEFAULT_README,
+                         **dense_kwargs) -> dict
+    def write_moe_repo(root: pathlib.Path, n_shards: int = 2, readme: str | None = DEFAULT_README,
+                       **moe_kwargs) -> dict
+    def write_pipeline_repo(root: pathlib.Path, readme: str | None = DEFAULT_README) -> dict
+    def params_of(tensors: dict[str, TensorSpec]) -> int
+    DEFAULT_README: str = "---\nlicense: apache-2.0\nbase_model:\n- Org/Base-Model\ntags:\n- test\npipeline_tag: text-generation\nlibrary_name: transformers\n---\n# Test model\n"
+behavior: |
+  1. safetensors_bytes: build header dict in the INSERTION ORDER of `tensors`; for each tensor
+     nbytes = prod(shape) * DTYPE_BYTES[dtype] (prod(()) == 1); data_offsets = [cursor, cursor+nbytes];
+     cursor += nbytes. If metadata is not None add "__metadata__": metadata. Serialize with
+     json.dumps(header, separators=(",", ":")).encode("utf-8"), then right-pad with b" " until
+     len % 8 == 0. Output = N.to_bytes(8, "little") + header_bytes + bytes([FILL_BYTE]) * cursor.
+  2. write_safetensors writes those bytes and returns N (the padded header length).
+  3. dense_tensors (Qwen3-style), in this order:
+       f"{prefix}.embed_tokens.weight" (dtype,(vocab,hidden))
+       for i in range(n_layers):
+         f"{prefix}.layers.{i}.self_attn.q_proj.weight" (heads*head_dim, hidden)
+         f"{prefix}.layers.{i}.self_attn.k_proj.weight" (kv_heads*head_dim, hidden)
+         f"{prefix}.layers.{i}.self_attn.v_proj.weight" (kv_heads*head_dim, hidden)
+         f"{prefix}.layers.{i}.self_attn.o_proj.weight" (hidden, heads*head_dim)
+         f"{prefix}.layers.{i}.self_attn.q_norm.weight" (head_dim,)
+         f"{prefix}.layers.{i}.self_attn.k_norm.weight" (head_dim,)
+         f"{prefix}.layers.{i}.mlp.gate_proj.weight" (inter, hidden)
+         f"{prefix}.layers.{i}.mlp.up_proj.weight" (inter, hidden)
+         f"{prefix}.layers.{i}.mlp.down_proj.weight" (hidden, inter)
+         f"{prefix}.layers.{i}.input_layernorm.weight" (hidden,)
+         f"{prefix}.layers.{i}.post_attention_layernorm.weight" (hidden,)
+       f"{prefix}.norm.weight" (hidden,)
+       "lm_head.weight" (vocab, hidden) unless tie
+  4. moe_tensors: same as dense (prefix "model") except the three mlp.*_proj tensors per layer are
+     replaced by, in order: f"model.layers.{i}.mlp.gate.weight" (n_experts, hidden), then for
+     j in range(n_experts): f"model.layers.{i}.mlp.experts.{j}.gate_proj.weight" (moe_inter, hidden),
+     ".up_proj.weight" (moe_inter, hidden), ".down_proj.weight" (hidden, moe_inter).
+     The layernorms come after the experts.
+  5. write_sharded: split the tensor items in insertion order into n_shards contiguous chunks of
+     sizes as equal as possible (first chunks get the extra item; use divmod). If n_shards == 1 write
+     f"{stem}.safetensors" and no index. Otherwise the files are
+     f"{stem}-{k:05d}-of-{n_shards:05d}.safetensors" (k from 1), plus f"{stem}.safetensors.index.json" =
+     {"metadata": {"total_size": sum of nbytes}, "weight_map": {name: filename}} (json.dumps indent=2).
+     Create root if missing. Return the dict described in the interface (relnames relative to root,
+     excluding the index; total_size = sum of tensor nbytes).
+  6. write_dense_repo: write config.json {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],
+     "num_hidden_layers": n_layers,"hidden_size": hidden,"intermediate_size": inter,"vocab_size": vocab,
+     "num_attention_heads": heads,"num_key_value_heads": kv_heads,"head_dim": head_dim,
+     "tie_word_embeddings": tie}, plus README.md if readme is not None, plus write_sharded(stem="model").
+     Return the write_sharded dict plus {"params_total": int, "n_tensors": int, "tensors": dict}.
+  7. write_moe_repo: the same with config {"model_type":"qwen3_moe","architectures":["Qwen3MoeForCausalLM"],
+     "num_hidden_layers","hidden_size","moe_intermediate_size","num_experts": n_experts,
+     "num_experts_per_tok": 2,"vocab_size","num_attention_heads","num_key_value_heads","head_dim"}.
+  8. write_pipeline_repo(root):
+     model_index.json = {"_class_name":"TestPipeline","_diffusers_version":"0.35.0",
+       "scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"],
+       "text_encoder":["transformers","Qwen3ForCausalLM"],
+       "tokenizer":["transformers","Qwen2Tokenizer"],
+       "transformer":["diffusers","TestTransformer2DModel"],
+       "vae":["diffusers","AutoencoderKL"],
+       "safety_checker":[null,null]}
+     scheduler/scheduler_config.json = {"_class_name":"FlowMatchEulerDiscreteScheduler"}
+     tokenizer/tokenizer_config.json = {"model_max_length": 16}
+     text_encoder/: write_dense_repo(root/"text_encoder", n_shards=2, readme=None) (its config.json stays)
+     transformer/config.json = {"_class_name":"TestTransformer2DModel","num_layers":3}; tensors
+       for i in range(3): f"transformer_blocks.{i}.attn.to_q.weight" (8,8), f"transformer_blocks.{i}.attn.to_k.weight" (8,8),
+       f"transformer_blocks.{i}.ff.net.0.proj.weight" (16,8), f"transformer_blocks.{i}.ff.net.2.weight" (8,16);
+       then "proj_out.weight" (4,8); all BF16; write_sharded(stem="diffusion_pytorch_model", n_shards=1)
+     vae/config.json = {"_class_name":"AutoencoderKL"}; tensors
+       for i in range(2): for r in range(2): f"encoder.down_blocks.{i}.resnets.{r}.conv1.weight" ("F32",(4,4,3,3));
+       "decoder.conv_out.weight" ("F32",(3,4,3,3)); write_sharded(stem="diffusion_pytorch_model", n_shards=1)
+     README.md at root if readme is not None.
+     Return {"components": {"text_encoder": dict, "transformer": dict, "vae": dict}} where each dict
+     is that component's write_sharded dict plus params_total and n_tensors.
+  9. params_of = sum(prod(shape)).
+  10. tests/conftest.py: add the repo root to sys.path so `tests.helpers` imports work, and nothing else.
+acceptance:
+  tests:
+    - "tests/test_st_fixtures.py::test_roundtrip_header: parse the bytes by hand (u64 LE, json) and check that offsets are contiguous and the file length == 8+N+sum nbytes, and N % 8 == 0"
+    - "test_dense_counts: dense_tensors(n_layers=2) has 2*11+3 = 25 tensors; tie=True gives 24"
+    - "test_moe_counts: moe_tensors(n_layers=2,n_experts=4) has 2*(8+1+12)+3 = 45 tensors"
+    - "test_sharded_index: write_dense_repo(n_shards=2): index weight_map covers all tensors; total_size is correct"
+    - "test_pipeline_layout: the expected files exist; model_index.json parses"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_st_fixtures.py
+    - pytest -q
+out_of_scope:
+  - any scout/ module besides __init__.py
+  - CLI implementation (scout.cli is created in T012; the entry point may dangle until then)
+invariants_touched: [6]

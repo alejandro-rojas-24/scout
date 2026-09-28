@@ -1,0 +1,61 @@
+id: T013
+title: HTTP server (stdlib) - background scans, live log polling, views from persisted Cards
+depends_on: [T010, T011]
+files:
+  - scout/server.py
+  - scout/web/.keep
+  - tests/test_server.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/server.py:
+    POLL_EVENTS_MAX = 5000
+    class ScanState:                   # one per scan
+        scan_id: str; target: str; status: str   # "running" | "done" | "error"
+        log: ByteLog; t0: float; elapsed_s: float | None; error: dict | None; views: list[dict] | None
+    class ScoutServer(http.server.ThreadingHTTPServer):
+        out_dir: pathlib.Path; threshold_bytes: int; endpoint: str | None
+        client_factory: Callable[[], httpx.Client] | None   # tests inject FakeHub clients
+        scans: dict[str, ScanState]; lock: threading.Lock
+    def make_server(host: str = "127.0.0.1", port: int = 8765, out_dir: pathlib.Path = Path("cards"),
+                    threshold_bytes: int = DEFAULT_THRESHOLD_BYTES, endpoint: str | None = None,
+                    client_factory: Callable[[], httpx.Client] | None = None) -> ScoutServer
+    def serve(host: str, port: int, out_dir: pathlib.Path, threshold_bytes: int, endpoint: str | None) -> None  # serve_forever
+  Routes (all JSON responses have Content-Type application/json; utf-8; Cache-Control no-store):
+    GET  /                      -> scout/web/index.html (text/html; utf-8), 404 JSON if the file is missing
+    GET  /app.js                -> scout/web/app.js (application/javascript; utf-8)
+    POST /api/scans             body {"target": str} -> 202 {"scan_id": str}; 400 {"error": "..."} on a missing or invalid target
+    GET  /api/scans/{id}?since=N -> 200 {"scan_id","target","status","elapsed_s","error","totals","events":[...],"views":[...]|null}
+    other                       -> 404 {"error":"not found"}
+behavior: |
+  1. Static files are resolved through a module-level WEB_DIR = importlib.resources.files("scout").joinpath("web")
+     (scout/web is a plain data dir with no __init__.py; scout/web/.keep makes sure it exists). index.html and app.js
+     arrive in T014. The tests here monkeypatch scout.server.WEB_DIR to a tmp dir and must not depend on T014.
+  2. POST /api/scans: parse JSON; target must be a non-empty str; validate with scan.parse_target (ValueError -> 400).
+     scan_id = uuid4().hex[:12]. Create ScanState with ByteLog(threshold_bytes); status running; t0 = monotonic.
+     Start a daemon thread: client = client_factory() if set else None; result = scan(target, out_dir, log, client=client,
+     endpoint=endpoint). Then views = [build_view(*load_card(p.json_path)) for p in result.cards] (views come from the
+     PERSISTED Cards). Under the lock set views, then status "done", then elapsed_s = monotonic - t0.
+     On an exception: status "error", error {"type": type(e).__name__, "message": str(e)}, elapsed_s.
+  3. GET /api/scans/{id}: since = int(query since, default 0); events = [e.to_dict() for e in log.events_since(since)]
+     truncated to the first POLL_EVENTS_MAX; totals = log.totals; views only when status == "done", else null;
+     elapsed_s = the running value (monotonic - t0) while running. Unknown id -> 404.
+  4. Nothing is persisted by the server besides what scan() writes (Cards). No request logging to files; override
+     log_message to write to stderr only when an env var SCOUT_HTTP_LOG=1 is set, else silent.
+  5. Bind to the given host (default loopback).
+acceptance:
+  tests:
+    - "start make_server(port=0, out_dir=tmp, client_factory=lambda: hub.client(), endpoint=HUB) in a thread; use httpx against http://127.0.0.1:{server.server_port}"
+    - "test_scan_local_roundtrip: POST a local write_dense_repo dir -> poll until done (timeout 10 s) -> views length 1, views[0].summary.weight_bytes_read == 0, events non-empty with seq increasing"
+    - "test_since: a GET with since=last_seq returns only newer events"
+    - "test_hub_pipeline: FakeHub pipeline repo -> 3 views"
+    - "test_error_status: gated FakeHub repo -> status error, error.type 'GatedRepoError'"
+    - "test_bad_target: POST {'target':'nope'} -> 400"
+    - "test_static: monkeypatch the web dir to tmp files -> GET / returns 200 text/html"
+  commands:
+    - pytest -q tests/test_server.py
+    - pytest -q
+out_of_scope:
+  - auth, CORS, SSE/websockets
+  - listing or reopening old Cards (later.md)
+invariants_touched: [1, 2]
