@@ -9,3 +9,5 @@
 {"ts":"2026-09-28T01:50:57Z","agent":"orchestrator","model":"opus","step":"REVISE","task_id":null,"status":"handoff","note":"round 2 (final) findings -> planner"}
 {"ts":"2026-09-28T01:53:19Z","agent":"planner","model":"opus","step":"REVISE","task_id":null,"status":"done","note":"round 2 applied: major fixed (C0 target-set check, SDXL fallback removed), 5/6 minors accepted, CDN-location reuse rejected (later.md)"}
 {"ts":"2026-09-28T01:53:19Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"final validation (round 3), fresh context; prior validation files withheld"}
+{"ts":"2026-09-28T02:03:58Z","agent":"validator","model":"opus","step":"VALIDATE","task_id":null,"status":"REVISE","note":"round 3: 0 blocker, 1 major (exit run not bound to real Hub endpoint / fixed 10s budget / evidence), 15 minor"}
+{"ts":"2026-09-28T02:03:58Z","agent":"orchestrator","model":"opus","step":"REVISE","task_id":null,"status":"halted","note":"max 2 revise rounds reached; open disputes escalated to human; awaiting decision"}
