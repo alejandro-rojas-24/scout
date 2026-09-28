@@ -17,7 +17,7 @@ interface: |
         kind: str                   # "hub" | "local"
         repo: str                   # "owner/name" or "local:/abs/path"
         revision_sha: str
-        revision_kind: str          # "git" | "local-content-hash"
+        revision_kind: str          # "git" | "local-stat-hash"
         requested_revision: str | None
         local_path: str | None
         endpoint: str | None
@@ -32,19 +32,19 @@ interface: |
 behavior: |
   1. __init__: root = Path(root).resolve(strict=True). Raise ScoutError if it is not a directory.
      kind="local", repo=f"local:{root}", local_path=str(root), requested_revision=None, endpoint=None,
-     revision_kind="local-content-hash". revision_sha is "" until resolve().
+     revision_kind="local-stat-hash". revision_sha is "" until resolve().
   2. resolve(): walk root recursively with os.walk (sorted). Skip any directory or file whose name starts with "."
      and follow no symlinked directories. Collect RepoFile(relpath, st_size). Compute
      revision_sha = sha256("\n".join(f"{rel}\t{size}\t{st_mtime_ns}" for sorted rel).encode()).hexdigest().
      Log a "fetch" event with nbytes=0, path="@local/stat", source="local", note=f"{n} files".
      No file contents are read.
   3. read_file(path): if path is not in files() return None. Call log.preflight(path, 0, size). This raises for
-     weight-extension files and for the threshold. Then read the whole file and
+     weight-extension files and for the threshold, and returns a reservation id r. Then read the whole file and
      log.record(event="fetch", source="local", path=path, url=None, start=0, nbytes=len(data), status=None,
-     elapsed_ms=...). Return data.
+     elapsed_ms=..., release=r). Return data. On any exception, call log.release(r) (in a finally block).
   4. read_range(path, start, length): path must be in files() (else ScoutError). Call log.preflight(path, start,
-     start+length) BEFORE opening the file. open(..., "rb"); seek(start); data = f.read(length);
-     record(start=start, nbytes=len(data)). If len(data) < length raise HeaderError(f"short read {path}").
+     start+length) BEFORE opening the file (reservation r). open(..., "rb"); seek(start); data = f.read(length);
+     record(start=start, nbytes=len(data), release=r); log.release(r) in finally. If len(data) < length raise HeaderError(f"short read {path}").
      Return data.
   5. Never write any file. Never read a byte that preflight did not approve.
 decisions: []

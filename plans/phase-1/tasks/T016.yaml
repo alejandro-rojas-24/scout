@@ -1,0 +1,66 @@
+id: T016
+title: Exit expectations (C-checks + E1-E3) as pure functions, with offline pass/fail tests
+depends_on: [T011]
+files:
+  - scripts/__init__.py
+  - scripts/exit_expectations.py
+  - tests/test_exit_expectations.py
+route: sonnet
+spec_complete: true
+interface: |
+  scripts/exit_expectations.py:
+    @dataclass(frozen=True)
+    class Check:
+        target: str; name: str; expected: str; actual: str; ok: bool
+
+    @dataclass
+    class TargetResult:            # everything one exit target produced; filled by T015's runner
+        target: str; pin: str; status: str; elapsed_s: float
+        final: dict                 # the last GET /api/scans/{id} response
+        events: list[dict]          # all events (since=0) after completion
+        cards: list[dict]; tables: list[pyarrow.Table]; views: list[dict]
+        json_paths: list[pathlib.Path]; parquet_paths: list[pathlib.Path]
+        wire: list[dict]            # CountingTransport records: {method,url,orig_path,range,status,location,body_bytes}
+
+    def common_checks(r: TargetResult, budget_s: float) -> list[Check]       # C1..C11
+    def expect_qwen3_8b(r: TargetResult) -> list[Check]
+    def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]
+    def expect_qwen_image(r: TargetResult) -> list[Check]
+    DEFAULT_EXPECTATIONS: dict[str, Callable[[TargetResult], list[Check]]] = {
+        "Qwen/Qwen3-8B": expect_qwen3_8b, "Qwen/Qwen3-30B-A3B": expect_qwen3_30b_a3b, "Qwen/Qwen-Image": expect_qwen_image}
+behavior: |
+  1. Every assertion is its own Check. expected/actual are str() of the compared values. Checks NEVER raise: wrap each
+     predicate so a KeyError/IndexError/TypeError yields ok=False with actual=f"error: {type(e).__name__}: {e}".
+     Helpers: cfg(card, *keys) returns a nested config.raw lookup or raises KeyError.
+  2. common_checks, exactly per plan.md section 2:
+     C1 status == "done" and elapsed_s < budget_s.
+     C2 final["totals"]["weight"] == 0, each card fetch_log.totals.weight == 0, and sum(e.bytes_by_class.weight for events) == 0.
+     C3 sum(bytes_by_class.header over events with event == "fetch") == sum over cards, over weights.files, of (8 + header_len).
+     C4 per file: 8 + header_len + data_bytes == size_bytes (one Check per file).
+     C5 per card with index_path: tensor_bytes_total == index_total_size.
+     C6 (sanity) every json/parquet path exists and card.key.revision_sha == r.pin.
+     C7 table.num_rows == weights.n_tensors; each stat_* column null_count == num_rows; all(card.stats values is None).
+     C8 per view: count of nodes with kind != "tensor" <= 100.
+     C9 (sanity) weights.params_total == sum(table.column("numel")).
+     C10 for each wire record with orig_path ending ".safetensors": range is not None; parse "bytes=a-b"; b + 1 <= 8 + header_len
+         of that file (look up by path in the cards' weights.files); records without a Range fail.
+         Also require >= 1 such record, so the check is not vacuous.
+     C11 sum(w.body_bytes for w in wire) == final.totals.meta + final.totals.header + final.totals.weight.
+  3. expect_* implement the E1/E2/E3 tables of plan.md section 2 literally:
+     - "a stack whose prefix ends with X" means any stack in structure.stacks with prefix.endswith(X) (the "." boundary:
+       prefix == X or prefix.endswith("." + X)) whose depth equals the expected value. Also emit a Check that at least one
+       stack with that suffix exists.
+     - Qwen-Image text depth: text_config.num_hidden_layers if the "text_config" key exists and has it, else num_hidden_layers.
+     - Cards are selected by key.component; a missing component yields failing Checks, not an exception.
+acceptance:
+  tests:
+    - "tests/test_exit_expectations.py builds minimal hand-written TargetResult objects (dict cards/views, small pyarrow tables)"
+    - "for EACH of expect_qwen3_8b, expect_qwen3_30b_a3b, expect_qwen_image: a passing input -> all ok; and a failing input per checked field (parametrized: wrong depth, wrong n_experts, missing vision_config, missing component, wrong base_model, ...) -> at least that Check is not ok and nothing raises"
+    - "common_checks: a passing input; C10 fails for a record with Range end beyond 8+N and for one with no Range; C10 fails when there are no safetensors records; C11 fails when a wire byte total exceeds the ByteLog total by 1; C8 fails at 101 non-tensor nodes"
+    - "test_stack_suffix_boundary: prefix 'model.xlayers' does not match suffix 'layers'"
+  commands:
+    - pytest -q tests/test_exit_expectations.py
+    - pytest -q
+out_of_scope:
+  - network, server, CountingTransport (T015)
+invariants_touched: [2]

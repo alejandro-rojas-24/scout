@@ -1,5 +1,5 @@
 id: T005
-title: HubSource - pinned resolve, ranged reads via redirects, retries, gated handling, honest counting
+title: HubSource - pinned resolve, ranged reads with manual redirects, retries, gated handling, honest bounded counting
 depends_on: [T002, T003, T004]
 files:
   - scout/hub.py
@@ -9,7 +9,9 @@ spec_complete: true
 interface: |
   scout/hub.py:
     DEFAULT_ENDPOINT = "https://huggingface.co"
-    API_PATH = "@api/revision"                 # the logged path for the API call (classified meta)
+    API_PATH = "@api/revision"                 # logged path for the API call (classified meta)
+    REDIRECT_PATH = "@redirect"                # logged path for 3xx bodies (classified meta)
+    MAX_REDIRECTS = 5
     SHA_RE = re.compile(r"^[0-9a-f]{40}$")
     REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
@@ -30,61 +32,71 @@ interface: |
         def close(self) -> None               # closes the client only if HubSource created it
 behavior: |
   1. __init__ validates repo_id against REPO_RE (else ValueError). No network. If the client is None, create
-     httpx.Client(follow_redirects=True, timeout=timeout_s). Every request sends the headers
-     {"User-Agent": f"scout/{__version__}", "Accept-Encoding": "identity"}, plus
-     "Authorization: Bearer <token>" when a token is set. httpx strips Authorization on cross-origin redirects;
-     do not re-add it.
-  2. resolve(): GET f"{endpoint}/api/models/{repo}/revision/{quote(rev or 'main', safe='')}", params {"blobs": "true"}.
-     The call goes through _get(..., logged_path=API_PATH, start=None); classification is meta.
-     Status 401 or 404 with the body error containing "Repository Not Found" -> RepoNotFoundError(f"{repo}: not
-     found or private (HF_TOKEN {'set' if token else 'not set'})"). Status 404 otherwise -> RepoNotFoundError
-     (revision not found). 403 -> GatedRepoError. Parse JSON: revision_sha = body["sha"]. If requested_revision
-     matches SHA_RE and differs -> RevisionMismatch. files = [RepoFile(s["rfilename"], s.get("size"))] sorted.
-     Remember gated = body.get("gated") for error messages.
-  3. File URL = f"{endpoint}/{repo}/resolve/{revision_sha}/{quote(path)}". Always the resolved sha, never the
-     branch.
-  4. read_file(path): None if path is not in files. preflight(path, 0, size or 0). GET without Range, expect 200.
-     Read through _get with start=0 and expected length = size if known.
-  5. read_range(path, start, length): preflight(path, start, start+length) BEFORE any request. GET with
-     Range f"bytes={start}-{start+length-1}". Expect 206. If the final status is 200 (Range ignored): read at most
-     `length` bytes from iter_raw, count EVERYTHING yielded (a chunk may overshoot; count the whole chunk,
-     classified by position), close the response, raise RangeNotSupported. Retries must not apply to this.
-     If 206: accumulate iter_raw chunks until the stream ends; count every yielded byte.
-     If len(body) != length it is a short read (retryable).
-  6. _get(url, *, logged_path, start, expected_len, headers) implements attempts:
-     for attempt in 1..attempts: t0 = monotonic; try client.stream("GET", ...) as r:
-       - r.status_code in (401, 403) on a file URL -> GatedRepoError(f"{repo} is gated or private: accept the terms at
-         {endpoint}/{repo} and set HF_TOKEN (HF_TOKEN {'set' if token else 'not set'})"). Log a note error; no retry.
-       - 404 on a file -> ScoutError(f"missing file {path}"); no retry.
+     httpx.Client(timeout=timeout_s). Every request is sent with follow_redirects=False (per-request argument), because
+     redirects are followed manually (step 7). Base headers: {"User-Agent": f"scout/{__version__}",
+     "Accept-Encoding": "identity"}, plus "Authorization: Bearer <token>" when a token is set, but ONLY for requests
+     whose host equals the endpoint host.
+  2. resolve(): r = log.preflight(API_PATH, 0, META_MAX_BYTES). GET
+     f"{endpoint}/api/models/{repo}/revision/{quote(rev or 'main', safe='')}" with params {"blobs": "true"}, through
+     _get(logged_path=API_PATH, start=None, cap=META_MAX_BYTES, reservation=r).
+     Status 401 or 404 with a body error containing "Repository Not Found" -> RepoNotFoundError(f"{repo}: not
+     found or private (HF_TOKEN {'set' if token else 'not set'})"). Other 404 -> RepoNotFoundError (revision not found).
+     403 -> GatedRepoError. Parse JSON: revision_sha = body["sha"]. If requested_revision matches SHA_RE and differs
+     -> RevisionMismatch. files = [RepoFile(s["rfilename"], s.get("size"))], sorted.
+  3. File URL = f"{endpoint}/{repo}/resolve/{revision_sha}/{quote(path)}". Always the resolved sha, never the branch.
+  4. read_file(path): None if path is not in files. n = size if known, else META_MAX_BYTES; r = preflight(path, 0, n).
+     GET without Range, expect 200; _get(start=0, cap=n, reservation=r).
+  5. read_range(path, start, length): r = preflight(path, start, start+length) BEFORE any request. GET with
+     Range f"bytes={start}-{start+length-1}" (resent on every redirect hop); _get(start=start, cap=length, reservation=r).
+     Expect 206; the body must be exactly `length` bytes (a short body is retryable).
+     If the final status is 200 (Range ignored): read chunks from iter_raw until at least `length` bytes or EOF, then
+     close. Record ALL yielded bytes with start=0 (the body begins at file offset 0, so bytes past 8+N classify as
+     weight honestly). Raise RangeNotSupported. No retry.
+  6. _get(url, *, logged_path, start, cap, reservation, headers) runs up to `attempts` attempts:
+     for each attempt: t0 = monotonic; follow the redirect chain (step 7); then on the final response:
+       - 401/403 on a file URL -> GatedRepoError(f"{repo} is gated or private: accept the terms at {endpoint}/{repo}
+         and set HF_TOKEN (HF_TOKEN {'set' if token else 'not set'})"). log.note("error", ...). No retry.
+       - 404 on a file -> ScoutError(f"missing file {path}"). No retry.
        - 429 or >= 500 -> retryable.
-       - else stream the body counting bytes; if Content-Encoding is present and not "identity": count raw bytes,
-         then gzip-decode when it is "gzip", else NetworkError.
-       httpx.TransportError (ConnectError, ReadError, RemoteProtocolError, TimeoutException) -> retryable.
-     On a retryable failure: log.record(event="retry", start=start, nbytes=<bytes received this attempt>,
-     status=..., attempt=attempt, note=str(err)); sleep(backoff_s[min(attempt-1, len-1)]) if attempts remain.
-     On success: log.record(event="fetch", ..., url=str(final response url)).
+       - Content-Encoding present and not "identity" -> NetworkError (no decoding branch). No retry.
+       - Otherwise stream iter_raw, counting every yielded byte. If the running count exceeds `cap`, close the
+         response, record the bytes received (event "fetch", note "cap exceeded") and raise ReadThresholdExceeded.
+     httpx.TransportError (ConnectError, ReadError, RemoteProtocolError, TimeoutException) -> retryable.
+     On a retryable failure: log.record(event="retry", start=start, nbytes=<bytes received this attempt>, status=...,
+     attempt=attempt, note=str(err)); sleep(backoff_s[min(attempt-1, len-1)]) if attempts remain.
+     On success: log.record(event="fetch", ..., url=str(final url), release=reservation).
      When attempts run out: log.note("error", ...) and raise NetworkError(f"{path}: {attempts} attempts failed: {last}").
-  7. No bytes are written to disk. No huggingface_hub import.
+     In every case, log.release(reservation) in a finally block.
+  7. Manual redirects: for status in (301, 302, 303, 307, 308), read the full 3xx body and record it as
+     event "fetch", path REDIRECT_PATH, start None, url=request url, status, note=f"-> {location host}". This is meta and
+     does not use the file's reservation; it is covered by the cap check of META_MAX_BYTES per redirect body (abort
+     with ReadThresholdExceeded beyond it). Resolve Location relative to the request URL. Send the next hop with the
+     same Range header, with Authorization only if the new host equals the endpoint host. More than MAX_REDIRECTS hops
+     -> NetworkError.
+  8. No bytes are written to disk. No huggingface_hub import.
 decisions: []
 acceptance:
   tests:
     - "all tests use FakeHub (tests/helpers/fakehub.py) with endpoint=HUB, client=hub.client(), sleep=lambda s: None"
-    - "test_resolve_pins_sha: resolve('org/m', None) -> sha 'a'*40; files match the fixture; exactly 1 meta fetch event, path '@api/revision'"
+    - "test_resolve_pins_sha: resolve('org/m', None) -> sha 'a'*40; files match the fixture; exactly 1 meta fetch event with path '@api/revision'; reserved == 0 afterwards"
     - "test_unknown_revision: requested 'b'*40 on a repo with sha 'a'*40 -> FakeHub 404 -> RepoNotFoundError"
     - "test_revision_mismatch: wrap hub.transport() in an httpx.MockTransport whose handler rewrites the API JSON 'sha' to 'c'*40; requested 'a'*40 -> RevisionMismatch"
-    - "test_header_ranges: read_range(shard,0,8) then set_header_len and read_range(shard,8,N): 206; header bytes == 8+N; weight 0; fakehub.cdn_reads ranges end <= 8+N"
+    - "test_header_ranges: read_range(shard,0,8) then set_header_len and read_range(shard,8,N): 206; header bytes == 8+N; weight 0; fakehub.cdn_reads ranges end <= 8+N; 2 '@redirect' fetch events of 18 bytes each (meta)"
+    - "test_manual_redirect_auth: token='hf_x' -> the Authorization header is present on HUB requests and absent on CDN requests; the Range header is present on both hops"
     - "test_weight_refused_no_request: read_range(shard, 8+N, 1) raises WeightReadRefused and len(fakehub.requests) is unchanged"
-    - "test_retry_mid_read: inject(shard,'reset',times=1,after_bytes=3) on the header body read -> succeeds; one retry event with bytes 3 and one fetch event; totals.header == 8+N+3"
-    - "test_retry_exhausted: inject(shard,'reset',times=5,after_bytes=2) -> NetworkError; 3 retry events; 1 error event"
+    - "test_retry_mid_read: inject(shard,'reset',times=1,after_bytes=3) on the header body read -> succeeds; one retry event with bytes 3 and one fetch event; totals.header == 8+N+3; reserved == 0"
+    - "test_retry_exhausted: inject(shard,'reset',times=5,after_bytes=2) -> NetworkError; 3 retry events; 1 error event; reserved == 0"
     - "test_503_then_ok: inject('503', times=2) -> success on attempt 3"
-    - "test_range_ignored: inject('ignore_range') on read_range(shard,8,N) -> RangeNotSupported; totals count the bytes actually received (> N possible, weight > 0 allowed and visible)"
+    - "test_range_ignored: inject('ignore_range') on read_range(shard,8,N) -> RangeNotSupported; the recorded event has range starting at 0; totals.weight > 0 when the file has data beyond 8+N"
+    - "test_cap: ByteLog(threshold_bytes=64MiB); read_file('config.json') where a wrapping MockTransport drops 'size' from that sibling in the API JSON and the file body is > META_MAX_BYTES (monkeypatch scout.hub.META_MAX_BYTES and scout.bytelog.META_MAX_BYTES to 100) -> ReadThresholdExceeded; the received bytes are recorded"
     - "test_gated: add_repo(gated=True, token='hf_x'): without a token read_file('config.json') raises GatedRepoError mentioning 'HF_TOKEN not set'; with token='hf_x' it succeeds"
     - "test_repo_not_found: RepoNotFoundError"
-    - "test_env_token: monkeypatch HF_TOKEN -> the Authorization header is present on HUB requests and absent on CDN requests"
+    - "test_env_token: monkeypatch HF_TOKEN -> the Authorization header is used for HUB requests"
   commands:
     - pytest -q tests/test_hub_source.py
     - pytest -q
 out_of_scope:
-  - parallelism (T010 owns the thread pool; HubSource must simply be thread-safe to call concurrently. httpx.Client is thread-safe; keep no per-call mutable state on self except under a lock)
+  - parallelism (T010 owns the thread pool). HubSource must be safe to call concurrently; httpx.Client is thread-safe; keep no per-call mutable state on self
   - interactive download confirmation (Phase 2)
+  - gzip/br decoding
 invariants_touched: [1, 2, 6]

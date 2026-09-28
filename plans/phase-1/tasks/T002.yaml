@@ -28,6 +28,7 @@ interface: |
     class ByteClass(str, enum.Enum): META="meta" HEADER="header" WEIGHT="weight"
     WEIGHT_EXTENSIONS: tuple[str, ...] = (".safetensors",".bin",".pt",".pth",".ckpt",".gguf",".h5",".msgpack",".onnx",".pb",".npz",".pkl")
     DEFAULT_THRESHOLD_BYTES: int = 64 * 1024 * 1024
+    META_MAX_BYTES: int = 16 * 1024 * 1024      # reservation for reads of unknown length (API call, size-less files)
     COUNTING: str = "http-body-bytes-yielded"
 
     def classify_range(path: str, start: int, end_exclusive: int, header_len: int | None) -> dict[str, int]
@@ -51,10 +52,12 @@ interface: |
         def stage(self, stage: Stage) -> LogEvent
         def set_header_len(self, path: str, header_len: int) -> None
         def header_len(self, path: str) -> int | None
-        def preflight(self, path: str, start: int, end_exclusive: int) -> None
+        def preflight(self, path: str, start: int, end_exclusive: int) -> int     # returns a reservation id
+        def release(self, reservation: int) -> None                               # idempotent
+        @property reserved -> int                                                 # sum of open reservations
         def record(self, *, event: str, source: str | None, path: str | None, url: str | None,
                    start: int | None, nbytes: int, status: int | None, attempt: int = 1,
-                   elapsed_ms: float = 0.0, note: str | None = None) -> LogEvent
+                   elapsed_ms: float = 0.0, note: str | None = None, release: int | None = None) -> LogEvent
         def note(self, event: str, note: str, path: str | None = None) -> LogEvent   # 0-byte events: error, refused, card_written
         def to_card_dict(self) -> dict   # {"counting": COUNTING, "threshold_bytes", "totals", "events": [e.to_dict()]}
 behavior: |
@@ -72,14 +75,19 @@ behavior: |
   4. preflight(path, start, end): c = classify_range(path, start, end, self.header_len(path)).
      If c["weight"] > 0: emit a "refused" event with note f"weight bytes {c['weight']} in {path}[{start}:{end}]"
      and raise WeightReadRefused with the same text.
-     If totals.meta + totals.header + (end-start) > threshold_bytes: emit a "refused" event with note
+     Under the lock, atomically: t = totals.meta + totals.header + reserved. If t + (end-start) > threshold_bytes:
+     emit a "refused" event with note
      f"threshold: requested={end-start} total={t} threshold={thr} disk=0 reason=non-weight read budget"
-     and raise ReadThresholdExceeded(requested, total, threshold) with that message.
-     Preflight never records bytes.
+     and raise ReadThresholdExceeded(requested, t, threshold) with that message. Otherwise create a reservation of
+     (end-start) bytes, keyed by an incrementing int id, and return the id.
+     Preflight never records bytes. The weight check happens first and creates no reservation.
+     release(id) removes the reservation if it is still open (unknown or already released ids are a no-op).
+     Callers must release on every exit path (success via record(release=id), failure via release(id) in finally).
   5. record(...): the range is [start, start+nbytes), with start None treated as 0. Classify it with the
      header_len known at record time; add the result to totals; build a LogEvent with stage = current_stage.name
      (or "NONE" if no stage yet), ts = time.time(), bytes = nbytes, bytes_by_class = the classification,
      range = (start, start+nbytes) if start is not None else None, totals = a snapshot after the update.
+     If release is not None, the reservation is removed in the same critical section as the totals update.
      event must be "fetch" or "retry" (else ValueError). Append it and call on_event outside the lock.
      Exceptions raised by on_event propagate.
   6. note(event, note, path): event must be in {"error","refused","card_written"}; emits a 0-byte event.
@@ -90,6 +98,8 @@ acceptance:
     - "classify_range table: safetensors with N=None: [0,8)->header 8, [0,16)-> header 8 + weight 8; with N=100: [8,108) all header, [100,120) -> header 8 + weight 12; model.bin [0,4) -> weight 4; config.json -> meta; model.safetensors.index.json -> meta; MODEL.SAFETENSORS is treated case-insensitively"
     - "preflight raises WeightReadRefused for ('a.safetensors', 8, 9) before set_header_len, and does not after set_header_len(…, 1); a refused event is logged and totals are unchanged"
     - "threshold: ByteLog(threshold_bytes=100); record 90 meta bytes; preflight of 11 bytes raises ReadThresholdExceeded with requested/total/threshold attrs; preflight of 10 passes"
+    - "reservation race: ByteLog(threshold_bytes=400); 8 threads start behind a threading.Barrier and each call preflight('c.json', 0, 100) without releasing -> exactly 4 succeed, 4 raise ReadThresholdExceeded; reserved == 400; after release of all ids reserved == 0"
+    - "record(release=id) frees the reservation; release is idempotent"
     - "stage order: HEADERS then RESOLVE raises StageOrderError; RESOLVE, HEADERS, META, REPORT succeeds"
     - "thread safety: 8 threads x 1000 record() calls of 1 meta byte -> totals.meta == 8000, seqs unique and contiguous 1..N"
     - "record of a mixed range counts weight honestly (weight > 0 in totals); record never raises on weight"

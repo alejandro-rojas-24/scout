@@ -33,8 +33,9 @@ behavior: |
      - unknown repo -> 401; rev != sha -> 404; file missing -> 404 JSON {"error":"Entry not found"}
      - gated and request Authorization != f"Bearer {token}" -> 401 with header "X-Error-Code: GatedRepo"
        and JSON {"error": "Access to model is restricted"}
-     - path ends with ".safetensors" -> 302 with Location f"{CDN}/{sha}/{path}" (a different host, so httpx
-       drops the Authorization header on redirect)
+     - path ends with ".safetensors" -> 302 with Location f"{CDN}/{sha}/{path}" and the non-empty body
+       b"Found. Redirecting" (18 bytes), so tests can check that 3xx bodies are counted. It is a different host, so
+       the client must drop the Authorization header when it follows.
      - otherwise serve the file from HUB directly with the same range semantics as the CDN (step 4)
   4. GET {CDN}/{sha}/{path}: find the file by sha+path across repos (404 if missing).
      Range header "bytes=a-b" (inclusive) -> 206, body = data[a:b+1], headers Content-Range
@@ -51,7 +52,8 @@ behavior: |
 acceptance:
   tests:
     - "test_api_revision: siblings/sha/gated are correct; unknown repo 401; bad rev 404"
-    - "test_range_via_redirect: client.get(resolve url of a .safetensors, headers Range bytes=0-7) -> final 206, 8 bytes, the redirect happened (2 requests recorded), Authorization absent on the CDN request"
+    - "test_range_via_redirect: client.get(resolve url of a .safetensors, headers Range bytes=0-7) -> final 206, 8 bytes, the redirect happened (2 requests recorded), Authorization absent on the CDN request (httpx auto-redirect)"
+    - "test_redirect_body: client.get(..., follow_redirects=False) -> 302, 18-byte body, Location on CDN host"
     - "test_gated: 401 without token, 206 with the correct Bearer token"
     - "test_inject_reset: streaming read raises httpx.ReadError after exactly after_bytes bytes; second request succeeds"
     - "test_inject_ignore_range: 200 and full length"

@@ -8,18 +8,28 @@ route: sonnet
 spec_complete: true
 interface: |
   scout/view.py:
+    DISCLAIMERS: tuple[str, str, str] = (
+        "Distillation is invisible to weight forensics: a model trained on another model's outputs leaves no trace in its weights.",
+        "Tokenizer reuse alone is not proof of derivation.",
+        "Licensing is a human decision: scout shows the license claimed by the model card and does not judge compliance.",
+    )
     def build_view(card: dict, table: pyarrow.Table) -> dict     # schema of plan.md section 4.4
 behavior: |
-  1. Segment rule: split each collapsed_name on "."; then merge every "#" or "*" segment into the previous segment as
-     f"{prev}[#]" / f"{prev}[*]" (e.g. ["model","layers[#]","mlp","experts[*]","up_proj","weight"]).
+  1. Segment rule: split each collapsed_name on "."; then merge every "#" or "*" segment, AND every remaining all-digit
+     segment, into the previous segment as f"{prev}[#]" / f"{prev}[*]" / f"{prev}[#]"
+     (e.g. ["model","layers[#]","mlp","experts[*]","up_proj","weight"];
+     "decoder.up_blocks.#.resnets.2.conv1.weight" -> ["decoder","up_blocks[#]","resnets[#]","conv1","weight"]).
+     While doing this, remember for each node id ending in "[#]" that came from a literal digit (an "inner stack") the set
+     of distinct literal indices seen for it.
   2. Nodes: a root node id "" with kind "root", parent None, label = card.key.component or card.key.repo.
      For each row, for each prefix length L = 1..len(segs), node id = ".".join(segs[:L]) and parent = the id of L-1 ("" for L=1).
      Every node on the path adds the row's numel to params (so the root's params == the sum of all numel).
   3. kind: if the last segment ends with "[#]" -> "stack"; if it ends with "[*]" -> "expert_group"; if the id is a full row path
      (a leaf) -> "tensor"; else "module". A leaf id that is also a prefix of another row stays "module".
-  4. count: stack -> the depth of the Card stack whose prefix == the stack_prefix of the rows under it (use the row's
-     stack_prefix column); expert_group -> the n_experts of the Card expert_group whose template equals the collapsed_name
-     prefix up to and including "*"; else 1.
+  4. count: a Card stack node ("#" from collapsed_name) -> the depth of the Card stack whose prefix == the row's
+     stack_prefix; an inner stack node (from a literal digit) -> the number of distinct literal indices seen for that node
+     id; expert_group -> the n_experts of the Card expert_group whose template equals the collapsed_name prefix up to
+     and including "*"; else 1. Both kinds of "[#]" nodes have kind "stack".
   5. label: the last segment with "[#]" replaced by f" ×{count}" and "[*]" by f" ×{count}" (U+00D7).
   6. shape/dtype: for tensor nodes, the shape (list) and dtype of the first row (by table order); if rows under the same leaf
      disagree on shape, shape = None and dtype = "varies". None for non-tensor nodes.
@@ -28,7 +38,8 @@ behavior: |
      params: block_params[i], signature: block_signatures[i], moe: block_moe[i], n_experts: block_n_experts[i]}]}.
   9. summary: params_total, n_tensors from weights; n_stacks, n_expert_groups from structure; weight/header/meta bytes
      from fetch_log.totals.
-  10. card_key = card.key; model_card = card.model_card; title = f"{repo}@{revision_sha[:12]}" + (f" / {component}" if component).
+  10. disclaimers = list(DISCLAIMERS), always present.
+  10b. card_key = card.key; model_card = card.model_card; title = f"{repo}@{revision_sha[:12]}" + (f" / {component}" if component).
   11. Pure function; the output must json.dumps.
 acceptance:
   tests:
@@ -38,6 +49,8 @@ acceptance:
     - "test_strips: cells length == depth; moe flags copied"
     - "test_collapse_scale: moe_tensors(n_layers=48, n_experts=128, hidden=8, moe_inter=4) -> len(nodes) <= 100 and exactly 1 expert_group with count 128"
     - "test_json: json.dumps(view) works"
+    - "test_disclaimers: view['disclaimers'] == list(DISCLAIMERS) and has 3 entries mentioning 'Distillation', 'Tokenizer', 'Licensing'"
+    - "test_wan_vae_bound: the write_pipeline_repo vae card -> the node 'decoder.up_blocks[#].resnets[#]' exists with kind stack and count 3; the number of nodes with kind != 'tensor' is <= 100 (and < 40 for the fixture); root params == params_total"
   commands:
     - pytest -q tests/test_view.py
     - pytest -q

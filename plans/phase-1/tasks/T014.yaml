@@ -20,6 +20,8 @@ behavior: |
   2. The byte counter shows totals.meta, totals.header and totals.weight from each poll. #counter-weight gets class "nonzero"
      (red) if weight > 0, else "zero" (green) and the text "weight 0 B". The counter is visible from the first poll.
   3. For each view in views (on done), render a section containing:
+     a0. The view's `disclaimers` (3 strings), shown as a visible note block at the top of EVERY view section (not collapsed,
+        not only in a tooltip).
      a. The title, and a "claimed by model card" box: base_model (list), license, tags, pipeline_tag; "no model card" if
         present is false.
      b. A summary line: params_total (human units: K/M/B with 2 decimals), n_tensors, number of stacks and expert groups,
@@ -29,19 +31,19 @@ behavior: |
         fixed 8-colour list. MoE cells get a hatch/marker. Tooltip (<title>): index, params, signature, n_experts. Label "prefix · depth".
      d. The graph: an SVG left-to-right tree built from nodes (parent links). x = depth * 180 px; y = the leaf order * 22 px.
         Stack and expert_group nodes are drawn with a double outline and their "×N" label. "tensor" nodes are hidden by default
-        behind a "show tensors" checkbox (their shape/dtype goes in <title>). Clicking a module node collapses or expands its
-        subtree. The SVG scrolls inside its container; there is no page-level horizontal scroll.
+        behind a "show tensors" checkbox (their shape/dtype goes in <title>). OPTIONAL polish: clicking a module node
+        collapses or expands its subtree. The SVG scrolls inside its container; there is no page-level horizontal scroll.
   4. Plain CSS in index.html. Must honour prefers-color-scheme (light/dark variables). No external fonts or CDNs.
   5. All text is inserted with textContent (no innerHTML with data), because tensor names come from untrusted headers.
 acceptance:
   tests:
-    - "tests/test_web_static.py: index.html contains every required id; app.js contains '/api/scans' and 'since='; neither file contains 'http://' or 'https://' (except the SVG namespace 'http://www.w3.org/2000/svg'); app.js does not contain 'innerHTML'"
+    - "tests/test_web_static.py: index.html contains every required id; app.js contains '/api/scans' and 'since='; neither file contains 'http://' or 'https://' (except the SVG namespace 'http://www.w3.org/2000/svg'); app.js does not contain 'innerHTML'; app.js references 'disclaimers'"
     - "served through make_server (from T013) GET / -> 200 and GET /app.js -> 200 application/javascript"
   commands:
     - pytest -q tests/test_web_static.py
     - pytest -q
   manual:
-    - "scout serve; scan a local write_moe_repo fixture dir; confirm: live log lines appear, weight counter 'weight 0 B' green, 'layers ×N' and 'experts ×4' nodes, one depth strip; screenshot noted in log.jsonl"
+    - "scout serve; scan a local write_moe_repo fixture dir; confirm: live log lines appear, weight counter 'weight 0 B' green, 'layers ×N' and 'experts ×4' nodes, one depth strip, the 3 disclaimers; then scan a write_pipeline_repo dir and confirm 3 sections; note this in log.jsonl"
 out_of_scope:
   - diff view, attribution colouring, any npm/build tooling, JS unit test frameworks
 invariants_touched: [2, 5]

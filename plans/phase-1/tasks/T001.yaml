@@ -111,9 +111,19 @@ behavior: |
        for i in range(3): f"transformer_blocks.{i}.attn.to_q.weight" (8,8), f"transformer_blocks.{i}.attn.to_k.weight" (8,8),
        f"transformer_blocks.{i}.ff.net.0.proj.weight" (16,8), f"transformer_blocks.{i}.ff.net.2.weight" (8,16);
        then "proj_out.weight" (4,8); all BF16; write_sharded(stem="diffusion_pytorch_model", n_shards=1)
-     vae/config.json = {"_class_name":"AutoencoderKL"}; tensors
-       for i in range(2): for r in range(2): f"encoder.down_blocks.{i}.resnets.{r}.conv1.weight" ("F32",(4,4,3,3));
-       "decoder.conv_out.weight" ("F32",(3,4,3,3)); write_sharded(stem="diffusion_pytorch_model", n_shards=1)
+     vae/config.json = {"_class_name":"AutoencoderKLQwenImage"}. The tensors mirror Wan-VAE naming (nested integer
+       indices), all "F32" with shape (2,2) for weights and (2,) for gamma/bias, in this order:
+       "encoder.conv_in.weight", "encoder.conv_in.bias";
+       for i in range(4): f"encoder.down_blocks.{i}.norm1.gamma", ".conv1.weight", ".conv1.bias", ".norm2.gamma",
+         ".conv2.weight", ".conv2.bias"; and for i in (0,1,2) additionally f"encoder.down_blocks.{i}.resample.1.weight";
+       for r in range(2): f"encoder.mid_block.resnets.{r}.conv1.weight", f"encoder.mid_block.resnets.{r}.conv2.weight";
+       "encoder.mid_block.attentions.0.to_qkv.weight", "encoder.mid_block.attentions.0.proj.weight";
+       for r in range(2): f"decoder.mid_block.resnets.{r}.conv1.weight";
+       for i in range(4): for r in range(3): f"decoder.up_blocks.{i}.resnets.{r}.norm1.gamma", ".conv1.weight",
+         ".conv1.bias", ".conv2.weight"; and for i in (0,1,2): f"decoder.up_blocks.{i}.upsamplers.0.resample.1.weight",
+         f"decoder.up_blocks.{i}.upsamplers.0.time_conv.weight";
+       "decoder.conv_out.weight", "quant_conv.weight", "post_quant_conv.weight";
+       write_sharded(stem="diffusion_pytorch_model", n_shards=1)
      README.md at root if readme is not None.
      Return {"components": {"text_encoder": dict, "transformer": dict, "vae": dict}} where each dict
      is that component's write_sharded dict plus params_total and n_tensors.

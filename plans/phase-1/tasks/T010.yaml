@@ -55,7 +55,7 @@ acceptance:
   tests:
     - "Hub tests use FakeHub + client=hub.client(), endpoint=HUB; local tests use tmp dirs; all offline"
     - "test_scan_dense_sharded_hub: write_dense_repo(n_shards=3) -> 1 card; n_tensors/params match the fixture; totals.weight == 0; totals.header == sum(8+N); every fakehub.cdn_reads range ends <= 8+N of its file; the stage_start order is RESOLVE,HEADERS,META,REPORT"
-    - "test_scan_local_folder: same repo scanned as a local path -> revision_kind local-content-hash, key.repo startswith 'local:', weight 0"
+    - "test_scan_local_folder: same repo scanned as a local path -> revision_kind local-stat-hash, key.repo startswith 'local:', weight 0"
     - "test_scan_moe: write_moe_repo -> expert_groups[0].n_experts == 4; stacks[0].block_moe all True"
     - "test_scan_pipeline: write_pipeline_repo -> exactly 3 cards (text_encoder, transformer, vae); pipeline.components has scheduler/tokenizer has_weights False; text_encoder index_path 'text_encoder/model.safetensors.index.json' and index_total_size == tensor_bytes_total; transformer stack 'transformer_blocks' depth 3; all cards share revision_sha and model_card"
     - "test_scan_no_readme: readme=None -> model_card.present False; the scan succeeds"

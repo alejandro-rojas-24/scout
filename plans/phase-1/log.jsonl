@@ -3,3 +3,5 @@
 {"ts":"2026-09-28T01:37:34Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"validator round 1, fresh context: context + plan.md + tasks only"}
 {"ts":"2026-09-28T01:41:58Z","agent":"validator","model":"opus","step":"VALIDATE","task_id":null,"status":"REVISE","note":"round 1: 0 blocker, 5 major, 10 minor"}
 {"ts":"2026-09-28T01:41:58Z","agent":"orchestrator","model":"opus","step":"REVISE","task_id":null,"status":"handoff","note":"round 1 findings -> planner"}
+{"ts":"2026-09-28T01:45:59Z","agent":"planner","model":"opus","step":"REVISE","task_id":null,"status":"done","note":"round 1 applied: 5/5 majors accepted, minors accepted except snapshot-SHA local key (later.md); added T016"}
+{"ts":"2026-09-28T01:45:59Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"validator round 2, fresh context; round-1 file moved to validation-r1.md and withheld"}

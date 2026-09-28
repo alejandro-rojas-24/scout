@@ -1,76 +1,70 @@
 id: T015
-title: Exit check script, pins file, network-marked test
-depends_on: [T012, T013]
+title: Exit check runner with independent wire counting (CountingTransport), pins file, network-marked test
+depends_on: [T012, T013, T016]
 files:
   - scripts/exit_check.py
   - exit/pins.json
   - tests/test_exit_network.py
   - tests/test_exit_check_offline.py
-route: sonnet
+route: opus
 spec_complete: true
 interface: |
   exit/pins.json (committed as):
     {"Qwen/Qwen3-8B": "UNPINNED", "Qwen/Qwen3-30B-A3B": "UNPINNED", "Qwen/Qwen-Image": "UNPINNED"}
   scripts/exit_check.py:
+    class CountingTransport(httpx.BaseTransport):
+        def __init__(self, inner: httpx.BaseTransport) -> None
+        records: list[dict]     # {method,url,orig_path,range,status,location,body_bytes}; guarded by a lock
+        def handle_request(self, request: httpx.Request) -> httpx.Response
     def run(pins: dict[str, str], out_dir: Path, *, endpoint: str | None = None,
-            client_factory: Callable[[], httpx.Client] | None = None,
-            expectations: dict[str, Callable[[list[dict], list[dict], list[pyarrow.Table], dict], list[Check]]] | None = None,
+            inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
+            expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,   # default DEFAULT_EXPECTATIONS
             budget_s: float = 10.0) -> list[Check]
-    @dataclass class Check: target: str; name: str; expected: str; actual: str; ok: bool
     def main(argv: list[str] | None = None) -> int
-      # flags: --pins PATH (default exit/pins.json), --out DIR (default: a fresh tempfile.mkdtemp()), --budget-s FLOAT (default 10.0)
+      # flags: --pins PATH (default <repo>/exit/pins.json), --out DIR (default: tempfile.mkdtemp()), --budget-s FLOAT (default 10.0)
   tests/test_exit_network.py:
+    ROOT = Path(__file__).resolve().parents[1]
     @pytest.mark.network
-    def test_exit_check(): assert subprocess.run([sys.executable, "scripts/exit_check.py", "--pins", "exit/pins.json"]).returncode == 0
+    def test_exit_check(): subprocess.run([sys.executable, str(ROOT/"scripts"/"exit_check.py"), "--pins", str(ROOT/"exit"/"pins.json")], cwd=ROOT).returncode == 0
 behavior: |
-  1. main: load pins. If any value does not match ^[0-9a-f]{40}$, print "pins not set: run `scout resolve <repo>` and commit
-     exit/pins.json" and return 2. Otherwise checks = run(...). Print a table with one row per Check:
-     target | check | expected | actual | PASS/FAIL. Print "EXIT CHECK: PASS" iff all ok, else "EXIT CHECK: FAIL". Return 0 iff all ok.
-  2. run: server = make_server(port=0, out_dir=out_dir, endpoint=endpoint, client_factory=client_factory) in a daemon thread.
-     For each (repo, sha) in pins order: target = f"{repo}@{sha}"; t0 = time.monotonic(); POST /api/scans; poll every 0.1 s
-     until status is done or error, or 60 s. elapsed = time.monotonic() - t0. Then load every Card JSON + parquet under
-     out_dir/<repo_slug>/<sha>/ via load_card. final = the last GET response.
-  3. Common checks (names C1..C9, exactly as defined in plan.md section 2):
-     C1 status == "done" and elapsed < budget_s;
-     C2 final.totals.weight == 0 and every card fetch_log.totals.weight == 0 and the sum over all fetched events of
-        bytes_by_class.weight == 0 (fetch every event with since=0 after completion);
-     C3 the sum of bytes_by_class.header over events with event == "fetch" == Σ over all cards' weights.files (8 + header_len);
-     C4 each file 8 + header_len + data_bytes == size_bytes;
-     C5 index_path set -> tensor_bytes_total == index_total_size;
-     C6 json/parquet exist and key.revision_sha == sha;
-     C7 table.num_rows == weights.n_tensors, every stat_* column null_count == num_rows, all card.stats values None;
-     C8 len(view.nodes) <= 100; C9 the root node (id "") params == weights.params_total.
-  4. Target-specific expectations (the default `expectations` dict), exactly as in plan.md section 2 tables E1/E2/E3:
-     Qwen/Qwen3-8B: model_type qwen3; architectures ["Qwen3ForCausalLM"]; n_tensors 399; params_total 8190735360;
-       params_by_dtype {"BF16": 8190735360}; stacks[0].prefix "model.layers", depth 36 == config.raw.num_hidden_layers;
-       len(set(block_signatures)) == 1; expert_groups == []; model_card present, license "apache-2.0",
-       base_model ["Qwen/Qwen3-8B-Base"].
-     Qwen/Qwen3-30B-A3B: model_type qwen3_moe; n_tensors 18867; params_total 30532122624; stacks[0] model.layers depth 48 ==
-       config num_hidden_layers; exactly 1 expert group with template "model.layers.#.mlp.experts.*", n_experts 128 ==
-       config.raw.num_experts, n_instances 48, tensors_per_expert 3, params_per_expert 4718592 ==
-       3*config.hidden_size*config.moe_intermediate_size, homogeneous True; strip: 48 cells all moe with n_experts 128 and
-       1 distinct signature; the view has exactly 1 expert_group node with count 128; license apache-2.0; base_model
-       ["Qwen/Qwen3-30B-A3B-Base"].
-     Qwen/Qwen-Image: 3 cards with components {"text_encoder","transformer","vae"}; pipeline_class "QwenImagePipeline";
-       pipeline.components includes scheduler and tokenizer with has_weights False and the three with True;
-       text_encoder: "Qwen2_5_VLForConditionalGeneration" in architectures; some stack with prefix ending "layers" has
-       depth == (config.raw["text_config"]["num_hidden_layers"] if "text_config" in raw and it has that key else
-       config.raw["num_hidden_layers"]); some stack with prefix ending "blocks" has depth == config.raw["vision_config"]["depth"];
-       expert_groups == []. transformer: class_name "QwenImageTransformer2DModel"; the stack "transformer_blocks" depth ==
-       config.raw["num_layers"]. vae: class_name "AutoencoderKLQwenImage", 1 weight file, index_path None.
-       All 3 cards: same revision_sha, model_card.license "apache-2.0".
-     Each assertion is one Check row, with expected/actual stringified.
-  5. The script imports only scout.* and the stdlib plus httpx/pyarrow. Add the repo root to sys.path when run as a file.
+  1. CountingTransport.handle_request: resp = inner.handle_request(request). Wrap resp.stream in a SyncByteStream that
+     yields the inner chunks and adds len(chunk) to this record's body_bytes as they are yielded (bytes the client never
+     consumes are not counted, matching the ByteLog definition). Return a new httpx.Response with the same status, headers,
+     stream and extensions. The record's orig_path:
+       - URL path matching "/{owner}/{name}/resolve/{sha}/{path}" -> that path (unquoted);
+       - otherwise, if this URL equals a Location seen in an earlier 3xx record -> that record's orig_path;
+       - else None.
+     location = the resolved absolute Location header for 3xx, else None. range = request.headers.get("range").
+  2. run: one CountingTransport per target, created from inner_transport_factory(). client_factory = lambda:
+     httpx.Client(transport=counting, timeout=10.0). make_server(port=0, out_dir=out_dir, endpoint=endpoint,
+     client_factory=client_factory) runs in a daemon thread. Per (repo, sha) in pins order: target f"{repo}@{sha}";
+     t0 = monotonic; POST /api/scans; poll every 0.1 s until done/error or 60 s; elapsed = monotonic - t0. The control
+     requests to the local server use a separate plain httpx.Client (not counted). Then GET with since=0 for all events,
+     load the cards under out_dir/repo_slug(repo)/sha/ via load_card, build a TargetResult (T016) with wire = counting.records,
+     and extend checks with common_checks(r, budget_s) + expectations[repo](r) (an unknown repo gets only the common checks).
+     Shut the server down at the end.
+  3. main: if any pin value does not match ^[0-9a-f]{40}$, print "pins not set: run `scout resolve <repo>` and commit
+     exit/pins.json" and return 2. Otherwise print a table with one row per Check: target | check | expected | actual |
+     PASS/FAIL, then "EXIT CHECK: PASS" iff all ok, else "EXIT CHECK: FAIL"; return 0 iff all ok. When run as a file,
+     insert the repo root into sys.path (for `scout` and `scripts.exit_expectations`).
+  4. After a real run, the operator appends to plans/phase-1/log.jsonl a line with step "EXIT", the pins, hostname and the
+     full stdout (plan.md §2 phase status rule). The script prints a one-line JSON summary {"hostname","pins","passed","failed"}
+     as its last stdout line to make that easy.
 acceptance:
   tests:
-    - "tests/test_exit_check_offline.py: run(pins={'org/dense': 'a'*40}, out_dir=tmp, endpoint=HUB, client_factory=hub.client, expectations={'org/dense': <a small callable asserting n_tensors == fixture value>}) against a FakeHub dense repo -> all Checks ok; then the same against a FakeHub repo with inject('ignore_range') on a shard -> C1 fails (status error) and at least one Check is not ok"
-    - "test_main_unpinned: main(['--pins', <file with UNPINNED>]) == 2"
-    - "tests/test_exit_network.py is deselected by default (pytest -q collects it as deselected)"
+    - "tests/test_exit_check_offline.py uses FakeHub: inner_transport_factory=hub.transport, endpoint=HUB"
+    - "test_offline_pass: pins={'org/dense': 'a'*40} on a write_dense_repo(n_shards=2) FakeHub repo, expectations={'org/dense': lambda r: []} -> every common Check (C1..C11) ok; C10 saw >= 2 safetensors records via the redirect mapping"
+    - "test_unlogged_read_fails_c11: monkeypatch scout.hub.HubSource.read_file to also do an unlogged self.client.get(<the config.json resolve url>) and read its body -> C11 not ok, everything else still runs"
+    - "test_range_ignored_fails: inject('ignore_range') on a shard -> C1 not ok (status error) and the overall result is FAIL"
+    - "test_main_unpinned: main(['--pins', <tmp file with UNPINNED>]) == 2"
+    - "tests/test_exit_network.py is deselected by default (pytest -q reports it as deselected)"
   commands:
     - pytest -q tests/test_exit_check_offline.py
     - pytest -q
-    - "at EXIT only (network): scout resolve Qwen/Qwen3-8B; scout resolve Qwen/Qwen3-30B-A3B; scout resolve Qwen/Qwen-Image -> write exit/pins.json -> python scripts/exit_check.py --pins exit/pins.json"
+    - "at EXIT only (network): scout resolve Qwen/Qwen3-8B; scout resolve Qwen/Qwen3-30B-A3B; scout resolve Qwen/Qwen-Image -> write exit/pins.json -> python scripts/exit_check.py --pins exit/pins.json -> append the evidence to log.jsonl"
 out_of_scope:
   - changing expected constants to make the check pass (a FAIL goes to the human)
   - browser automation (E5 is a manual check)
+  - expectation logic (T016)
+decisions: []
 invariants_touched: [1, 2, 6]

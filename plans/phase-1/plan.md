@@ -28,6 +28,14 @@ When this plan was written, huggingface.co, cdn-lfs.hf.co and
 cas-bridge.xethub.hf.co were rejected by this container's egress proxy (CONNECT
 403). See decision D3.
 
+**Phase status rule.** Phase 1 is not complete until E0–E5 have all passed. E0
+alone never closes the phase. Whoever runs E1–E5 appends one line per run to
+`plans/phase-1/log.jsonl` (`step: "EXIT"`). The line contains:
+- the pins used
+- `hostname`
+- the full stdout of `scripts/exit_check.py`
+- for E5, the per-target checklist results
+
 ### E0: offline suite (no network)
 ```bash
 pip install -e '.[dev]'
@@ -46,7 +54,21 @@ the same path the browser uses. It then loads the written Card JSON + Parquet fr
 disk. It prints one row per check (`target | check | expected | actual | PASS/FAIL`)
 and exits non-zero on any FAIL or if any pin is not 40-hex.
 
-**Common checks for every target (C1–C9):**
+The script also checks the wire independently of the code under test. It passes
+`make_server` a `client_factory` whose `httpx.Client` uses a `CountingTransport`.
+This is a wrapper around `httpx.HTTPTransport`, defined in `scripts/exit_check.py`,
+that records for every request:
+- method
+- URL
+- `Range` header
+- status
+- `Location`
+- response body bytes as the client actually consumed them
+
+It maps each redirect target back to its original resolve path, so opaque Xet or CDN
+URLs are still attributed to the right file.
+
+**Common checks for every target (C1–C11). C6 and C9 are sanity checks, not evidence:**
 
 | # | Check | Threshold |
 |---|-------|-----------|
@@ -57,8 +79,10 @@ and exits non-zero on any FAIL or if any pin is not 40-hex.
 | C5 | if `index_path` is set: `tensor_bytes_total` | `== index_total_size` (the value the repo publishes in its `*.index.json`) |
 | C6 | Card files exist at `<out>/<repo_slug>/<sha>/<component_slug>.card.json` and `.tensors.parquet`; `key.revision_sha == pin` | true |
 | C7 | Parquet row count | `== weights.n_tensors`; every `stat_*` column is 100 % null; every value in JSON `stats` is `null` |
-| C8 | `view.nodes` count (collapsed graph) | `<= 100` |
-| C9 | `view.nodes` root node params | `== weights.params_total` |
+| C8 | `view.nodes` with `kind != "tensor"` (what the graph shows by default; T014 hides tensor leaves) | `<= 100` per Card |
+| C9 | `weights.params_total` | `== Σ numel` over the Parquet rows |
+| C10 | wire (CountingTransport): every request whose original path ends in `.safetensors` carries `Range: bytes=a-b`, and `b + 1 <= 8 + header_len` of that file from the Card; there are no such requests without `Range` | true for all requests |
+| C11 | wire: Σ response body bytes over all requests, including 3xx | `==` ByteLog `meta + header + weight` total, so no unlogged fetch path exists |
 
 **E1 Qwen/Qwen3-8B @pin: 1 Card, component null**
 
@@ -112,13 +136,30 @@ scout scan "Qwen/Qwen3-8B@$(jq -r '."Qwen/Qwen3-8B"' exit/pins.json)" --out /tmp
 # live stage lines RESOLVE → HEADERS → META → REPORT in that order
 ```
 
-### E5: human visual confirmation (non-automated, recorded in log.jsonl)
-`scout serve`, open http://127.0.0.1:8765 and scan Qwen3-30B-A3B@pin. The page
-must show all of the following:
-- a byte counter with `weight 0` while the log streams
-- the graph with a `layers ×48` node and an `experts ×128` node
-- one depth strip of 48 cells
-- the claimed `base_model` / `license` labelled "claimed by model card"
+### E5: human visual confirmation (non-automated, each item recorded in log.jsonl)
+Run `scout serve`, open http://127.0.0.1:8765 and scan each of the three `repo@pin`
+targets.
+
+For every target the page must show:
+- log lines streaming live
+- the counter showing `weight 0 B` in green
+- the "claimed by model card" box with `license` and `base_model`
+- the three standing disclaimers (§4.4)
+
+Per target:
+- **Qwen3-8B:**
+  - graph node `layers ×36`
+  - one depth strip of 36 uniform cells
+  - no `experts` node
+- **Qwen3-30B-A3B:**
+  - graph nodes `layers ×48` and `experts ×128`
+  - one depth strip of 48 cells, all marked MoE
+- **Qwen-Image:**
+  - 3 sections (text_encoder, transformer, vae)
+  - text_encoder: strips for its `layers` stack and its vision `blocks` stack
+  - transformer: a `transformer_blocks` strip of 60 cells
+  - vae: a strip for each of its stacks
+  - no section has a horizontally overflowing page
 
 ## 3. Definitions
 
@@ -140,9 +181,12 @@ byte offsets. The caller never supplies the class.
 - **meta**: every other byte. This covers Hub API JSON responses (logged path
   `@api/revision`), `model_index.json`, `*.index.json`, `config.json` and
   `README.md`.
-- HTTP response headers, TLS and redirect (3xx) bodies are not counted. Bytes the
-  OS or TCP buffered but the client never yielded are also not counted. This is
-  stated in the Card (`fetch_log.counting = "http-body-bytes-yielded"`).
+- Redirect (3xx) bodies are counted. `HubSource` follows redirects itself, at most
+  5 hops, and logs each 3xx body as a `fetch` event with path `@redirect`, class
+  meta and the target host in `note`.
+- HTTP response headers and TLS framing are not counted. Neither are bytes the OS
+  or TCP buffered but the client never yielded. This narrowing is explicit (D13)
+  and recorded in the Card as `fetch_log.counting = "http-body-bytes-yielded"`.
 
 **Zero weight bytes** means all three of the following for a scan:
 - `ByteLog.totals["weight"] == 0`
@@ -154,9 +198,19 @@ Enforcement in Phase 1 is stricter than a gate. `ByteLog.preflight()` raises
 weight read is impossible by construction. Suppose a server ignores `Range` and
 returns 200. The source then counts what it actually received (possibly weight
 bytes, reported honestly), closes the stream and raises `RangeNotSupported`, and
-no Card is written. A non-weight read is also refused (`ReadThresholdExceeded`)
-when the running total plus the request length would exceed `threshold_bytes`
-(default 64 MiB). The error reports the bytes requested, the running total, disk
+no Card is written. It records those bytes with `start=0`, because the body begins
+at file offset 0, so they are classified correctly.
+
+A non-weight read is also refused (`ReadThresholdExceeded`) when
+`totals(meta+header) + reserved + request > threshold_bytes` (default 64 MiB).
+`preflight()` atomically reserves the request length under the ByteLog lock and
+returns a reservation id. `record(..., release=id)` or `release(id)` frees it, so
+concurrent header reads cannot overshoot the budget together.
+- Reads of unknown length reserve a fixed bound, `META_MAX_BYTES = 16 MiB`. This
+  applies to the API call and to files with no size.
+- A stream is aborted with `ReadThresholdExceeded` as soon as it yields more than
+  its reservation. The received bytes are still recorded.
+ The error reports the bytes requested, the running total, disk
 use (0; nothing is written) and the reason. The interactive confirmation UI for
 large reads is Phase 2 (download gate). Refusing is the safe P1 subset of
 invariant 2.
@@ -184,7 +238,7 @@ in memory only.
 - Local folder target (an existing directory). The key is
   `repo = "local:" + abs_path`, and
   `revision_sha = sha256("\n".join(f"{relpath}\t{size}\t{mtime_ns}" sorted by relpath))`
-  (64 hex), with `revision_kind = "local-content-hash"`. It is computed from
+  (64 hex), with `revision_kind = "local-stat-hash"`. It is computed from
   `stat()` only, with no reads.
 - A Card is keyed by `(key.repo, key.revision_sha, key.component)` and stored at
   `<out>/<repo_slug>/<revision_sha>/<component_slug>.card.json` and `.tensors.parquet`.
@@ -208,7 +262,7 @@ its received bytes are still counted), `refused`, `error`, `card_written`.
 ```
 schema_version: "card.v0"
 key:        {repo:str, revision_sha:str, component:str|null}
-source:     {kind:"hub"|"local", requested_revision:str|null, revision_kind:"git"|"local-content-hash",
+source:     {kind:"hub"|"local", requested_revision:str|null, revision_kind:"git"|"local-stat-hash",
              local_path:str|null, endpoint:str|null}
 scan:       {scanned_at:str(ISO-8601 UTC, "Z"), scout_version:str, elapsed_s:float}
 model_card: {present:bool, claimed:true, base_model:[str], base_model_relation:str|null,
@@ -276,8 +330,20 @@ Rows are sorted by `(file, data_begin)`.
  depth_strips:[{prefix:str, depth:int,
                 cells:[{index:int, params:int, signature:str, moe:bool, n_experts:int|null}]}],
  summary:{params_total:int, n_tensors:int, n_stacks:int, n_expert_groups:int,
-          weight_bytes_read:int, header_bytes_read:int, meta_bytes_read:int}}
+          weight_bytes_read:int, header_bytes_read:int, meta_bytes_read:int},
+ disclaimers:[str, str, str]}      # == scout.view.DISCLAIMERS, always present, in this order
 ```
+`DISCLAIMERS` (invariant 5; T011 defines them, T014 renders them in every view
+section, `scout scan` prints them to stderr after success):
+1. "Distillation is invisible to weight forensics: a model trained on another model's outputs leaves no trace in its weights."
+2. "Tokenizer reuse alone is not proof of derivation."
+3. "Licensing is a human decision: scout shows the license claimed by the model card and does not judge compliance."
+
+View collapsing rule for the graph: every integer segment is merged into its
+predecessor as `name[#]`, not only the first one. The first integer is the Card
+stack. Deeper integers, such as `up_blocks[#].resnets[#]`, are "inner stacks" with
+`count` = the number of distinct indices seen for that node. The Card and Parquet
+keep every literal index; only the view summarizes them.
 
 ## 5. Assumptions and open decisions (each with a recommended default)
 
@@ -295,6 +361,7 @@ Rows are sorted by `(file, data_begin)`.
 | D10 | Weight file selection per unit | In this order: `model.safetensors.index.json`, `diffusion_pytorch_model.safetensors.index.json`, `model.safetensors`, `diffusion_pytorch_model.safetensors`; then exactly one other `*.safetensors.index.json`; then exactly one other `*.safetensors`. Anything else is `AmbiguousWeightsError`. No safetensors at all is `NoSafetensorsError` (`.bin`-only repos are unsupported in P1 because they cannot be read header-only). | Deterministic. Variant files (`*.fp16.safetensors`) are ignored when a canonical file exists. |
 | D11 | Network failure policy | 3 attempts per request with backoff 0.5 s and 1.0 s, 10 s timeout. A failed attempt's received bytes are logged as a `retry` event. Once attempts run out: `NetworkError` (exit code 4), and no Card is written (all Cards are built in memory and written only after every unit succeeds). | The simplest option that is honest and atomic. |
 | D12 | MoE detection | The segment `experts` followed by an integer segment. Fused 3-D expert tensors (gpt-oss style) and `shared_expert` naming are later work. | Covers Qwen3-MoE, Qwen2-MoE and Mixtral (`block_sparse_moe.experts.N`). |
+| D13 | Byte counting scope | Response body bytes, including 3xx bodies, via manual redirects. HTTP header bytes and TLS framing are excluded, as the Card states. | Headers are a few hundred bytes of protocol overhead and cannot contain weights. The body is where data travels. |
 
 ## 6. Architecture (files)
 
@@ -314,6 +381,7 @@ scout/cli.py                           T012
 scout/server.py                        T013
 scout/web/index.html, scout/web/app.js T014
 scripts/exit_check.py, exit/pins.json, tests/test_exit_network.py  T015
+scripts/exit_expectations.py, tests/test_exit_expectations.py              T016
 tests/helpers/st_fixtures.py           T001  synthetic safetensors repos
 tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 ```
@@ -339,11 +407,14 @@ tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 
 | Risk | Mitigation / test |
 |---|---|
-| A weight byte slips through (the invariant fails) | Preflight refusal (T002 unit test). FakeHub counts CDN request ranges, and T010 asserts that every served range ends at or before `8+N`. Exit C2 and C3 (header bytes exactly Σ(8+N)). |
+| A weight byte slips through (the invariant fails) | Preflight refusal (T002 unit test). The exit wire checks C10 and C11 are independent of ByteLog. FakeHub counts CDN request ranges, and T010 asserts that every served range ends at or before `8+N`. Exit C2 and C3 (header bytes exactly Σ(8+N)). |
 | Server ignores Range or CDN returns 200 | T005 `test_range_ignored` checks honest counting plus an error. C3 would catch it live. |
-| Xet/CDN redirect drops Range or needs auth | httpx follows redirects and resends Range; auth is dropped cross-origin by httpx. FakeHub redirects every LFS read to a separate host (T003/T005). Live: E1–E3. |
+| Xet/CDN redirect drops Range or needs auth | `HubSource` follows redirects manually (≤ 5 hops): it resends Range, drops Authorization on a host change, and logs the 3xx body. FakeHub redirects every LFS read to a separate host (T003/T005). Live: E1–E3. |
 | 10 s budget on MoE (16 shards × 2 requests + redirect) | Headers are fetched with a thread pool (8 workers) and one shared `httpx.Client` (keep-alive). Budget ≈ 1 API call + 16×2 ranged requests ≈ 3–5 s. C1 measures it. |
 | Hub unreachable from build container | Offline suite with FakeHub; exit run on a host that has access (D3). |
+| Concurrent reads overshoot the threshold | Atomic reservation in `preflight()`. T002 test: 8 threads each request threshold/4 and at most 4 succeed. |
+| Graph too large for real diffusers VAEs | The view collapses every integer segment. The T001 fixture mirrors Wan-VAE naming, and T011 asserts ≤ 100 non-tensor nodes. |
+| Default E1–E3 expectations buggy (KeyError, vacuous match) | T016 unit-tests each expectation with a passing and a failing hand-built input. |
 | Wrong hard-coded constants | Cross-checked against `config.json` in the same Card; a mismatch FAILs and goes to a human, never gets tuned away. |
 | Partial Cards on failure | Cards are built in memory and written only after all units succeed, each by atomic temp+`os.replace`. T010 asserts the out dir stays empty on every error path. |
 | Weights persisted to disk | No `huggingface_hub`, no cache. T010 `test_no_extra_files` asserts only `*.card.json`/`*.tensors.parquet` exist under out dir and that `HOME`/tmp (monkeypatched) gain no files. |
@@ -368,10 +439,11 @@ tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 | T012 | CLI (`scan`, `resolve`, `serve`) | sonnet | T010, T013 |
 | T013 | HTTP server (stdlib) | sonnet | T010, T011 |
 | T014 | Frontend (index.html + app.js) | opus | T013 |
-| T015 | Exit check script, pins, network test | sonnet | T012, T013 |
+| T015 | Exit check runner, CountingTransport, pins, network test | opus | T012, T013, T016 |
+| T016 | Exit expectations E1–E3 + C-checks as pure functions + offline tests | sonnet | T011 |
 
 Tasks that can run in parallel (no shared files): {T002, T003, T007}, then
-{T004 ∥ T007}, and {T011 ∥ T010}.
+{T004 ∥ T007}, {T011 ∥ T010}, and {T016 ∥ T010, T012, T013}.
 
 ## 10. Out of scope for Phase 1
 Everything listed in `later.md`, notably:
@@ -381,3 +453,40 @@ Everything listed in `later.md`, notably:
 - Card cache/store
 - GGUF, `.bin` and quantized formats
 - dataflow graphs
+
+## 11. Validation responses (round 1)
+
+All 5 majors are accepted and resolved:
+- **C8 would fail on the Wan-VAE:**
+  - C8 now counts non-`tensor` nodes only.
+  - The view collapses every integer segment.
+  - The T001 vae fixture mirrors Wan-VAE naming, and T011 asserts the bound.
+- **Invariant 5:** the view gets `disclaimers` (§4.4). T011 defines it, T014 renders
+  it, T012 prints it, and tests assert it.
+- **Render verified for only 1 of 3 targets:** E5 now covers all three targets with
+  per-target checklists recorded in log.jsonl.
+- **Zero-weight evidence comes only from ByteLog:** C10 and C11 use an independent
+  CountingTransport (T015), with an offline test in which an unlogged read makes
+  C11 fail.
+- **Threshold race:** atomic reservation in `ByteLog.preflight()` (T002), with a
+  concurrency test.
+
+Minors accepted:
+- The phase-status rule and the log.jsonl evidence requirement (§2).
+- Offline tests for the default expectations, via new task T016.
+- The API call and unknown-size reads are bounded by `META_MAX_BYTES` plus stream
+  abort (T005).
+- Range-ignored bytes are recorded with `start=0` (T005).
+- 3xx bodies are now counted via manual redirects, and the narrowing is explicit in D13.
+- C9 is replaced by a Parquet Σ numel check, and C6/C9 are labelled sanity checks.
+- `local-content-hash` is renamed `local-stat-hash`.
+- `client_factory` is added to `cli.main` (T012).
+- test_exit_network paths are resolved from `__file__` (T015).
+- The gzip branch is dropped (T005), and collapse/expand in T014 is optional.
+
+Rejected (partially):
+- Local-key finding, optional part: detecting `.../snapshots/<40hex>` and using it
+  as the key. A folder under an HF cache snapshot can be locally modified (symlink
+  targets replaced), so claiming a git SHA for it would be unverifiable. The stat
+  hash is honest about what it is. Deferred to later.md.
+

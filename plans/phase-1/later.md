@@ -34,3 +34,4 @@ Unscheduled
 - Pinning exit repos in CI once the build container can reach huggingface.co.
 - Environment: the egress proxy in the planning container blocks huggingface.co,
   cdn-lfs*.hf.co and cas-bridge.xethub.hf.co. Allowlisting them would let EXIT run here.
+- Local folder inside an HF cache `snapshots/<sha>/`: optionally use that SHA as the key after verifying blob hashes (validation round 1, rejected for P1).

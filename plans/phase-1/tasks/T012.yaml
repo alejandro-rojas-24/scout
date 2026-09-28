@@ -10,7 +10,8 @@ spec_complete: true
 interface: |
   scout/cli.py:
     def format_event(e: LogEvent) -> str
-    def main(argv: list[str] | None = None) -> int
+    def main(argv: list[str] | None = None, *, client_factory: Callable[[], httpx.Client] | None = None) -> int
+        # client_factory is for tests only (no CLI flag): when given, scan/resolve use client=client_factory()
   CLI (argparse, prog "scout"):
     scout scan TARGET [--out DIR] [--max-read-bytes INT] [--endpoint URL]
     scout resolve REPO[@REV] [--endpoint URL]
@@ -18,12 +19,14 @@ interface: |
     defaults: --out = env SCOUT_CARDS_DIR or "./cards"; --max-read-bytes = DEFAULT_THRESHOLD_BYTES; --endpoint = None (HubSource default)
   scout/__main__.py: `from scout.cli import main; raise SystemExit(main())`
 behavior: |
+  0. main passes client=client_factory() if client_factory else None to scan() and HubSource.
   1. format_event(e) = f"[{e.stage:<8}] {e.event:<12} {e.path or '-'} +{e.bytes}B  meta={t['meta']} header={t['header']} weight={t['weight']}"
      with t = e.totals, plus f"  ({e.note})" if note.
   2. scan: log = ByteLog(threshold_bytes=..., on_event=lambda e: print(format_event(e), file=sys.stderr, flush=True)).
      result = scan(target, Path(out), log, endpoint=...). On success print to stdout
      json.dumps({"repo": result.repo, "revision_sha": result.revision_sha, "cards": [str(p.json_path) for p in result.cards],
-     "totals": result.totals, "elapsed_s": round(result.elapsed_s, 3)}) and return 0.
+     "totals": result.totals, "elapsed_s": round(result.elapsed_s, 3)}), then print each of scout.view.DISCLAIMERS to
+     stderr prefixed with "note: ", and return 0.
   3. resolve: parse REPO[@REV] with scan.parse_target (it must be "hub", else exit 2); log to stderr as above;
      HubSource(...).resolve(); print revision_sha alone to stdout; return 0.
   4. serve: call scout.server.serve(host, port, Path(out), threshold_bytes, endpoint). This blocks. Print
@@ -34,8 +37,8 @@ behavior: |
 acceptance:
   tests:
     - "test_scan_local: main(['scan', <write_dense_repo dir>, '--out', tmp]) == 0; stdout JSON totals.weight == 0 and 1 card path exists; capsys stderr has lines containing '[RESOLVE', '[HEADERS', '[META', '[REPORT' in that order"
-    - "test_scan_hub_fake: monkeypatch scout.scan.make_source or pass the endpoint so the scan runs against a FakeHub client (monkeypatch httpx.Client in scout.hub to return hub.client()) -> exit 0"
-    - "test_resolve_fake: prints 'a'*40"
+    - "test_scan_hub_fake: main(['scan','org/m','--out',tmp,'--endpoint',HUB], client_factory=hub.client) against a FakeHub dense repo -> exit 0; stderr contains the 3 disclaimers"
+    - "test_resolve_fake: main(['resolve','org/m','--endpoint',HUB], client_factory=hub.client) prints 'a'*40"
     - "test_exit_codes: gated FakeHub -> 3; persistent reset -> 4; bin-only local repo -> 1; 'not a target' -> 2"
     - "test_python_m: subprocess [sys.executable, '-m', 'scout', 'scan', dir, '--out', tmp] -> returncode 0"
   commands:
