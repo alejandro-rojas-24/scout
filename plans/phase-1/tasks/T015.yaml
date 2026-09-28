@@ -18,14 +18,16 @@ interface: |
         def __init__(self, inner: httpx.BaseTransport) -> None
         records: list[dict]     # {method,url,orig_path,range,status,location,body_bytes}; guarded by a lock
         def handle_request(self, request: httpx.Request) -> httpx.Response
-    def run(pins: dict[str, str], out_dir: Path, *, endpoint: str | None = None,
+    BUDGET_S: float = 10.0                     # fixed; not configurable from the CLI
+    def run(pins: dict[str, str], out_dir: Path, *, endpoint: str = HF_ENDPOINT_URL,
+            allowed_hosts: Iterable[str] = ALLOWED_HOSTS,       # offline tests pass {"hub.test", "cdn.test"}
             inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
             expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,   # default DEFAULT_EXPECTATIONS
-            budget_s: float = 10.0) -> list[Check]
+            budget_s: float = BUDGET_S) -> list[Check]      # budget_s/endpoint/allowed_hosts overridable only by offline tests
     def check_target_set(pins: dict[str, str], expectations: dict) -> Check
         # Check(target="*", name="C0 target set", expected=sorted(expectations), actual=sorted(pins), ok=set(pins)==set(expectations))
     def main(argv: list[str] | None = None) -> int
-      # flags: --pins PATH (default <repo>/exit/pins.json), --out DIR (default: tempfile.mkdtemp()), --budget-s FLOAT (default 10.0)
+      # flags: --pins PATH (default <repo>/exit/pins.json), --out DIR (default: tempfile.mkdtemp()). No endpoint or budget flags.
   scripts/pin_exit.py:
     HF_GIT = "https://huggingface.co"
     def git_main_sha(repo: str, run_cmd: Callable[[list[str]], str]) -> str
@@ -55,12 +57,14 @@ behavior: |
      t0 = monotonic; POST /api/scans; poll every 0.1 s until done/error or 60 s; elapsed = monotonic - t0. The control
      requests to the local server use a separate plain httpx.Client (not counted). Then GET with since=0 for all events,
      load the cards under out_dir/repo_slug(repo)/sha/ via load_card, build a TargetResult (T016) with wire = counting.records,
-     and extend checks with common_checks(r, budget_s) + expectations[repo](r).
+     and extend checks with common_checks(r, budget_s, allowed_hosts=allowed_hosts, expected_endpoint=endpoint) + expectations[repo](r).
      Shut the server down at the end.
   2a. run() FIRST computes c0 = check_target_set(pins, expectations). If not c0.ok it returns [c0] immediately: no server,
      no scans. Otherwise the result list starts with c0. There is no code path that scans a repo without an expectation
      function.
-  3. main: load pins. c0 = check_target_set(pins, DEFAULT_EXPECTATIONS). If not ok: print the C0 row and
+  3. main: if os.environ.get("HF_ENDPOINT") is set and != HF_ENDPOINT_URL (ignoring one trailing "/"): print
+     f"HF_ENDPOINT={value} is not allowed for the exit check" and return 1. main always calls run(endpoint=HF_ENDPOINT_URL,
+     allowed_hosts=ALLOWED_HOSTS, budget_s=BUDGET_S). Load pins. c0 = check_target_set(pins, DEFAULT_EXPECTATIONS). If not ok: print the C0 row and
      "EXIT CHECK: FAIL (target set must be exactly: ...)", then return 1. Then, if any pin value does not match ^[0-9a-f]{40}$, print "pins not set: run `scout resolve <repo>` and commit
      exit/pins.json" and return 2. Otherwise print a table with one row per Check: target | check | expected | actual |
      PASS/FAIL, then "EXIT CHECK: PASS" iff all ok, else "EXIT CHECK: FAIL"; return 0 iff all ok. When run as a file,
@@ -68,18 +72,29 @@ behavior: |
   3a. pin_exit.main: for each target in sorted(DEFAULT_EXPECTATIONS): s = scout_sha(repo), g = git_main_sha(repo). If
      either is not 40-hex, or s != g: print f"PIN MISMATCH {repo}: scout={s} git_ls_remote={g}" and return 1 WITHOUT
      writing the pins file (and a failing run_cmd, e.g. CalledProcessError, also returns 1 without writing). Otherwise
-     write {repo: s} (json indent=2, sorted keys) atomically, then print one JSON line {"step":"PIN","hostname":
+     write {repo: s} (json indent=2, sorted keys) atomically. scout_sha runs the subprocess with env = os.environ minus
+     HF_ENDPOINT, and pin_exit.main returns 1 up front if HF_ENDPOINT is set to anything other than HF_ENDPOINT_URL.
+     After writing, print one JSON line {"step":"PIN","hostname":
      socket.gethostname(),"repos":{repo:{"scout":s,"git_ls_remote":g}}} and return 0.
   4. After a real run, the operator appends to plans/phase-1/log.jsonl a line with step "EXIT", the pins, hostname and the
-     full stdout (plan.md §2 phase status rule). The script prints a one-line JSON summary {"hostname","pins","passed","failed"}
-     as its last stdout line to make that easy.
+     full stdout (plan.md §2 phase status rule). The script prints a one-line JSON summary as its last stdout line:
+     {"step":"EXIT","hostname","pins","passed","failed","endpoint": HF_ENDPOINT_URL,"budget_s": BUDGET_S,
+      "hosts": sorted distinct wire hosts across all targets,
+      "git_commit": `git rev-parse HEAD` output or "unknown", "git_dirty": bool(`git status --porcelain` output) or null}
+     (git is run via subprocess in the repo root; failure yields "unknown"/null, never an exception).
+     The hostname must equal the hostname of the PIN line in log.jsonl; if not, the run is invalid and is repeated on the
+     pinning host (plan.md §2).
 acceptance:
   tests:
     - "tests/test_exit_check_offline.py uses FakeHub: inner_transport_factory=hub.transport, endpoint=HUB"
-    - "test_offline_pass: pins={'org/dense': 'a'*40} on a write_dense_repo(n_shards=2) FakeHub repo added with meta_redirect='relative307', expectations={'org/dense': lambda r: []} -> C0 and every common Check (C1..C11) ok; C10 saw >= 2 safetensors records via the absolute-Location mapping; C11 includes the 18-byte relative-307 bodies"
+    - "test_offline_pass: pins={'org/dense': 'a'*40} on a write_dense_repo(n_shards=2) FakeHub repo added with meta_redirect='relative307', endpoint=HUB, allowed_hosts={'hub.test','cdn.test'}, expectations={'org/dense': lambda r: []} -> C0 and every common Check (C1..C12) ok; C10 saw >= 2 safetensors records via the absolute-Location mapping; C11 includes the 18-byte relative-307 bodies"
     - "test_target_set_missing: main(['--pins', <file with only 2 of the 3 required repos, 40-hex values>]) == 1; output contains 'C0 target set'; no server started (monkeypatch make_server to raise if called)"
     - "test_target_set_extra: main with the 3 required repos plus 'stabilityai/stable-diffusion-xl-base-1.0' -> 1"
     - "test_target_set_renamed: main with 'Qwen/Qwen3-8b' (wrong case) instead of 'Qwen/Qwen3-8B' -> 1"
+    - "test_endpoint_env_refused: monkeypatch HF_ENDPOINT='https://mirror.example.com' -> main([...valid 3-repo pins...]) == 1 and no server started"
+    - "test_no_budget_flag: main(['--budget-s','60']) exits with argparse error code 2"
+    - "test_c12_disallowed_host: offline run with allowed_hosts={'hub.test'} only (cdn.test missing) -> C12 not ok"
+    - "test_summary_line: the last stdout line of a (monkeypatched run) main parses as JSON with keys endpoint, budget_s == 10.0, hosts, git_commit, git_dirty, hostname"
     - "test_run_c0: run(pins={'org/a':'a'*40}, expectations={'org/b': ...}) returns exactly one Check, C0, not ok"
     - "tests/test_pin_exit.py: with a fake run_cmd: (1) scout and git agree -> 0, pins file written with the 3 required repos, JSON evidence line printed; (2) they disagree for one repo -> 1 and the pins file is unchanged; (3) git returns an empty string -> 1; (4) run_cmd raises CalledProcessError -> 1, file unchanged"
     - "test_unlogged_read_fails_c11: monkeypatch scout.hub.HubSource.read_file to also do an unlogged self.client.get(<the config.json resolve url>) and read its body -> C11 not ok, everything else still runs"

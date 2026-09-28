@@ -22,7 +22,11 @@ interface: |
         json_paths: list[pathlib.Path]; parquet_paths: list[pathlib.Path]
         wire: list[dict]            # CountingTransport records: {method,url,orig_path,range,status,location,body_bytes}
 
-    def common_checks(r: TargetResult, budget_s: float) -> list[Check]       # C1..C11
+    HF_ENDPOINT_URL = "https://huggingface.co"
+    ALLOWED_HOSTS: tuple[str, ...] = ("huggingface.co", "*.hf.co")    # "*.x" matches any subdomain of x (not x itself)
+    def host_allowed(host: str, allowed: Iterable[str]) -> bool
+    def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
+                      expected_endpoint: str = HF_ENDPOINT_URL) -> list[Check]       # C1..C12
     def expect_qwen3_8b(r: TargetResult) -> list[Check]
     def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]
     def expect_qwen_image(r: TargetResult) -> list[Check]
@@ -46,6 +50,8 @@ behavior: |
          of that file (look up by path in the cards' weights.files); records without a Range fail.
          Also require >= 1 such record, so the check is not vacuous.
      C11 sum(w.body_bytes for w in wire) == final.totals.meta + final.totals.header + final.totals.weight.
+     C12 every wire record's URL host satisfies host_allowed(host, allowed_hosts) (one failing Check lists the offending
+         hosts), AND every card.source.endpoint == expected_endpoint. Requires len(wire) >= 1 (not vacuous).
   3. expect_* implement the E1/E2/E3 tables of plan.md section 2 literally:
      - "a stack whose prefix ends with X" means any stack in structure.stacks with prefix.endswith(X) (the "." boundary:
        prefix == X or prefix.endswith("." + X)) whose depth equals the expected value. Also emit a Check that at least one
@@ -57,6 +63,7 @@ acceptance:
     - "tests/test_exit_expectations.py builds minimal hand-written TargetResult objects (dict cards/views, small pyarrow tables)"
     - "for EACH of expect_qwen3_8b, expect_qwen3_30b_a3b, expect_qwen_image: a passing input -> all ok; and a failing input per checked field (parametrized: wrong depth, wrong n_experts, missing vision_config, missing component, wrong base_model, ...) -> at least that Check is not ok and nothing raises"
     - "common_checks: a passing input; C10 fails for a record with Range end beyond 8+N and for one with no Range; C10 fails when there are no safetensors records; C11 fails when a wire byte total exceeds the ByteLog total by 1; C8 fails at 101 non-tensor nodes"
+    - "C12: passes for hosts huggingface.co and cas-bridge.xethub.hf.co; fails for 'mirror.example.com', for 'evilhf.co', and when a card's source.endpoint is 'https://hub.test' with expected_endpoint default"
     - "test_stack_suffix_boundary: prefix 'model.xlayers' does not match suffix 'layers'"
   commands:
     - pytest -q tests/test_exit_expectations.py

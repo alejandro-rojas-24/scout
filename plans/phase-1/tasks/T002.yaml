@@ -89,7 +89,9 @@ behavior: |
      (or "NONE" if no stage yet), ts = time.time(), bytes = nbytes, bytes_by_class = the classification,
      range = (start, start+nbytes) if start is not None else None, totals = a snapshot after the update.
      If release is not None, the reservation is removed in the same critical section as the totals update.
-     event must be "fetch" or "retry" (else ValueError). Append it and call on_event outside the lock.
+     event must be "fetch", "retry" or "error" (else ValueError). "error" with nbytes > 0 records the body bytes of a
+     non-2xx response (callers use the pseudo-path "@error", so it is classified as meta). Append it and call on_event
+     outside the lock.
      Exceptions raised by on_event propagate.
   6. note(event, note, path): event must be in {"error","refused","card_written"}; emits a 0-byte event.
   7. to_card_dict returns JSON-serializable data only.
@@ -103,6 +105,7 @@ acceptance:
     - "record(release=id) frees the reservation; release is idempotent"
     - "stage order: HEADERS then RESOLVE raises StageOrderError; RESOLVE, HEADERS, META, REPORT succeeds"
     - "thread safety: 8 threads x 1000 record() calls of 1 meta byte -> totals.meta == 8000, seqs unique and contiguous 1..N"
+    - "record(event='error', path='@error', nbytes=10) adds 10 to totals.meta; record(event='bogus') raises ValueError"
     - "record of a mixed range counts weight honestly (weight > 0 in totals); record never raises on weight"
     - "on_event receives every event in order; to_card_dict round-trips through json.dumps"
   commands:

@@ -13,6 +13,8 @@ interface: |
     REDIRECT_PATH = "@redirect"                # logged path for 3xx bodies (classified meta)
     MAX_REDIRECTS = 5
     REDIRECT_MAX_BYTES = 64 * 1024             # per-hop cap and reservation for a 3xx body
+    ERROR_PATH = "@error"                      # logged path for non-2xx response bodies (classified meta)
+    ERROR_BODY_MAX_BYTES = 64 * 1024           # cap and reservation for one non-2xx body
     SHA_RE = re.compile(r"^[0-9a-f]{40}$")
     REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
@@ -62,6 +64,12 @@ behavior: |
      weight honestly). Raise RangeNotSupported. No retry.
   6. _get(url, *, logged_path, start, cap, reservation, headers) runs up to `attempts` attempts:
      for each attempt: t0 = monotonic; follow the redirect chain (step 7); then on the final response:
+       - ANY non-2xx final response (API or file, including 401/403/404/429/5xx): re = preflight(ERROR_PATH, 0,
+         ERROR_BODY_MAX_BYTES); read the body up to ERROR_BODY_MAX_BYTES (close beyond it); log.record(event="error",
+         path=ERROR_PATH, start=None, nbytes=len(body), status=..., url=..., note=f"{status} for {logged_path}",
+         release=re); release(re) in finally. Only then apply the mapping below and the step-2 API mapping (which may use
+         that body). This way no body byte is ever unrecorded, and an error body on a .safetensors URL is never classified
+         as header or weight. "retry" events are used only for bytes of a 2xx body cut off by a transport error.
        - 401/403 on a file URL -> GatedRepoError(f"{repo} is gated or private: accept the terms at {endpoint}/{repo}
          and set HF_TOKEN (HF_TOKEN {'set' if token else 'not set'})"). log.note("error", ...). No retry.
        - 404 on a file -> ScoutError(f"missing file {path}"). No retry.
@@ -102,6 +110,7 @@ acceptance:
     - "test_repo_not_found: RepoNotFoundError"
     - "test_error_mapping: a wrapping MockTransport (1) keeps X-Error-Code RepoNotFound but changes the body to {'error':'nope'} -> RepoNotFoundError; (2) drops the header and lowercases the body to 'repository not found' -> RepoNotFoundError; (3) returns 400 with an empty body -> HubAPIError; (4) returns 200 with {'id':'x'} (no sha) -> HubAPIError. No KeyError in any case"
     - "test_relative307_meta: add_repo(meta_redirect='relative307'): read_file('config.json') returns the right bytes; one '@redirect' fetch event of 18 bytes; the second hop goes to HUB '/api/resolve-cache/...'; totals.meta == 18 + file size (+ API bytes)"
+    - "test_error_body_logged: an unknown repo (401 JSON body) -> RepoNotFoundError; exactly one 'error' event with path '@error' whose bytes == len(body); totals.meta grew by that length; a 503 on a shard read logs its body under '@error', not as header"
     - "test_redirect_body_cap: a transport returns a 302 with a 70 KiB body -> ReadThresholdExceeded; the received bytes are recorded; reserved == 0"
     - "test_env_token: monkeypatch HF_TOKEN -> the Authorization header is used for HUB requests"
   commands:

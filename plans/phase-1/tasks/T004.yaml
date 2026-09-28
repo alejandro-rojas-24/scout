@@ -34,7 +34,9 @@ behavior: |
      kind="local", repo=f"local:{root}", local_path=str(root), requested_revision=None, endpoint=None,
      revision_kind="local-stat-hash". revision_sha is "" until resolve().
   2. resolve(): walk root recursively with os.walk (sorted). Skip any directory or file whose name starts with "."
-     and follow no symlinked directories. Collect RepoFile(relpath, st_size). Compute
+     and follow no symlinked directories (os.walk followlinks=False). Files are stat'ed with os.stat(path) which FOLLOWS
+     symlinks (HF-cache snapshots are symlinks into ../blobs/), so size/mtime are the target's; a broken symlink ->
+     ScoutError(f"broken symlink {rel}"). Reads open the path normally (following the link). Collect RepoFile(relpath, st_size). Compute
      revision_sha = sha256("\n".join(f"{rel}\t{size}\t{st_mtime_ns}" for sorted rel).encode()).hexdigest().
      Log a "fetch" event with nbytes=0, path="@local/stat", source="local", note=f"{n} files".
      No file contents are read.
@@ -55,6 +57,7 @@ acceptance:
     - "test_read_range_header: after reading 8 bytes and set_header_len, reading [8,8+N) counts header bytes only; totals.weight == 0"
     - "test_weight_refused: read_range(shard, 8+N, 4) raises WeightReadRefused and open() is never called (spy)"
     - "test_bin_refused: read_file('pytorch_model.bin') raises WeightReadRefused"
+    - "test_symlinked_files: an HF-cache-shaped fixture (snapshots/<sha>/model.safetensors -> ../../blobs/<hash>) -> size equals the blob size; read_header-style reads (8 bytes, then N) succeed; a broken link raises ScoutError"
     - "test_hidden_skipped: .git/ contents are excluded from files()"
   commands:
     - pytest -q tests/test_local_source.py

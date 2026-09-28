@@ -64,6 +64,9 @@ behavior: |
      if not, add a warning f"{template}: heterogeneous experts".
      params_per_expert = total group params // (sum over instances of n_i); if that is not an exact division,
      homogeneous=False and add a warning. Groups are sorted by template.
+  6b. Fused-expert detection (warning only, no collapsing): if any tensor has a segment in EXPERT_CONTAINERS that is NOT
+     followed by an integer segment, and len(shape) >= 3, add ONE warning per distinct collapsed parent path:
+     f"{parent}: fused expert tensors detected (leading expert dim {shape[0]}); not collapsed in v0". No expert group is created.
   7. params_total = sum numel; n_tensors = count; params_by_dtype = {dtype: sum numel}, sorted keys.
   8. The module is pure: no IO, no logging.
 decisions: []
@@ -79,6 +82,7 @@ acceptance:
     - "test_varying_expert_count: layer0 has 4 experts, layer1 has 2 -> warning, n_experts 4"
     - "test_signature_differs: a layer with an extra bias tensor gets a different signature"
     - "test_duplicate: DuplicateTensorError"
+    - "test_fused_experts_warning: 'model.layers.0.mlp.experts.gate_up_proj' shape (4,8,16) -> exactly one warning containing 'fused expert'; expert_groups == []; a 2-D 'experts.foo' tensor gives no warning"
     - "test_scale: moe_tensors(n_layers=48, n_experts=128, hidden=8, moe_inter=4) (18867 tensors) analyzes in < 2 s"
   commands:
     - pytest -q tests/test_structure.py

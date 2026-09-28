@@ -1,0 +1,52 @@
+# Future improvements
+
+This file collects non-blocking review findings per phase for a later wave.
+
+## Phase 1
+
+- **Per-target CountingTransport switching** — T015 behavior 2. Use a mutable holder (`current["transport"]`, set before each POST, with scans strictly sequential) or one `make_server` per target. Without this, a single `client_factory` can attribute every target's traffic to one transport and corrupt C10/C11. Source: r3-m11.
+- **Map redirect targets by normalised URL; no unmapped CDN bodies** — T015 behavior 1, T016 C10, plan §2 C10. Compare `httpx.URL` objects, not strings. C10 should also FAIL if any 2xx record with `body_bytes > 0`, other than the API call, has `orig_path` None. Source: r3-m2.
+- **Catch HTTP that bypasses the injected client** — T015 behavior 2, plan §2 C11. In `run()`, patch `httpx.HTTPTransport.handle_request` at class level, or guard `socket.connect`. Add an offline test in which a fetch goes through a fresh `httpx.Client`. Soften the "no unlogged fetch path exists" wording. Source: r3-m3.
+- **Automated view checks per target** — T016 behavior 3, plan §2 E1/E3. Assert the following automatically instead of relying on the manual E5:
+  - `view.disclaimers == DISCLAIMERS`
+  - every stack has a strip whose cell count equals its depth, and a stack node whose `count` equals its depth
+  - at least one "running" poll returned new events, proving the log is live
+
+  Source: r3-m4.
+- **Config-derived expected constants** — T016, plan §2 E1/E2 and §8. Compute the expected `n_tensors` and `params_total` from the Card's `config.raw` using the §2 formulas. Also check `params_total * 2 == index_total_size` for all-BF16 Cards. A constant then changes only when two independent sources agree. Source: r3-m5.
+- **Qwen-Image critical path** — T010 steps 3 and 5, plan §8. Read the index files and the META files through the existing thread pool. State the Qwen-Image round-trip budget in §8; the relative 307 adds a hop to each of these reads. Source: r3-m6.
+- **Reuse the CDN Location for the second header read** — T005, plan §8. Reuse the Location from the 8-byte read for the `[8, 8+N)` read, re-resolving on 403 or expiry. This saves one hop per file. It was rejected in r2 because the 10 s budget was not at risk. Source: r2-m6.
+- **"Indexed" vs "repeated" stacks** — T008, T011, T014, plan E5.
+  - Containers such as `mlp.0`/`mlp.2` with depth ≤ 3 and no repeating block signature should get kind "indexed", with no depth strip.
+  - Add a test using `mlp.0`/`mlp.2`.
+  - Make the E5 wording non-tautological.
+
+  Source: r3-m7.
+- **Schedule fused-expert MoE support** — T008, later.md, D12. v0 only warns. Fused support (gpt-oss or Llama-4 `experts.gate_up_proj` with a leading expert dimension) should be assigned to a numbered phase. Source: r3-m8 (the warning part is fixed).
+- **Unbuffered local reads** — T004 behavior 4. Use `open(path, "rb", buffering=0)` plus a `readinto` loop, so that read-ahead never pulls tensor bytes into the process. Add a spy test on the raw read sizes. Source: r3-m9.
+- **Warn on skipped root weights in pipelines** — T010 behavior 2. When `model_index.json` exists, add a pipeline warning listing the weight files at the repo root that were not scanned (e.g. a single-file checkpoint). Source: r3-m13.
+- **Script E4; D3 wording** — plan §2 E4 and D3. Make E4 a network-marked test that asserts:
+  - exit code 0
+  - `totals.weight == 0`
+  - exactly 1 card path
+  - the stage lines in order
+
+  Also change D3 from "E1–E4" to "E1–E5". Source: r3-m14.
+- **Cut subtree collapse/expand from P1** — T014 behavior 3d. This is UX polish, planned for P5, and no exit check needs it. Move it to later.md. Source: r3-m15, r1-m10 (partly: made optional in r1).
+- **HF cache snapshot SHA as the local key** — T004 behavior 2, plan §3.3. When a local folder is `.../snapshots/<40hex>/`, use that SHA as the key after verifying blob hashes. It was rejected in r1 because the folder can be modified locally. Source: r1-m7 (optional part).
+
+## Phase 2
+
+_pending planning_
+
+## Phase 3
+
+_pending planning_
+
+## Phase 4
+
+_pending planning_
+
+## Phase 5
+
+_pending planning_

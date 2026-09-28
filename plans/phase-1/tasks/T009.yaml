@@ -54,8 +54,10 @@ behavior: |
      structure.places[name], file, dtype, shape (list), numel, nbytes, data_begin, data_end; all stat_* are null.
      Build it with pyarrow.Table.from_pydict(..., schema=PARQUET_SCHEMA). Then replace the schema metadata with
      {b"schema_version", b"repo", b"revision_sha", b"component"} (component "" for None).
-  4. write_card: mkdir parents. Write JSON (indent=2, ensure_ascii=False, UTF-8) to f"{json_path}.tmp-{pid}", then
-     os.replace. Write parquet (pyarrow.parquet.write_table, compression "zstd") to a temp name, then os.replace.
+  4. write_card: mkdir parents. Temp files are created with tempfile.mkstemp(dir=json_path.parent, prefix=f".{name}.",
+     suffix=".tmp") so concurrent writers (two server threads scanning the same target) never share a temp name.
+     Write JSON (indent=2, ensure_ascii=False, UTF-8) to its temp file, then os.replace. Write parquet
+     (pyarrow.parquet.write_table, compression "zstd") to its own mkstemp temp file, then os.replace.
      Parquet first, then JSON, so a JSON file never points at a missing parquet. On any exception, remove the temp
      files and re-raise. Write nothing else, anywhere.
   5. load_card: json.load plus pyarrow.parquet.read_table(json_path.parent / card["tensors_parquet"]). Raise ScoutError if
@@ -70,6 +72,7 @@ acceptance:
     - "test_roundtrip: write_card then load_card gives an equal dict and an equal table"
     - "test_atomic: monkeypatch pq.write_table to raise -> no files left under out_dir (glob '**/*' has no files)"
     - "test_fetch_log_embedded: card['fetch_log']['totals']['weight'] == 0 and events non-empty, with counting 'http-body-bytes-yielded'"
+    - "test_concurrent_write: 8 threads write_card the same BuiltCard at once -> no exception; final JSON and parquet load; no '*.tmp' files remain"
     - "test_only_card_files: after write_card, out_dir holds exactly 2 files"
   commands:
     - pytest -q tests/test_card.py
