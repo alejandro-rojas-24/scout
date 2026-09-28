@@ -1,0 +1,59 @@
+id: T107
+title: Sigma compute - frozen SIGMA_PARAMS, dtype decode, float64 SVD, in-memory SampleBuffers with purge accounting
+depends_on: [T101, T103]
+files:
+  - scout/sigma.py
+  - tests/test_sigma.py
+route: opus
+spec_complete: true
+interface: |
+  scout/sigma.py:
+    SIGMA_PARAMS: dict      # EXACTLY the literal of plan.md section 4.6 (deep-frozen via types.MappingProxyType is NOT used;
+                            # plain dict; tests compare equality with the plan literal)
+    ROLE_ORDER: tuple[str, ...] = ("attn.v", "attn.k")          # == tuple(SIGMA_PARAMS["roles"])
+    SUPPORTED_DTYPES: frozenset[str] = frozenset({"BF16", "F16", "F32"})
+
+    def decode_tensor(raw: bytes, dtype: str, shape: tuple[int, int]) -> numpy.ndarray   # float64, C-contiguous
+    def sigma_values(w: numpy.ndarray) -> numpy.ndarray                                    # float64, descending
+
+    class SampleBuffers:
+        def put(self, name: str, raw: bytes) -> None            # thread-safe
+        def pop(self, name: str) -> bytes
+        @property resident_bytes -> int
+        @property names -> list[str]
+        def clear(self) -> int                                  # drops all, returns bytes released
+
+    def compute_all(buffers: SampleBuffers, specs: list[tuple[str, str, tuple[int, int]]]) -> tuple[dict[str, list[float]], int]
+        # specs: (tensor name, dtype, shape); returns ({name: descending sigma as python floats}, bytes_released)
+behavior: |
+  1. decode_tensor: m, n = shape; expected = m*n*{BF16:2, F16:2, F32:4}[dtype]; dtype not supported -> SigmaError;
+     len(raw) != expected -> SigmaError(f"{dtype}{list(shape)}: {len(raw)} bytes != {expected}").
+     BF16: u = numpy.frombuffer(raw, "<u2").astype("<u4") << 16; a = u.view("<f4"). F16: frombuffer "<f2". F32: "<f4".
+     Return a.astype(numpy.float64).reshape(m, n). Non-finite values -> SigmaError("non-finite values").
+  2. sigma_values(w): s = numpy.linalg.svd(w, compute_uv=False) (float64); return numpy.sort(s)[::-1].copy().
+     A LinAlgError becomes SigmaError.
+  3. SampleBuffers: a dict guarded by a threading.Lock plus a running resident_bytes counter. put() on an existing name
+     raises ValueError. pop() of a missing name raises KeyError. The bytes are never written anywhere.
+  4. compute_all: for (name, dtype, shape) in specs, in order: raw = buffers.pop(name); released += len(raw);
+     w = decode_tensor(raw, dtype, shape); del raw; s = sigma_values(w); del w; out[name] = [float(x) for x in s].
+     On ANY exception, call buffers.clear() (adding what it returns to released) and re-raise, so no weight bytes stay
+     resident. After the loop, if buffers.resident_bytes != 0, raise SigmaError("buffers not empty after COMPUTE").
+     Return (out, released).
+  5. No IO, no logging (the caller logs the purge event), no raw cosine.
+acceptance:
+  tests:
+    - "test_params_literal: SIGMA_PARAMS == the dict literal copied from plan.md 4.6; ROLE_ORDER == ('attn.v','attn.k')"
+    - "test_decode_bf16: bytes from weights_fixtures.to_bf16_bytes(x) decode within 2**-8 relative of x; F16 and F32 are exact; a wrong length -> SigmaError; F8_E4M3 -> SigmaError; NaN -> SigmaError"
+    - "test_sigma_known: diag(3,2,1) padded into 3x5 -> [3,2,1]"
+    - "test_invariance: W (64x128 from weights_fixtures.structured_matrix); P W Q with P a row permutation and Q a random orthogonal 128x128 (plus sign flips) -> sigma equal within 1e-9 relative (float64 inputs)"
+    - "test_compute_all_purges: put 3 buffers; compute_all -> 3 curves, released == total bytes, resident_bytes == 0"
+    - "test_compute_all_error_clears: the second spec has a wrong shape -> SigmaError raised and resident_bytes == 0"
+    - "test_threadsafe_put: 8 threads put distinct names -> resident_bytes == sum"
+  commands:
+    - pytest -q tests/test_sigma.py
+    - pytest -q
+out_of_scope:
+  - reading bytes (T108)
+  - the comparison statistic (T109)
+invariants_touched: [1, 4]
+decisions: []

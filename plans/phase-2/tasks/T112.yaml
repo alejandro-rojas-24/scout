@@ -1,0 +1,67 @@
+id: T112
+title: CLI - scan --sample/--tokenizer/--confirm-bytes/--gate-threshold-bytes with prompt confirmer; diff and suggest subcommands
+depends_on: [T012, T108, T111]
+files:
+  - scout/cli.py
+  - tests/test_cli_p2.py
+route: opus
+spec_complete: true
+interface: |
+  scout/cli.py (additions to P1 T012; main signature unchanged; client_factory still tests-only):
+    scout scan TARGET [--out DIR] [--max-read-bytes INT] [--endpoint URL]
+                      [--sample] [--tokenizer] [--confirm-bytes INT] [--gate-threshold-bytes INT]
+    scout diff REF_CARD SUBJ_CARD [--json]            # paths to *.card.json
+    scout suggest CARD [--out DIR] [--top INT] [--json]
+    defaults: --gate-threshold-bytes = DEFAULT_GATE_THRESHOLD_BYTES; --top = 5; suggest --out = env SCOUT_CARDS_DIR or "./cards"
+
+    def choose_confirmer(confirm_bytes: int | None, stdin: TextIO, stderr: TextIO) -> Confirmer
+    def format_diff(view: dict) -> str
+    def format_suggest(result: dict) -> str
+behavior: |
+  1. choose_confirmer: if confirm_bytes is not None -> gate.flag_confirmer(confirm_bytes); elif stdin.isatty() ->
+     gate.prompt_confirmer(stdin, stderr); else gate.flag_confirmer(None) (declines).
+  2. scan: pass tokenizer=args.tokenizer, sample=args.sample, gate_threshold_bytes=..., and
+     confirmer=choose_confirmer(args.confirm_bytes, sys.stdin, sys.stderr) when --sample is given (else None).
+     --confirm-bytes without --sample -> argparse error (exit 2). The stdout JSON gains "gate": result.gate and
+     "plan_bytes": plan.bytes_planned if plan else null.
+     On GateDeclined e: print gate.format_plan-equivalent text from e.plan (reconstruct the lines from the dict with the same
+     format as T106 format_plan; the helper format_plan_dict(plan: dict) is added to cli.py) to stderr, then
+     f"declined: rerun with --confirm-bytes {e.plan['bytes_cap']}" and return 6 (the P1 ScoutError path already maps exit_code).
+  3. diff: (ref, rt) = load_card(Path(REF)); (sub, st) = load_card(Path(SUBJ)); view = diff.build_diff(ref, rt, sub, st).
+     --json -> print json.dumps(view) to stdout. Else print format_diff(view) to stdout. Return 0.
+     A missing file -> "error: ..." and return 1.
+  4. format_diff(view) lines:
+     "REFERENCE {reference.title}" / "SUBJECT   {subject.title}"
+     "config: score {score or '-'} ({compared} keys); mismatches: {comma list or 'none'}"
+     "tokenizer: jaccard {jaccard:.3f}" or "tokenizer: n/a ({reason})"
+     per stack pair: "stack {reference_prefix} ({reference_depth}) <-> {subject_prefix} ({subject_depth}): {kind}, mode {mode},
+       location {'resolved' if location_resolved else 'UNRESOLVED'}"; then, if jumps, "  jumps: " + "; ".join(f"{s}:{f}->{t}");
+       duplicated/pruned lists if non-empty; then a table header "  subj  ref  op        struct  r" and one line per layer
+       f"  {subject_index:>4}  {reference_index:>3}  {op:<8}  {struct_cost:>6.2f}  {r:+.3f}" ("   n/a" for null r)
+     "weight: median r {median_r:+.3f} over {n_with_r}/{n_layers} layers (roles {roles})" or "weight: n/a ({reason})"
+     "tensors: {len(only_in_reference)} only in reference, {len(only_in_subject)} only in subject, {len(shape_changed)} shape changed"
+     then "note: " + each disclaimer.
+  5. suggest: (card, _) = load_card(Path(CARD)); pool = [c for _, c in suggest.list_cards(Path(out))];
+     result = suggest.suggest(card, pool, top_n=args.top); --json -> json.dumps(result); else format_suggest:
+     one line per suggestion f"{rank}. {title}  score {score:.3f}  tokenizer {J:.3f|n/a}  config {cs:.3f|n/a}  {'claimed base' if claimed_base_match else ''}",
+     then "unscanned claims: ..." if any, then "note: Tokenizer reuse alone is not proof of derivation.".
+  6. No other behaviour of P1 commands changes. The disclaimers are still printed after a successful scan.
+acceptance:
+  tests:
+    - "local repos from weights_fixtures (family seed 1 + fine-tune + independent llama-style), all with vocab"
+    - "test_scan_sample_flag: main(['scan', dir, '--out', tmp, '--sample', '--tokenizer', '--gate-threshold-bytes', '0', '--confirm-bytes', '999999999']) == 0; stdout JSON has gate[0].approved True and plan_bytes > 0; the card has sigma_curves"
+    - "test_scan_sample_declined_non_tty: monkeypatch sys.stdin to io.StringIO('') (isatty False); --sample --gate-threshold-bytes 0 without --confirm-bytes -> exit 6; stderr contains 'DOWNLOAD GATE' and '--confirm-bytes <cap>'; out dir empty"
+    - "test_scan_prompt_tty: a stdin double with isatty() True and readline 'yes' -> exit 0; with 'no' -> exit 6"
+    - "test_confirm_too_small: --confirm-bytes cap-1 -> exit 6"
+    - "test_confirm_without_sample: exit 2"
+    - "test_diff_cmd: main(['diff', base_card, finetune_card, '--json']) == 0 and the JSON weight.median_r equals build_diff's; the text mode contains 'kind' words 'same' and 'median r' and the 3 disclaimers"
+    - "test_suggest_cmd: main(['suggest', finetune_card, '--out', tmp]) lists the base first; --json parses"
+    - "P1 tests/test_cli.py passes unchanged"
+  commands:
+    - pytest -q tests/test_cli_p2.py tests/test_cli.py
+    - pytest -q
+out_of_scope:
+  - server/UI (T113, T114)
+  - any new subcommand beyond diff/suggest
+invariants_touched: [1, 2, 5]
+decisions: []

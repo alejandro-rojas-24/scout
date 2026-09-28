@@ -1,0 +1,71 @@
+id: T113
+title: Server - scan options, awaiting_confirmation gate with confirm/decline routes, cards list, diff and suggest routes
+depends_on: [T013, T108, T111]
+files:
+  - scout/server.py
+  - tests/test_server_p2.py
+route: opus
+spec_complete: true
+interface: |
+  scout/server.py (additions to P1 T013):
+    GATE_WAIT_S: float = 900.0
+    SHA_KEY_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+    class ScanState:                    # new fields
+        plan: dict | None; gate_event: threading.Event; gate_answer: dict | None; gate: list[dict]
+    class ScoutServer: gate_threshold_bytes: int            # new; make_server(..., gate_threshold_bytes=DEFAULT_GATE_THRESHOLD_BYTES)
+    def server_confirmer(state: ScanState, lock: threading.Lock, wait_s: float) -> Confirmer
+  Routes (new or changed):
+    POST /api/scans                  body {"target": str, "sample"?: bool, "tokenizer"?: bool} -> 202 {"scan_id"}; non-bool -> 400
+    GET  /api/scans/{id}?since=N     adds "plan": dict|null, "gate": [GateDecision]; status may be "awaiting_confirmation"
+    POST /api/scans/{id}/confirm     {"plan_id": str, "bytes_confirmed": int} -> 200 {"ok": true} | 409 {"error"} | 404
+    POST /api/scans/{id}/decline     {} -> 200 {"ok": true} | 409 | 404
+    GET  /api/cards                  -> 200 {"cards": [{"card_key", "title", "path", "has_sigma", "has_tokenizer"}]}
+    POST /api/diff                   {"reference": card_key, "subject": card_key} -> 200 DiffView | 400 | 404
+    GET  /api/suggest?repo=&revision_sha=&component=   -> 200 suggest() result | 400 | 404
+    GET  /diff.js                    -> scout/web/diff.js (application/javascript), 404 JSON if missing
+behavior: |
+  1. POST /api/scans: "sample" and "tokenizer" default to False and must be bool if present (else 400). The scan thread calls
+     scan(..., tokenizer=..., sample=..., gate_threshold_bytes=server.gate_threshold_bytes,
+     confirmer=server_confirmer(state, server.lock, GATE_WAIT_S) if sample else None).
+  2. server_confirmer(plan): under the lock: state.plan = plan.to_dict(); state.gate_answer = None; state.gate_event.clear();
+     status = "awaiting_confirmation". Then wait on gate_event up to wait_s (outside the lock). Then under the lock
+     status = "running", and:
+       - no answer (timeout) -> decision(plan, approved=False, via="timeout", bytes_confirmed=None)
+       - answer {"approved": True, "bytes_confirmed": n} -> decision(approved=True, via="api-confirm", bytes_confirmed=n)
+       - answer {"approved": False} -> decision(approved=False, via="api-decline", bytes_confirmed=None)
+     run_gate (T106) re-validates plan_id and bytes.
+  3. POST confirm: 404 for an unknown id. 409 {"error": ...} if status != "awaiting_confirmation", or plan_id != state.plan.plan_id,
+     or bytes_confirmed is not an int (bool rejected) or < state.plan.bytes_cap. Else set gate_answer
+     {"approved": True, "bytes_confirmed": n}, set the event, return 200. POST decline: same checks except the bytes;
+     answer {"approved": False}.
+  4. GET /api/scans/{id}: plan = state.plan (stays set after the decision); gate = state.log.gate_decisions. On an exception
+     that is GateDeclined, error = {"type": "GateDeclined", "message": str(e), "plan": e.plan}.
+  5. GET /api/cards: suggest.list_cards(out_dir) -> entries with path relative to out_dir (posix), title as in suggest,
+     has_sigma = stats.sigma_curves is not None, has_tokenizer = stats.tokenizer_minhash is not None. Sorted by (repo, sha,
+     component or "").
+  6. Card lookup for diff/suggest: card_key must be {"repo": str, "revision_sha": str matching SHA_KEY_RE, "component": str|None};
+     the component (if any) must match ^[A-Za-z0-9._-]+$ (else 400). Path = card.card_paths(out_dir, ...).json_path; it must
+     resolve inside out_dir.resolve() (else 400) and exist (else 404). load_card is then used.
+  7. POST /api/diff: 200 with diff.build_diff(ref_card, ref_table, subj_card, subj_table). The diff route makes no network
+     request and uses no ByteLog (it reads only local Cards).
+  8. GET /api/suggest: pool = the cards from list_cards; 200 with suggest.suggest(subject, pool).
+  9. Static: add "/diff.js" alongside "/app.js" via WEB_DIR.
+acceptance:
+  tests:
+    - "make_server(port=0, out_dir=tmp, client_factory=lambda: hub.client(), endpoint=HUB, gate_threshold_bytes=0) on FakeHub family repos"
+    - "test_gate_confirm_flow: POST {target, sample: true, tokenizer: true} -> poll until awaiting_confirmation (10 s timeout); at that moment totals.weight == 0 and no fakehub cdn_reads range starts at >= 8+N; the plan has bytes_planned/bytes_cap/per_file; POST confirm with bytes_confirmed = bytes_cap -> 200; poll until done; views[0].summary.weight_bytes_read == bytes_planned; gate[0].via == 'api-confirm'"
+    - "test_gate_confirm_rejects: a wrong plan_id -> 409; bytes_cap-1 -> 409; true (bool) -> 409; confirm when not awaiting -> 409; unknown id -> 404"
+    - "test_gate_decline: POST decline -> status error, error.type GateDeclined, error.plan present; totals.weight == 0; out_dir empty"
+    - "test_gate_timeout: monkeypatch GATE_WAIT_S = 0.2 -> error GateDeclined; gate[0].via == 'timeout'"
+    - "test_cards_diff_suggest: after 2 confirmed scans (base, finetune), GET /api/cards lists 2 with has_sigma true; POST /api/diff -> 200 with kind same; GET /api/suggest for the finetune -> top-1 base; the FakeHub request count does not change during these 3 calls"
+    - "test_diff_bad_key: revision_sha '../../etc' -> 400; a component with '/' -> 400; an unknown sha -> 404"
+    - "test_plain_scan_unchanged: POST {target} only -> no awaiting state, plan null, gate []"
+    - "P1 tests/test_server.py passes unchanged"
+  commands:
+    - pytest -q tests/test_server_p2.py tests/test_server.py
+    - pytest -q
+out_of_scope:
+  - auth/CORS (P1 decision: loopback only)
+  - persisting diffs or suggestions
+invariants_touched: [1, 2, 5]
+decisions: []

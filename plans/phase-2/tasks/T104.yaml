@@ -1,0 +1,84 @@
+id: T104
+title: Tokenizer file resolution, parsing, MinHash signature and Jaccard estimate
+depends_on: [T103]
+files:
+  - scout/tokenizer.py
+  - tests/test_tokenizer.py
+route: opus
+spec_complete: true
+interface: |
+  scout/tokenizer.py:
+    MINHASH_VERSION = "minhash.v1"
+    NUM_PERM = 256
+    MERSENNE_61 = (1 << 61) - 1
+    ELEMENT_SCHEME = "v:<token>|a:<added content>"
+    HASH_DESC = "blake2b-32;(a*x+b) mod 2^61-1"
+    CHUNK = 8192
+
+    @dataclass(frozen=True)
+    class TokenizerInfo:
+        tokenizer_type: str            # "BPE" | "Unigram" | "WordPiece" | "WordLevel" | "vocab.json"
+        elements: list[str]            # sorted, de-duplicated
+        n_vocab: int
+        n_added: int
+
+    def tokenizer_candidates(files: set[str], subdir: str, component: str | None) -> list[str]
+    def parse_tokenizer_file(path: str, raw: bytes) -> TokenizerInfo        # raises ValueError on bad input
+    def coefficients() -> tuple[numpy.ndarray, numpy.ndarray]               # (a, b), uint64, length NUM_PERM, cached
+    def minhash(elements: Iterable[str]) -> list[int]                       # NUM_PERM ints < 2**61
+    def signature_hex(sig: list[int]) -> list[str]                          # 16-hex lowercase each
+    def jaccard(sig_a: list[str], sig_b: list[str]) -> float
+    def tokenizer_stat(path: str, raw: bytes) -> dict                       # TokenizerMinHash (plan.md 4.2)
+behavior: |
+  1. tokenizer_candidates(files, subdir, component): join(d, name) = name if d == "" else f"{d}/{name}".
+     Return, keeping only paths present in `files` and in this order:
+       a. join(subdir, "tokenizer.json");
+       b. if component matches ^text_encoder(_\d+)?$ with suffix sfx (the "_2" part or ""): f"tokenizer{sfx}/tokenizer.json";
+       c. join(subdir, "vocab.json");
+       d. if (b) applied: f"tokenizer{sfx}/vocab.json".
+     The caller reads only the first entry.
+  2. parse_tokenizer_file(path, raw): j = json.loads(raw.decode("utf-8")). It must be a dict, else ValueError.
+     - If path ends with "vocab.json": j must be a dict str->int; elements = {"v:"+k for k in j}; type "vocab.json";
+       n_vocab = len(j); n_added = 0.
+     - Else model = j["model"] (a dict). type = model.get("type"). If type is None and "vocab" is a dict and "merges"
+       is in model, then type = "BPE".
+         BPE / WordPiece / WordLevel: vocab must be a dict; tokens = its keys.
+         Unigram: vocab must be a list of [piece, score]; tokens = the pieces.
+         Anything else -> ValueError(f"unsupported tokenizer type {type}").
+       added = [t["content"] for t in j.get("added_tokens", []) if isinstance(t, dict) and isinstance(t.get("content"), str)].
+       elements = {"v:"+t for t in tokens} | {"a:"+c for c in added}; n_vocab = len(tokens); n_added = len(added).
+     elements is returned as a sorted list. Merges are never used.
+  3. coefficients(): for i in range(NUM_PERM): a_i = int.from_bytes(blake2b(b"scout.minhash.a.%d" % i, digest_size=4).digest(), "little") | 1;
+     b_i = int.from_bytes(blake2b(b"scout.minhash.b.%d" % i, digest_size=4).digest(), "little"). Return numpy uint64 arrays.
+     Cache them with functools.lru_cache.
+  4. minhash(elements): x_e = int.from_bytes(blake2b(e.encode("utf-8"), digest_size=4).digest(), "little") as uint64.
+     Process the elements in chunks of CHUNK: H = (a[None,:] * x[:,None] + b[None,:]) % MERSENNE_61 (uint64; there is no
+     overflow because a, x < 2**32 and b < 2**32); running min over rows. An empty input raises ValueError.
+     Return [int(v) for v in mins].
+  5. signature_hex: format(v, "016x"). jaccard(sa, sb): both must have length NUM_PERM (else ValueError);
+     return sum(x == y) / NUM_PERM.
+  6. tokenizer_stat(path, raw): info = parse_tokenizer_file(path, raw); return {"version": MINHASH_VERSION,
+     "source_file": path, "source_bytes": len(raw), "source_sha256": sha256(raw).hexdigest(), "tokenizer_type",
+     "n_vocab", "n_added", "n_elements": len(elements), "num_perm": NUM_PERM, "element_scheme": ELEMENT_SCHEME,
+     "hash": HASH_DESC, "signature": signature_hex(minhash(elements))}.
+  7. The module is pure: no IO, no logging.
+acceptance:
+  tests:
+    - "test_candidates: root tokenizer.json; a pipeline 'text_encoder' uses 'tokenizer/tokenizer.json'; 'text_encoder_2' uses 'tokenizer_2/...'; 'transformer' -> [] when there is no file in its dir; the vocab.json fallback"
+    - "test_parse_bpe_unigram_vocabjson: fixtures from tests/helpers/weights_fixtures.tokenizer_json_bytes (BPE and Unigram) and a vocab.json; elements have the correct prefixes; added tokens are included"
+    - "test_parse_errors: a non-JSON body, an unknown model type, and Unigram vocab as a dict each raise ValueError"
+    - "test_identical: the same vocab -> jaccard == 1.0"
+    - "test_estimate_accuracy: two vocabularies of 3000 tokens with true Jaccard 0.5 (built with family_vocab using shared tokens) -> |estimate - 0.5| <= 0.1 (about 3.2 SE); disjoint -> <= 0.05"
+    - "test_order_invariant: shuffled element order -> the same signature"
+    - "test_stable_constants: coefficients()[0][:2] and minhash(['v:a'])[:2] equal literal values that the implementer computes once and commits in the test, so any change to the scheme fails the test"
+    - "test_stat_schema: tokenizer_stat keys exactly as plan.md 4.2 TokenizerMinHash; 256 16-hex strings; json.dumps works"
+    - "test_scale: 150_000 elements finish in < 5 s"
+  commands:
+    - pytest -q tests/test_tokenizer.py
+    - pytest -q
+out_of_scope:
+  - fetching the file (T108)
+  - SentencePiece tokenizer.model parsing (later.md)
+  - using merges
+invariants_touched: [5]
+decisions: []

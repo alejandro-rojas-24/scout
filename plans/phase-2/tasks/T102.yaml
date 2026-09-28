@@ -1,0 +1,59 @@
+id: T102
+title: Card v1 schema - scan.options/notes, fetch_log.gate, filled sigma_curves/tokenizer_minhash slots, v0 compatibility
+depends_on: [T009, T101]
+files:
+  - scout/card.py
+  - tests/test_card.py
+  - tests/test_card_v1.py
+route: opus
+spec_complete: true
+interface: |
+  scout/card.py (changes relative to P1 T009):
+    SCHEMA_VERSION = "card.v1"
+    SUPPORTED_SCHEMA_VERSIONS: tuple[str, ...] = ("card.v0", "card.v1")
+    STATS_SLOTS unchanged: ("tensor_stats", "spectral_topk", "sigma_curves", "tokenizer_minhash", "attribution")
+
+    def build_card(*, source, component, pipeline, config, model_card, headers, file_sizes, index_path,
+                   index_total_size, structure, log, scanned_at, elapsed_s, out_dir,
+                   options: dict | None = None,                 # {"sample": bool, "tokenizer": bool}; None -> both False
+                   notes: list[str] | None = None,              # None -> []
+                   sigma_curves: dict | None = None,            # SigmaCurves (plan.md 4.2) or None
+                   sigma_by_tensor: dict[str, list[float]] | None = None,   # tensor name -> descending sigma
+                   tokenizer_minhash: dict | None = None) -> BuiltCard
+    def load_card(json_path: pathlib.Path) -> tuple[dict, pyarrow.Table]   # accepts SUPPORTED_SCHEMA_VERSIONS
+behavior: |
+  1. The card dict keeps the P1 key order. schema_version = "card.v1".
+     scan = {scanned_at, scout_version, elapsed_s, "options": {"sample": bool, "tokenizer": bool}, "notes": list(notes)}.
+  2. stats = {slot: None for slot in STATS_SLOTS}, then stats["sigma_curves"] = sigma_curves and
+     stats["tokenizer_minhash"] = tokenizer_minhash (either may be None).
+  3. fetch_log = log.to_card_dict(), which now includes "gate" (T101).
+  4. Parquet: stat_sigma_curve for row `name` = [float(x) for x in sigma_by_tensor[name]] if name is in sigma_by_tensor,
+     else null. Every name in sigma_by_tensor must exist in the table, else ValueError. Every other stat_* column stays
+     null. The schema metadata schema_version is b"card.v1".
+  5. Validation in build_card (ValueError on violation):
+     - if sigma_curves is not None: sigma_by_tensor is not None, and {t["name"] for t in sigma_curves["tensors"]} ==
+       set(sigma_by_tensor); each list is non-empty, finite and non-increasing (x[i] >= x[i+1]); and
+       len == sigma_curves tensor's n_sigma.
+     - if sigma_curves is None, then sigma_by_tensor must be None or empty.
+     - tokenizer_minhash, if not None: num_perm == len(signature) == 256 and every entry matches ^[0-9a-f]{16}$.
+  6. load_card: raise ScoutError if schema_version is not in SUPPORTED_SCHEMA_VERSIONS. A v0 Card is returned as
+     stored (no rewriting). Consumers use .get for the new keys.
+  7. Update tests/test_card.py (P1): assertions of "card.v0" become "card.v1"; test_keys_exact also expects the
+     scan subkeys options and notes and the fetch_log key gate. All other P1 assertions are unchanged (stats are
+     all None for a plain build).
+acceptance:
+  tests:
+    - "tests/test_card.py (P1, updated) passes"
+    - "test_v1_plain: build_fixture_card (tests/helpers/cards.py) -> schema_version card.v1; scan.options == {'sample': False, 'tokenizer': False}; scan.notes == []; fetch_log.gate == []; all stats None; every stat_* column is fully null"
+    - "test_v1_sigma: pass a sigma_curves dict with 2 tensors plus sigma_by_tensor for the same 2 names -> stat_sigma_curve is non-null for exactly those 2 rows, with equal values; a round trip through write_card/load_card preserves them"
+    - "test_v1_validation: a name missing from the table -> ValueError; an increasing sigma list -> ValueError; sigma_by_tensor without sigma_curves -> ValueError; a signature of 255 entries -> ValueError"
+    - "test_load_v0: a hand-written v0 JSON + parquet (schema_version card.v0) loads; 'card.v9' raises ScoutError"
+    - "test_json_serializable: json.dumps(card) works with numpy-free python floats"
+  commands:
+    - pytest -q tests/test_card.py tests/test_card_v1.py
+    - pytest -q
+out_of_scope:
+  - computing sigma or minhash (T107, T104)
+  - migrating v0 files on disk
+invariants_touched: [1, 2]
+decisions: []

@@ -1,0 +1,64 @@
+id: T111
+title: Diff builder - DiffView from two persisted Cards (config/tensor diff, stack alignment, per-layer r, tokenizer J, disclaimers)
+depends_on: [T011, T105, T108, T109, T110]
+files:
+  - scout/diff.py
+  - tests/test_diff.py
+route: opus
+spec_complete: true
+interface: |
+  scout/diff.py:
+    DIFF_SCHEMA = "diff.v1"
+    LIST_CAP = 200
+    def build_diff(ref_card: dict, ref_table: pyarrow.Table, subj_card: dict, subj_table: pyarrow.Table) -> dict   # plan.md 4.5
+behavior: |
+  1. reference/subject = {"card_key": suggest.card_key(card), "title": f"{repo}@{sha[:12]}" + (f" / {component}" if component)}.
+     params = {"sigma": SIGMA_PARAMS, "align": ALIGN_PARAMS}.
+  2. config_diff = suggest.config_match(ref.config.raw, subj.config.raw, ref.config.architectures, subj.config.architectures).
+  3. tensor_diff: per card, group rows by collapsed_name -> (set of shapes as tuples, set of dtypes).
+     only_in_reference / only_in_subject = sorted name differences; shape_changed = names in both whose shape sets differ,
+     with reference/subject = the sorted list of shapes (as lists); dtype_changed likewise for dtypes. Each list is cut to
+     LIST_CAP; truncated = any list was cut.
+  4. Stacks: (pairs, unpaired_ref, unpaired_subj) = align.pair_stacks(ref.structure.stacks, subj.structure.stacks).
+     SigmaSets: sr = layercorr.sigma_set(ref), ss = layercorr.sigma_set(subj).
+     weight_pair = the index of the first pair (ref_prefix, subj_prefix) with sr and ss not None, sr.stack_prefix ==
+     ref_prefix and ss.stack_prefix == subj_prefix; None if there is none.
+     If weight_pair is not None: (R, roles, reason) = layercorr.compare(sr, ss); else R = None, roles = [], and reason =
+     "reference has no sigma curves" / "subject has no sigma curves" / "sampled stacks are not paired" (first that applies).
+     For each pair p: ref_idx/subj_idx = the literal indices of the stacks; S = align.structural_cost(subj blocks in
+     subj_idx order, ref blocks in ref_idx order) using align.block_sets.
+       - If (S == 1).all(): mode = "reldepth"; a = align.reldepth(nB, nA); used_weights = False.
+       - Else: Rp = R if p == weight_pair and R is not None and R.shape == (nB, nA) else None;
+         C = align.combine_cost(S, Rp); a = align.viterbi(C); mode = "dp-structure+weights" if Rp is not None else "dp-structure";
+         used_weights = Rp is not None.
+       summary = align.summarize(a, nA, S, used_weights, mode, ref_idx, subj_idx).
+       layers[i] = {"subject_index": subj_idx[i], "reference_index": ref_idx[a[i]], "op": summary.ops[i],
+                    "struct_cost": float(S[i, a[i]]), "r": round(float(R[i, a[i]]), 6) if p == weight_pair and R is not None else None}.
+       The stack_pairs entry has exactly the keys of plan.md 4.5 (ops go only into layers).
+  5. weight = {"available": R is not None, "reason": reason, "roles": roles, "pair_index": weight_pair if R is not None else None,
+     "median_r": round(float(median of non-null r in that pair's layers), 6) or None, "n_layers": nB of that pair (0 if none),
+     "n_with_r": the count of non-null r}.
+  6. tokenizer: J = suggest.tokenizer_jaccard(ref, subj); {"available": J is not None, "reason": None or
+     "tokenizer MinHash missing on one side", "jaccard": J}.
+  7. disclaimers = list(scout.view.DISCLAIMERS).
+  8. Pure; accepts v0 Cards (.get for new keys); the output json.dumps; no verdict field, no thresholds applied.
+acceptance:
+  tests:
+    - "Cards are produced by T108 scan(sample=True, tokenizer=True, gate_threshold_bytes=0, confirmer=flag_confirmer(10**9)) on local repos written with tests/helpers/weights_fixtures, then load_card; a module-scoped fixture caches them"
+    - "test_related: base = FamilySpec(seed=1) vs finetune(base, 0.02, 7) -> one pair model.layers, kind same, mode dp-structure+weights, all ops match with equal indices, weight.median_r >= 0.9, n_with_r == 16, tokenizer.jaccard == 1.0, config_diff.score == 1.0"
+    - "test_unrelated: base qwen2-style seed 1 vs llama-style FamilySpec(seed=2, style='llama', n_layers=20, hidden=160, n_kv_heads=4, head_dim=32) -> kind incompatible, mode reldepth, n_with_r == 20, only_in_reference contains 'model.layers.#.self_attn.q_proj.bias', '...k_proj.bias', '...v_proj.bias'; weight.median_r <= 0.40"
+    - "test_upscaled: base vs upscale(base,16,12,4) -> kind upscaled, location_resolved True, duplicated_reference == [4..11], the layer at subject_index 12 has reference_index 4 and op jump; r at matched layers >= 0.9 in median"
+    - "test_pruned: base vs prune(base,16,[5,6,7]) -> kind pruned, pruned_reference == [5,6,7]"
+    - "test_structure_only: the same upscaled pair built with sample=False -> mode dp-structure, location_resolved False, weight.available False with a reason"
+    - "test_permuted: base vs permute_hidden(base) -> median_r >= 0.99 (invariant 4 end-to-end)"
+    - "test_v0_inputs: two P1 v0-style Cards (plain scans) -> diff builds; weight/tokenizer unavailable; disclaimers present"
+    - "test_json_and_keys: json.dumps works; top-level keys exactly as plan.md 4.5"
+  commands:
+    - pytest -q tests/test_diff.py
+    - pytest -q
+out_of_scope:
+  - persisting diffs (D25: never)
+  - verdicts / probabilities (Phase 3)
+  - rendering (T114)
+invariants_touched: [1, 4, 5]
+decisions: []

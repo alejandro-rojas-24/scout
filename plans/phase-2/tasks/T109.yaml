@@ -1,0 +1,71 @@
+id: T109
+title: Per-layer sigma-curve statistic - top-half log grid, per-layer centring, cubic depth detrend, Pearson matrix (from Cards)
+depends_on: [T107]
+files:
+  - scout/layercorr.py
+  - tests/test_layercorr.py
+route: opus
+spec_complete: true
+interface: |
+  scout/layercorr.py:
+    from scout.sigma import SIGMA_PARAMS, ROLE_ORDER
+
+    def grid_curve(sigma: Sequence[float]) -> numpy.ndarray                       # shape (grid_points,)
+    def residuals(Y: numpy.ndarray, degree: int | None = SIGMA_PARAMS["detrend_degree"]) -> numpy.ndarray
+    def role_matrix(curves_by_block: dict[int, Sequence[float]], order: list[int]) -> numpy.ndarray   # (L, G)
+    def layer_vectors(res_by_role: dict[str, numpy.ndarray], roles: list[str]) -> numpy.ndarray       # (L, G*len(roles))
+    def pearson_matrix(VB: numpy.ndarray, VA: numpy.ndarray) -> numpy.ndarray                          # (nB, nA)
+
+    @dataclass(frozen=True)
+    class SigmaSet:
+        stack_prefix: str; indices: list[int]; curves: dict[str, dict[int, list[float]]]   # role -> block index -> sigma
+
+    def sigma_set(card: dict, table: pyarrow.Table) -> SigmaSet | None          # None if the card has no sigma_curves
+    def compare(ref: SigmaSet, subj: SigmaSet) -> tuple[numpy.ndarray | None, list[str], str | None]
+        # (R of shape (n_subj, n_ref) or None, roles used, reason if None)
+behavior: |
+  1. grid_curve(sigma): s = numpy.asarray(sigma, float64) (descending, K >= 1); floor = SIGMA_PARAMS["log_floor_rel"] * s[0]
+     (if s[0] <= 0: return zeros(G)); y = log(maximum(s, floor)); u_k = (arange(K) + 0.5)/K;
+     G = SIGMA_PARAMS["grid_points"]; u_g = SIGMA_PARAMS["grid_u_max"] * (arange(G) + 0.5)/G;
+     return numpy.interp(u_g, u_k, y) (numpy's constant extrapolation at the ends).
+  2. residuals(Y, degree): Y is (L, G). Z = Y - Y.mean(axis=1, keepdims=True) (per-layer centring).
+     If degree is None: return Z (test hook only; production always uses SIGMA_PARAMS["detrend_degree"] = 3).
+     t = linspace(-1, 1, L); X = numpy.polynomial.polynomial.polyvander(t, degree) (L x (degree+1));
+     coef = numpy.linalg.lstsq(X, Z, rcond=None)[0]; return Z - X @ coef.
+     L must be >= SIGMA_PARAMS["min_layers"], else ValueError.
+  3. role_matrix: rows in the given block-index order, each grid_curve(curves_by_block[idx]). A missing idx raises KeyError.
+  4. layer_vectors: numpy.concatenate([res_by_role[r] for r in roles], axis=1).
+  5. pearson_matrix(VB, VA): row-centre each vector; norms; r = (VBc @ VAc.T) / outer(nB, nA). Any pair with a zero norm
+     gets r = 0.0. Clip to [-1, 1].
+  6. sigma_set(card, table): sc = (card.get("stats") or {}).get("sigma_curves"); None if absent. rows = the table's
+     name -> stat_sigma_curve (only non-null). curves[role][block_index] = rows[name] for each entry in sc["tensors"]
+     (missing row -> skip that entry). indices = sorted distinct block_index over all entries.
+  7. compare(ref, subj):
+     roles = [r for r in ROLE_ORDER if r in ref.curves and r in subj.curves and set(ref.curves[r]) == set(ref.indices)
+              and set(subj.curves[r]) == set(subj.indices)].
+     If no roles -> (None, [], "no common sampled roles"). If len(ref.indices) or len(subj.indices) < min_layers ->
+     (None, roles, "stack shallower than min_layers").
+     Per side: res[r] = residuals(role_matrix(curves[r], indices)); V = layer_vectors(res, roles).
+     R = pearson_matrix(V_subj, V_ref). Return (R, roles, None).
+  8. Pure; no IO; no raw cosine; no thresholds (verdicts are not produced here).
+acceptance:
+  tests:
+    - "Math tests build SigmaSets directly from arrays made by tests/helpers/weights_fixtures (family_weights, finetune, permute_hidden, rotate_kv_inputs), taking sigma via scout.sigma.sigma_values of the float32 arrays cast to float64 (no files needed)"
+    - "test_grid_curve: sigma = [4,2,1,0.5] -> length 128, first value log(4), non-increasing"
+    - "test_residuals_remove_poly: Y whose columns are cubic polynomials in t plus a per-row constant -> residuals ~ 0 (1e-10)"
+    - "test_invariance: family A vs permute_hidden(A) and vs rotate_kv_inputs(A) -> diag(R) all >= 0.999999"
+    - "test_finetune: A vs finetune(A, eps=0.02, seed=9) -> median diag r >= 0.95; eps=0.05 -> median >= 0.80"
+    - "test_independent_null: for seed pairs (1,2),(3,4),(5,6),(7,8),(9,10) with the SAME trend_seed=0 (shared linear + U-shaped depth trend): median diag r <= 0.40 for every pair and the mean of the 5 medians <= 0.20"
+    - "test_detrend_matters: the same pairs with residuals(degree=None) (no depth detrend) -> the mean of the medians >= 0.60 (proves the generic structure the detrend removes is real in the fixture)"
+    - "test_layer_specific: for A vs finetune(A): the median of the off-diagonal R entries <= 0.40 while the diagonal median >= 0.95"
+    - "test_different_shapes: llama-style family with hidden=160, n_kv_heads=4 (k 128x160) vs a qwen2-style family -> compare works (grid makes the lengths equal); returns R of shape (nB, nA)"
+    - "test_shallow_and_missing: 6-layer sets -> R None with a reason; roles missing on one side -> reason 'no common sampled roles'"
+    - "test_sigma_set_from_card: using a card+table produced by T108's scan on a family repo -> the SigmaSet has 16 indices and 2 roles"
+  commands:
+    - pytest -q tests/test_layercorr.py
+    - pytest -q
+out_of_scope:
+  - alignment (T110) and DiffView (T111)
+  - CKA or any other similarity (Phase 3)
+invariants_touched: [4]
+decisions: []

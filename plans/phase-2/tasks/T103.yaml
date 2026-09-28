@@ -1,0 +1,110 @@
+id: T103
+title: Real-valued safetensors fixtures, synthetic model families (base/fine-tune/permuted/independent/upscaled/pruned), tokenizer fixtures
+depends_on: [T001, T101]
+files:
+  - tests/helpers/weights_fixtures.py
+  - tests/test_weights_fixtures.py
+route: sonnet
+spec_complete: true
+interface: |
+  tests/helpers/weights_fixtures.py (test-only; numpy; no scout imports except none needed):
+    Array = numpy.ndarray
+
+    def to_bf16_bytes(a: Array) -> bytes
+    def array_bytes(a: Array, dtype: str) -> bytes          # dtype in {"BF16","F16","F32"}; little-endian, C order
+    def write_safetensors_arrays(path: pathlib.Path, tensors: dict[str, tuple[str, Array]],
+                                 metadata: dict[str, str] | None = None) -> int   # returns padded header len N
+
+    @dataclass(frozen=True)
+    class FamilySpec:
+        seed: int
+        n_layers: int = 16
+        hidden: int = 128
+        n_heads: int = 4
+        n_kv_heads: int = 2
+        head_dim: int = 32
+        inter: int = 256
+        vocab: int = 256
+        style: str = "qwen2"          # "qwen2" (q/k/v biases) | "llama" (no biases)
+        trend_seed: int = 0           # depth-trend parameters shared by families with equal trend_seed
+        trend: bool = True
+
+    def spectrum(K: int, alpha: float, amp: float, freq: float, phase: float) -> Array
+    def structured_matrix(rng: numpy.random.Generator, m: int, n: int, s: Array) -> Array
+    def family_weights(spec: FamilySpec) -> dict[str, Array]          # float32 arrays, insertion order = file order
+    def family_config(spec: FamilySpec, n_layers: int | None = None) -> dict
+    def finetune(w: dict[str, Array], eps: float, seed: int) -> dict[str, Array]
+    def permute_hidden(w: dict[str, Array], seed: int) -> dict[str, Array]
+    def rotate_kv_inputs(w: dict[str, Array], seed: int) -> dict[str, Array]
+    def upscale(w: dict[str, Array], n_layers: int, first_end: int, second_start: int) -> dict[str, Array]
+    def prune(w: dict[str, Array], n_layers: int, drop: list[int]) -> dict[str, Array]
+    def tokenizer_json_bytes(vocab: list[str], added: list[str] = (), model_type: str = "BPE") -> bytes
+    def family_vocab(seed: int, size: int = 256, shared: list[str] = ()) -> list[str]
+    def write_family_repo(root: pathlib.Path, w: dict[str, Array], config: dict, *, n_shards: int = 2,
+                          dtype: str = "BF16", vocab: list[str] | None = None,
+                          readme: str | None = None) -> dict
+        # returns {"files": [...], "header_lens": {rel: N}, "n_tensors": int, "params_total": int}
+behavior: |
+  1. to_bf16_bytes: a32 = a.astype("<f4"); u = a32.view("<u4"); rounded = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+     (uint32 arithmetic; round-to-nearest-even); return rounded.astype("<u2").tobytes(). array_bytes: BF16 ->
+     to_bf16_bytes; F16 -> a.astype("<f2").tobytes(); F32 -> a.astype("<f4").tobytes().
+  2. write_safetensors_arrays: same layout rules as tests/helpers/st_fixtures.safetensors_bytes (insertion order,
+     contiguous offsets, JSON separators (",",":"), header right-padded with b" " to a multiple of 8, u64 LE length prefix),
+     but the data section is the concatenated array_bytes and "shape" is list(a.shape).
+  3. spectrum(K, alpha, amp, freq, phase): k = arange(K); s = (k+1)**(-alpha) * (1 + amp*sin(2*pi*freq*k/K + phase));
+     return s sorted descending (float64).
+  4. structured_matrix(rng, m, n, s): K = min(m,n) == len(s); U = QR(rng.standard_normal((m,K)))[0];
+     V = QR(rng.standard_normal((n,K)))[0]; return (U * s) @ V.T as float32.
+  5. family_weights(spec): rng = default_rng(spec.seed); trng = default_rng(10_000 + spec.trend_seed).
+     Draw once from trng: base_alpha = 0.3 + 0.2*trng.random(), lin = 0.4*trng.random(), quad = 0.6*trng.random().
+     kv = n_kv_heads*head_dim; q = n_heads*head_dim. For i in range(n_layers): t = i/(n_layers-1) (0 if n_layers == 1);
+     trend_i = base_alpha + lin*t + quad*(t-0.5)**2 if spec.trend else 0.5.
+     For each role in the order q, k, v, o, gate, up, down, with shapes q:(q,hidden), k:(kv,hidden), v:(kv,hidden),
+     o:(hidden,q), gate:(inter,hidden), up:(inter,hidden), down:(hidden,inter):
+       alpha = trend_i + 0.4*(rng.random() - 0.5); amp = 0.25; freq = 1 + 3*rng.random(); phase = 2*pi*rng.random();
+       W = structured_matrix(rng, m, n, spectrum(min(m,n), alpha, amp, freq, phase)).
+     Names follow P1 dense_tensors naming (prefix "model"): model.embed_tokens.weight (vocab,hidden) = 0.02*normal;
+     per layer: self_attn.q_proj.weight, [q_proj.bias (q,) if qwen2], k_proj.weight, [k_proj.bias (kv,)], v_proj.weight,
+     [v_proj.bias (kv,)], o_proj.weight, mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight,
+     input_layernorm.weight (hidden,) = 1 + 0.01*normal, post_attention_layernorm.weight (hidden,); biases are 0.01*normal;
+     then model.norm.weight (hidden,) and lm_head.weight (vocab,hidden) = 0.02*normal. All arrays are float32.
+     "llama" style has no biases. There are no q_norm/k_norm tensors.
+  6. family_config(spec, n_layers): {"model_type": "qwen2" if style=="qwen2" else "llama",
+     "architectures": ["Qwen2ForCausalLM"] or ["LlamaForCausalLM"], "hidden_size", "num_hidden_layers": n_layers or
+     spec.n_layers, "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
+     "rope_theta": 1000000.0 if qwen2 else 500000.0, "tie_word_embeddings": False, "max_position_embeddings": 4096,
+     "hidden_act": "silu", "rms_norm_eps": 1e-6 if qwen2 else 1e-5}.
+  7. finetune(w, eps, seed): rng = default_rng(seed); for every array a: a + eps * (norm(a)/sqrt(a.size)) * standard_normal(a.shape),
+     as float32. The output keys equal the input keys, in the same order.
+  8. permute_hidden(w, seed): P = default_rng(seed).permutation(hidden). Apply to the hidden axis of every tensor:
+     columns (axis 1) of q,k,v,gate,up,embed_tokens,lm_head; rows (axis 0) of o_proj, down_proj; the entries of every
+     layernorm and model.norm vector. Leave biases unchanged. This is function-preserving up to RMSNorm on permuted
+     coordinates.
+  9. rotate_kv_inputs(w, seed): Q = QR(default_rng(seed).standard_normal((hidden,hidden)))[0]; for every
+     k_proj/v_proj weight W, return W @ Q (float32). This is a test aid for rotation invariance of sigma only.
+  10. upscale(w, n_layers, first_end, second_start): new layer list = layers [0, first_end) followed by
+     [second_start, n_layers), renumbered 0..; non-layer tensors are copied. SOLAR-like: upscale(w,16,12,4) -> 24 layers.
+  11. prune(w, n_layers, drop): keep the layers not in drop, renumbered, in order.
+  12. tokenizer_json_bytes: json.dumps({"version": "1.0", "added_tokens": [{"id": len(vocab)+i, "content": c,
+     "special": True} for i, c in enumerate(added)], "model": ({"type": "BPE", "vocab": {tok: i}, "merges": []} if BPE
+     else {"type": "Unigram", "vocab": [[tok, -1.0] for tok in vocab]})}).encode().
+  13. family_vocab(seed, size, shared): shared + [f"tok_{seed}_{i}" for i in range(size - len(shared))].
+  14. write_family_repo: write config.json (json), README.md if readme, tokenizer.json if vocab (with added=["<|endoftext|>"]),
+     and the tensors cast to dtype and split into n_shards contiguous chunks exactly as st_fixtures.write_sharded does
+     (same file names and index format; the index total_size is the sum of nbytes).
+acceptance:
+  tests:
+    - "test_bf16_roundtrip: decode(to_bf16_bytes(x)) (uint16<<16 -> float32) is within 2**-8 relative of x for random x; 1.0 -> 0x3F80"
+    - "test_layout: write_safetensors_arrays: the header parses, offsets are contiguous, and the file length == 8+N+sum(nbytes)"
+    - "test_family_shapes: family_weights(FamilySpec(seed=1)) has 16*14+3 tensors (qwen2) and 16*11+3 (llama); k_proj shape (64,128)"
+    - "test_deterministic: the same spec gives identical arrays; a different seed gives different arrays"
+    - "test_upscale_prune: upscale(w,16,12,4) has 24 layers and layer 12 == original layer 4; prune(w,16,[5,6,7]) has 13 layers and layer 5 == original layer 8"
+    - "test_permute_sigma_equal: singular values of k_proj before and after permute_hidden agree to 1e-4 relative"
+    - "test_repo_written: write_family_repo(n_shards=2) -> index + 2 shards + config.json + tokenizer.json; the tokenizer parses as JSON with model.type BPE"
+  commands:
+    - pytest -q tests/test_weights_fixtures.py
+    - pytest -q
+out_of_scope:
+  - any scout/ production code
+invariants_touched: [4, 6]
+decisions: []

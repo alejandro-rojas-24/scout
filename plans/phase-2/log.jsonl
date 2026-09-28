@@ -1,1 +1,3 @@
 {"ts":"2026-09-28T21:05:42Z","agent":"orchestrator","model":"opus","step":"PLAN","task_id":null,"status":"spawn","note":"phase 2 planner round 1; branch plan/phase-2-diff-view stacked on phase-1"}
+{"ts":"2026-09-28T21:31:28Z","agent":"planner","model":"opus","step":"PLAN","task_id":null,"status":"done","note":"plan.md + T101-T116 + later.md; Card v0->v1; 15 opus / 1 sonnet"}
+{"ts":"2026-09-28T21:31:28Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"validator round 1, fresh context"}

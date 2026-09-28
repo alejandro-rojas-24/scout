@@ -1,0 +1,92 @@
+id: T101
+title: ByteLog weight grant + retry recheck + gate/purge events + GateDeclined + numpy dependency
+depends_on: [T002, T005]
+files:
+  - pyproject.toml
+  - scout/errors.py
+  - scout/bytelog.py
+  - scout/hub.py
+  - tests/test_bytelog_grant.py
+  - tests/test_hub_recheck.py
+route: opus
+spec_complete: true
+interface: |
+  pyproject.toml: dependencies += "numpy>=1.26" (nothing else changes)
+
+  scout/errors.py (additions):
+    class GateDeclined(ScoutError)        # exit_code 6; __init__(self, message: str, plan: dict | None = None); attr plan
+    class SigmaError(ScoutError)          # exit_code 1; decode/SVD failure of a sampled tensor
+
+  scout/bytelog.py (additions; everything in P1 T002 stays):
+    DEFAULT_GATE_THRESHOLD_BYTES: int = 64 * 1024 * 1024
+    RETRY_SLACK_BYTES: int = 16 * 1024 * 1024
+    NOTE_EVENTS: frozenset[str] = frozenset({"error", "refused", "card_written", "gate", "purge"})
+
+    class ByteLog:
+        def grant(self, plan_id: str, ranges: Iterable[tuple[str, int, int]], cap_bytes: int) -> None
+        def revoke_grant(self) -> None                      # idempotent
+        @property grant_active -> bool
+        def recheck(self, reservation: int) -> None         # no-op for non-weight or unknown reservations
+        def add_gate_decision(self, decision: dict) -> None
+        @property gate_decisions -> list[dict]              # deep copies
+        @property reserved_weight -> int
+        # to_card_dict() now returns {"counting","threshold_bytes","totals","events","gate"}
+
+  scout/hub.py: HubSource._get calls self.log.recheck(reservation) at the start of every attempt with attempt >= 2
+behavior: |
+  1. grant(plan_id, ranges, cap_bytes):
+     - Raise StageOrderError("grant outside SAMPLED_READ") if current_stage != Stage.SAMPLED_READ.
+     - Raise ScoutError("grant already active") if a grant is already active.
+     - Store: plan_id; a dict path -> sorted list of (start, end_exclusive) (ranges must have 0 <= start < end,
+       else ValueError); cap_bytes; weight_at_grant = totals["weight"].
+     - Emit a 0-byte "gate" event with note f"grant {plan_id}: {n} ranges, cap {cap_bytes} B".
+  2. revoke_grant(): if active, clear it and emit a "gate" event with note f"grant {plan_id} revoked".
+     Otherwise do nothing.
+     stage(s): if a grant is active and s != SAMPLED_READ, call revoke_grant() BEFORE emitting the stage_start event.
+  3. preflight(path, start, end) keeps the P1 rules when c["weight"] == 0. They are unchanged: the non-weight
+     threshold is computed over totals.meta + totals.header + reserved_nonweight, where reserved_nonweight is the sum
+     of reservations that are not weight. When c["weight"] > 0, the read is ALLOWED only if ALL of:
+       a. a grant is active and current_stage == SAMPLED_READ;
+       b. c["meta"] == 0 and c["header"] == 0 (a pure weight range);
+       c. there exists a granted (gs, ge) for this path with gs <= start and end <= ge;
+       d. (totals.weight - weight_at_grant) + reserved_weight + (end - start) <= cap_bytes.
+     Everything is evaluated under the lock. If allowed, create a WEIGHT reservation (tracked separately) and return
+     its id. If not allowed, emit "refused" with note f"weight bytes {c['weight']} in {path}[{start}:{end}]: {why}", where
+     why is one of "no grant", "stage", "mixed range", "outside grant", "over cap". Then raise WeightReadRefused with that
+     text. Without a grant, the note and behaviour match P1 apart from the ": no grant" suffix.
+  4. recheck(reservation): if the id is an open weight reservation, then under the lock, if not grant_active, or if
+     (totals.weight - weight_at_grant) + reserved_weight > cap_bytes (the reserved amount already includes this
+     reservation), emit "refused" (note f"retry over cap: ...") and raise WeightReadRefused. Otherwise do nothing.
+  5. release(id) and record(release=id) release weight reservations too (P1 semantics).
+  6. note(event, ...) accepts exactly NOTE_EVENTS (else ValueError).
+  7. add_gate_decision appends a deep copy (copy.deepcopy); the decision must json.dumps (else ValueError).
+     to_card_dict adds "gate": list of the decisions.
+  8. hub.py: in _get's attempt loop, before sending attempt k >= 2, call self.log.recheck(reservation). A
+     WeightReadRefused raised there propagates. The reservation is released in the existing finally block, and no
+     further attempts are made.
+  9. No other P1 behaviour changes. All P1 tests (tests/test_bytelog.py, tests/test_hub_source.py) must still pass
+     unmodified, except where an assertion compares the exact WeightReadRefused message text. Those may be updated
+     to allow the ": no grant" suffix.
+acceptance:
+  tests:
+    - "test_no_grant_unchanged: set_header_len(p, 100); preflight(p, 108, 120) raises WeightReadRefused; note contains 'no grant'; totals unchanged"
+    - "test_grant_allows_exact: stage up to SAMPLED_READ; grant('x', [(p,108,208)], cap=100); preflight(p,108,208) returns an id; record(fetch, start=108, nbytes=100, release=id) -> totals.weight == 100"
+    - "test_grant_subrange_ok_and_outside_refused: (p,150,160) is allowed; (p,100,160) is refused as 'mixed range' (header bytes); (p,200,300) is refused as 'outside grant'; another path is refused"
+    - "test_grant_wrong_stage: grant() in HEADERS raises StageOrderError; after grant, stage(COMPUTE) revokes it (a 'gate' event with 'revoked') and a later weight preflight is refused with 'no grant'"
+    - "test_cap: grant cap=150 over two 100-byte ranges: the first is allowed; the second is refused 'over cap' while the first reservation is open; after record(release) of 100 bytes, the second is still refused (100+100 > 150)"
+    - "test_recheck_cap: grant cap=150, range 100 bytes; r = preflight; record(event='retry', nbytes=60, start=108) (no release) -> recheck(r) raises WeightReadRefused (60 + 100 > 150); with cap=160, recheck passes"
+    - "test_weight_reservation_not_in_nonweight_threshold: ByteLog(threshold_bytes=50); an open 100-byte weight reservation does not make a 10-byte meta preflight fail"
+    - "test_note_events: note('gate', ...) and note('purge', ...) work; note('fetch', ...) raises ValueError"
+    - "test_gate_decisions: add_gate_decision({'plan_id':'x','approved':True}) -> to_card_dict()['gate'] == [that dict]; mutating the input afterwards does not change it; a non-JSON value raises ValueError"
+    - "test_revoke_idempotent: revoke_grant() twice emits exactly one 'revoked' event"
+    - "tests/test_hub_recheck.py (FakeHub): write a repo with st_fixtures; read the header of one shard; stage to SAMPLED_READ; grant exactly one tensor's range with cap = its nbytes + 3; inject(shard,'reset',times=1,after_bytes=5) -> read_range raises WeightReadRefused on the retry (5 + n > n + 3), exactly 1 retry event, reserved == 0; with cap = 2*nbytes the same read succeeds and totals.weight == nbytes + 5"
+    - "all P1 tests still pass"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_bytelog_grant.py tests/test_hub_recheck.py
+    - pytest -q
+out_of_scope:
+  - the plan/gate UI or confirmers (T106, T112, T113)
+  - sampling logic (T106, T108)
+invariants_touched: [1, 2]
+decisions: []

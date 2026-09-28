@@ -1,0 +1,122 @@
+id: T106
+title: Sample plan (which tensors, which byte ranges) + download gate + confirmers
+depends_on: [T101, T008, T107]
+files:
+  - scout/gate.py
+  - tests/test_gate.py
+route: opus
+spec_complete: true
+interface: |
+  scout/gate.py:
+    from scout.sigma import SIGMA_PARAMS, ROLE_ORDER, SUPPORTED_DTYPES
+
+    @dataclass(frozen=True)
+    class UnitInput:
+        component: str | None
+        structure: Structure                       # scout.structure.Structure
+        headers: list[SafetensorsHeader]           # scout.safetensors_header
+
+    @dataclass(frozen=True)
+    class PlannedRead:
+        component: str | None; path: str; tensor: str; role: str; block_index: int
+        start: int; end_exclusive: int; dtype: str; shape: tuple[int, int]
+        def to_dict(self) -> dict                  # shape as list
+
+    @dataclass(frozen=True)
+    class UnitPlan:
+        component: str | None; stack_prefix: str; roles: list[str]; role_rel: dict[str, str]
+        depth: int; bytes_per_layer_max: int
+
+    @dataclass(frozen=True)
+    class SamplePlan:
+        plan_id: str; repo: str; revision_sha: str; reads: list[PlannedRead]; units: list[UnitPlan]
+        skipped: list[dict]                        # [{"component", "reason"}]
+        bytes_planned: int; bytes_cap: int; disk_bytes: int; memory_peak_bytes: int
+        threshold_bytes: int; reason: str
+        def per_file(self) -> list[dict]           # [{"path","n_reads","bytes"}] sorted by path
+        def to_dict(self) -> dict                  # plan.md 4.4, incl. per_file
+
+    @dataclass(frozen=True)
+    class GateDecision:
+        plan_id: str; approved: bool; via: str; bytes_planned: int; bytes_cap: int; bytes_confirmed: int | None
+        threshold_bytes: int; disk_bytes: int; memory_peak_bytes: int; n_reads: int; reason: str; decided_at: str
+        def to_dict(self) -> dict                  # plan.md 4.2 GateDecision
+
+    Confirmer = Callable[[SamplePlan], GateDecision]
+
+    def plan_sample(repo: str, revision_sha: str, units: list[UnitInput],
+                    threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES) -> SamplePlan
+    def decision(plan: SamplePlan, *, approved: bool, via: str, bytes_confirmed: int | None) -> GateDecision
+    def flag_confirmer(confirm_bytes: int | None) -> Confirmer
+    def prompt_confirmer(stdin: TextIO, stderr: TextIO) -> Confirmer
+    def format_plan(plan: SamplePlan) -> str
+    def run_gate(plan: SamplePlan, log: ByteLog, confirmer: Confirmer | None) -> GateDecision
+behavior: |
+  plan_sample:
+    1. For each unit (in the given order): tensors = {t.name: t for h in headers for t in h.tensors};
+       header_len = {h.path: h.header_len for h in headers}.
+       stack = structure.stacks[0] if structure.stacks else None. If stack is None or stack.depth < SIGMA_PARAMS["min_layers"]:
+       skipped += {"component", "reason": f"no stack with >= {min_layers} blocks"}; continue.
+    2. roles = []; per_layer = [0]*depth. For role in ROLE_ORDER: find the FIRST pattern p in SIGMA_PARAMS["role_patterns"][role]
+       such that f"{prefix}.{idx}.{p}" is in tensors for EVERY idx in stack.indices. None -> skipped reason
+       f"{prefix}: role {role} not found in every block"; continue with the next role.
+       Eligibility of every such tensor: len(shape) == 2, dtype in SUPPORTED_DTYPES, min(shape) >= SIGMA_PARAMS["min_dim"];
+       the first failure -> skipped reason f"{prefix}: role {role} {name}: {what}" and the role is dropped.
+       Byte cap: if max_l(per_layer[l] + nbytes_l) > SIGMA_PARAMS["max_bytes_per_layer"] -> skipped reason
+       f"{prefix}: role {role} would exceed {cap} B per layer"; drop the role. Else add it and update per_layer.
+    3. If no role was added, the unit has no UnitPlan. Otherwise add UnitPlan(component, prefix, roles, {role: p},
+       depth, max(per_layer)), and for each block position l (in stack.indices order) and each added role (ROLE_ORDER order):
+       PlannedRead(component, t.file, t.name, role, idx, 8 + header_len[t.file] + t.data_begin,
+       8 + header_len[t.file] + t.data_end, t.dtype, tuple(t.shape)).
+    4. bytes_planned = sum(end - start); bytes_cap = bytes_planned + scout.bytelog.RETRY_SLACK_BYTES if reads else 0
+       (the module attribute is looked up at call time, so tests can monkeypatch it); disk_bytes = 0;
+       memory_peak_bytes = bytes_planned + 8 * max(m*n over reads) (0 if no reads);
+       reason = "; ".join(f"sigma-curve sample for layer comparison: {', '.join(u.roles)} x {u.depth} blocks of {u.stack_prefix}"
+       + (f" ({u.component})" if u.component else "") for u in units) or "nothing sampleable".
+       plan_id = sha256(json.dumps([repo, revision_sha, [[r.path, r.start, r.end_exclusive] for r in reads]],
+       separators=(",",":")).encode()).hexdigest()[:16].
+  decision(): decided_at = UTC now ISO-8601 with "Z"; the other fields are copied from the plan (n_reads = len(reads)).
+  flag_confirmer(n): approved iff n is not None and n >= plan.bytes_cap; via "cli-flag"; bytes_confirmed = n.
+  prompt_confirmer(stdin, stderr): write format_plan(plan) and then
+    f'Type "yes" to read up to {plan.bytes_cap} bytes of weights into memory (planned {plan.bytes_planned}): '
+    to stderr and flush; answer = stdin.readline().strip(); approved iff answer == "yes"; via "cli-prompt";
+    bytes_confirmed = plan.bytes_cap if approved else None.
+  format_plan(plan): exact line format:
+    "DOWNLOAD GATE: {repo}@{sha[:12]}"
+    "  reason: {reason}"
+    "  reads: {n} ranged reads in {k} files"
+    "  bytes planned: {bytes_planned:,} B ({mib:.1f} MiB)   hard cap incl. retries: {bytes_cap:,} B"
+    "  disk: 0 B (held in memory, released after COMPUTE); memory peak <= {memory_peak_bytes:,} B"
+    "  threshold: {threshold_bytes:,} B"
+    then one line per file "    {path}  {n_reads} reads  {bytes:,} B", then one line per skipped entry "  skipped: {component or '-'}: {reason}".
+  run_gate(plan, log, confirmer):
+    1. log.note("gate", f"plan {plan_id}: planned={bytes_planned} cap={bytes_cap} disk=0 memory={memory_peak_bytes} reads={n} reason={reason}").
+    2. If plan.bytes_cap <= plan.threshold_bytes -> d = decision(approved=True, via="below-threshold", bytes_confirmed=None).
+       Elif confirmer is None -> d = decision(approved=False, via="no-confirmer", bytes_confirmed=None).
+       Else d = confirmer(plan). If d.plan_id != plan.plan_id, or (d.approved and (d.bytes_confirmed is None or
+       d.bytes_confirmed < plan.bytes_cap)), then replace d with decision(approved=False, via=d.via, bytes_confirmed=d.bytes_confirmed).
+       A confirmer exception -> declined via "error".
+    3. log.add_gate_decision(d.to_dict()); log.note("gate", f"plan {plan_id} {'approved' if d.approved else 'declined'} via {d.via}").
+    4. Return d. run_gate never grants and never reads; the caller (T108) grants on approval or raises GateDeclined.
+acceptance:
+  tests:
+    - "fixtures: write_family_repo (T103) with FamilySpec(seed=1) (16 layers, kv 64 x hidden 128, BF16), read via LocalSource + read_header + analyze (P1)"
+    - "test_plan_dense: 32 reads (16 blocks x [v,k]); each read range == [8+N+data_begin, 8+N+data_end) of the right tensor; bytes_planned == 32*64*128*2; bytes_cap == bytes_planned + 16 MiB; roles == ['attn.v','attn.k']; plan_id is stable across calls and changes when one range changes"
+    - "test_plan_cap: monkeypatch SIGMA_PARAMS['max_bytes_per_layer'] to 64*128*2 -> only attn.v is planned; skipped mentions 'attn.k' and 'per layer'"
+    - "test_plan_shallow: a 4-layer family -> no reads; skipped reason mentions '>= 8'"
+    - "test_plan_dtype: a family written with dtype that the test forces to 'F8_E4M3' in the header (hand-built TensorInfo) -> role skipped"
+    - "test_plan_moe: P1 st_fixtures moe_tensors with hidden=64, head_dim=16, kv_heads=2, n_layers=8 (k/v 32x64, BF16) -> reads only for attention k/v, none for experts"
+    - "test_plan_pipeline: two UnitInputs (text_encoder with a family, vae with a P1 vae fixture) -> reads only for text_encoder; vae is in skipped"
+    - "test_run_gate_below_threshold: threshold >= cap -> approved via below-threshold, confirmer NOT called (spy); 2 gate events + 1 decision in log"
+    - "test_run_gate_flag: flag_confirmer(cap) approves; flag_confirmer(cap-1) and flag_confirmer(None) decline"
+    - "test_run_gate_bad_confirmer: a confirmer returning approved with another plan_id -> declined; one returning approved with bytes_confirmed < cap -> declined; one raising -> declined via 'error'"
+    - "test_prompt: io.StringIO('yes\\n') approves; 'y\\n' declines; stderr contains 'DOWNLOAD GATE' and the exact bytes_planned with thousands separators"
+    - "test_no_bytes: run_gate never changes log.totals and never creates a grant (grant_active False)"
+  commands:
+    - pytest -q tests/test_gate.py
+    - pytest -q
+out_of_scope:
+  - performing reads or granting (T108)
+  - CLI/HTTP confirmation plumbing (T112, T113)
+invariants_touched: [1, 2, 4]
+decisions: []
