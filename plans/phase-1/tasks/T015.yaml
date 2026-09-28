@@ -1,5 +1,5 @@
 id: T015
-title: Exit check runner (C0 target set, CountingTransport), pin script with git ls-remote cross-check, pins file, network test
+title: Exit check runner (C0 target set, per-target server + CountingTransport), pin script with git ls-remote cross-check, pins file, network test
 depends_on: [T012, T013, T016]
 files:
   - scripts/exit_check.py
@@ -24,6 +24,12 @@ interface: |
             inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
             expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,   # default DEFAULT_EXPECTATIONS
             budget_s: float = BUDGET_S) -> list[Check]      # budget_s/endpoint/allowed_hosts overridable only by offline tests
+    def _client_for(counting: CountingTransport) -> httpx.Client
+        # httpx.Client(transport=counting, timeout=10.0)
+    def _scan_target(repo: str, sha: str, out_dir: Path, *, endpoint: str,
+                     inner_transport_factory: Callable[[], httpx.BaseTransport]) -> TargetResult
+        # builds a fresh CountingTransport + its own make_server(client_factory=partial(_client_for, counting)),
+        # scans one target, shuts the server down, and returns the TargetResult with wire = counting.records
     def check_target_set(pins: dict[str, str], expectations: dict) -> Check
         # Check(target="*", name="C0 target set", expected=sorted(expectations), actual=sorted(pins), ok=set(pins)==set(expectations))
     def main(argv: list[str] | None = None) -> int
@@ -51,14 +57,22 @@ behavior: |
        - otherwise, if this URL equals a Location seen in an earlier 3xx record -> that record's orig_path;
        - else None.
      location = the resolved absolute Location header for 3xx, else None. range = request.headers.get("range").
-  2. run: one CountingTransport per target, created from inner_transport_factory(). client_factory = lambda:
-     httpx.Client(transport=counting, timeout=10.0). make_server(port=0, out_dir=out_dir, endpoint=endpoint,
-     client_factory=client_factory) runs in a daemon thread. Per (repo, sha) in pins order: target f"{repo}@{sha}";
+  2. run: targets are scanned STRICTLY SEQUENTIALLY. Each target gets its OWN server and its OWN fresh CountingTransport,
+     via _scan_target (see interface). For each (repo, sha) in pins order:
+       - counting = CountingTransport(inner_transport_factory())
+       - client_factory = functools.partial(_client_for, counting). This binds the transport at creation time, with no
+         shared holder and no closure over a loop variable.
+       - server = make_server(port=0, out_dir=out_dir, endpoint=endpoint, client_factory=client_factory), run in a daemon
+         thread
+       - target = f"{repo}@{sha}"
+     After the scan reaches done or error and the results are collected, call server.shutdown() and server.server_close()
+     and join the server thread, in a finally block (so it also runs on timeout or exception), BEFORE the next target's
+     CountingTransport or server is created. Scans never overlap. TargetResult.wire = counting.records of that target only.
      t0 = monotonic; POST /api/scans; poll every 0.1 s until done/error or 60 s; elapsed = monotonic - t0. The control
      requests to the local server use a separate plain httpx.Client (not counted). Then GET with since=0 for all events,
      load the cards under out_dir/repo_slug(repo)/sha/ via load_card, build a TargetResult (T016) with wire = counting.records,
      and extend checks with common_checks(r, budget_s, allowed_hosts=allowed_hosts, expected_endpoint=endpoint) + expectations[repo](r).
-     Shut the server down at the end.
+     Each per-target server is shut down inside _scan_target.
   2a. run() FIRST computes c0 = check_target_set(pins, expectations). If not c0.ok it returns [c0] immediately: no server,
      no scans. Otherwise the result list starts with c0. There is no code path that scans a repo without an expectation
      function.
@@ -95,6 +109,7 @@ acceptance:
     - "test_no_budget_flag: main(['--budget-s','60']) exits with argparse error code 2"
     - "test_c12_disallowed_host: offline run with allowed_hosts={'hub.test'} only (cdn.test missing) -> C12 not ok"
     - "test_summary_line: the last stdout line of a (monkeypatched run) main parses as JSON with keys endpoint, budget_s == 10.0, hosts, git_commit, git_dirty, hostname"
+    - "test_transport_per_target: pins with two FakeHub repos 'org/a' and 'org/b' (distinct file names, expectations for both) -> no wire record of target A (any URL containing '/org/a/' or an orig_path of org/a's files) appears in target B's TargetResult.wire and vice versa; the two CountingTransport instances are distinct objects; make_server was called exactly twice (spy) with distinct client_factory objects, and the first server's shutdown() was called before the second make_server call"
     - "test_run_c0: run(pins={'org/a':'a'*40}, expectations={'org/b': ...}) returns exactly one Check, C0, not ok"
     - "tests/test_pin_exit.py: with a fake run_cmd: (1) scout and git agree -> 0, pins file written with the 3 required repos, JSON evidence line printed; (2) they disagree for one repo -> 1 and the pins file is unchanged; (3) git returns an empty string -> 1; (4) run_cmd raises CalledProcessError -> 1, file unchanged"
     - "test_unlogged_read_fails_c11: monkeypatch scout.hub.HubSource.read_file to also do an unlogged self.client.get(<the config.json resolve url>) and read its body -> C11 not ok, everything else still runs"

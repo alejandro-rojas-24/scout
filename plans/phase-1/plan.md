@@ -604,6 +604,8 @@ Offline tests cover:
 - **Concurrent Card writes (r3-m12):** temp names come from `mkstemp` (T009).
 - **Fused-expert MoE (r3-m8):** detected with a warning only (T008). Scheduling
   fused-expert support is deferred.
+- **Per-target CountingTransport switching (r3-m11):** resolved in T015. Targets run
+  sequentially, each with its own `make_server` bound to a fresh `CountingTransport`.
 
 Every other unresolved minor from r1, r2 and r3, including the rejected ones, is
 listed in `/FUTURE_IMPROVEMENTS.md` under "Phase 1".

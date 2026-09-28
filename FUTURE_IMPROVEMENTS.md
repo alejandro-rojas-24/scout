@@ -4,7 +4,6 @@ This file collects non-blocking review findings per phase for a later wave.
 
 ## Phase 1
 
-- **Per-target CountingTransport switching** — T015 behavior 2. Use a mutable holder (`current["transport"]`, set before each POST, with scans strictly sequential) or one `make_server` per target. Without this, a single `client_factory` can attribute every target's traffic to one transport and corrupt C10/C11. Source: r3-m11.
 - **Map redirect targets by normalised URL; no unmapped CDN bodies** — T015 behavior 1, T016 C10, plan §2 C10. Compare `httpx.URL` objects, not strings. C10 should also FAIL if any 2xx record with `body_bytes > 0`, other than the API call, has `orig_path` None. Source: r3-m2.
 - **Catch HTTP that bypasses the injected client** — T015 behavior 2, plan §2 C11. In `run()`, patch `httpx.HTTPTransport.handle_request` at class level, or guard `socket.connect`. Add an offline test in which a fetch goes through a fresh `httpx.Client`. Soften the "no unlogged fetch path exists" wording. Source: r3-m3.
 - **Automated view checks per target** — T016 behavior 3, plan §2 E1/E3. Assert the following automatically instead of relying on the manual E5:
