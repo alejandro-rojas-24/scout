@@ -1,3 +1,5 @@
 {"ts":"2026-09-28T21:05:42Z","agent":"orchestrator","model":"opus","step":"PLAN","task_id":null,"status":"spawn","note":"phase 2 planner round 1; branch plan/phase-2-diff-view stacked on phase-1"}
 {"ts":"2026-09-28T21:31:28Z","agent":"planner","model":"opus","step":"PLAN","task_id":null,"status":"done","note":"plan.md + T101-T116 + later.md; Card v0->v1; 15 opus / 1 sonnet"}
 {"ts":"2026-09-28T21:31:28Z","agent":"orchestrator","model":"opus","step":"VALIDATE","task_id":null,"status":"spawn","note":"validator round 1, fresh context"}
+{"ts":"2026-09-28T21:38:31Z","agent":"validator","model":"opus","step":"VALIDATE","task_id":null,"status":"REVISE","note":"round 1: 1 blocker (gate approves unseen plans), 3 major (shared-arch confound / offdiag null, threshold derivation d_eff wrong - validator ran numpy on fixtures, T109->T108 dep), 8 minor; classifier outage during validator run, orchestrator verified only validation.md written"}
+{"ts":"2026-09-28T21:38:31Z","agent":"orchestrator","model":"opus","step":"REVISE","task_id":null,"status":"handoff","note":"round 1 findings -> planner"}
