@@ -18,6 +18,7 @@ interface: |
     class RevisionMismatch(ScoutError)
     class NetworkError(ScoutError)                   # exit_code 4
     class RangeNotSupported(ScoutError)              # exit_code 4
+    class HubAPIError(ScoutError)                    # exit_code 4; unexpected Hub API status or malformed body
     class HeaderError(ScoutError)
     class NoSafetensorsError(ScoutError)
     class AmbiguousWeightsError(ScoutError)

@@ -14,7 +14,8 @@ interface: |
     class FakeHub:
         def __init__(self) -> None
         def add_repo(self, repo_id: str, root: pathlib.Path, sha: str = "a" * 40,
-                     gated: bool = False, token: str | None = None) -> None
+                     gated: bool = False, token: str | None = None,
+                     meta_redirect: str | None = None) -> None     # None | "relative307"
         def inject(self, path: str, mode: str, times: int = 1, after_bytes: int = 0) -> None
             # mode in {"reset", "503", "ignore_range"}; path is repo-relative; applies to CDN requests of that path
         def transport(self) -> httpx.MockTransport
@@ -25,18 +26,23 @@ behavior: |
   1. add_repo stores repo_id -> (root, sha, gated, token). Files are every regular file under root
      (recursive), relpath with "/" separators, excluding names starting with ".".
   2. GET {HUB}/api/models/{owner}/{name}/revision/{rev} (any query string):
-     - unknown repo -> 401 JSON {"error": "Repository Not Found"}
-     - rev not in {"main", sha} -> 404 JSON {"error": "Revision Not Found"}
+     - unknown repo -> 401 JSON {"error": "Repository Not Found"} with header "X-Error-Code: RepoNotFound"
+     - rev not in {"main", sha} -> 404 JSON {"error": "Revision Not Found"} with header "X-Error-Code: RevisionNotFound"
      - else 200 JSON {"id": repo_id, "sha": sha, "gated": ("manual" if gated else False),
        "siblings": [{"rfilename": rel, "size": file size} for each file sorted by rel]}
   3. GET {HUB}/{owner}/{name}/resolve/{rev}/{path...}:
-     - unknown repo -> 401; rev != sha -> 404; file missing -> 404 JSON {"error":"Entry not found"}
+     - unknown repo -> 401 (X-Error-Code: RepoNotFound); rev != sha -> 404 (X-Error-Code: RevisionNotFound);
+       file missing -> 404 JSON {"error":"Entry not found"} (X-Error-Code: EntryNotFound)
      - gated and request Authorization != f"Bearer {token}" -> 401 with header "X-Error-Code: GatedRepo"
        and JSON {"error": "Access to model is restricted"}
      - path ends with ".safetensors" -> 302 with Location f"{CDN}/{sha}/{path}" and the non-empty body
        b"Found. Redirecting" (18 bytes), so tests can check that 3xx bodies are counted. It is a different host, so
        the client must drop the Authorization header when it follows.
+     - otherwise, if the repo has meta_redirect == "relative307": 307 with the RELATIVE Location
+       f"/api/resolve-cache/models/{owner}/{name}/{sha}/{path}" and body b"Temporary Redirect" (18 bytes);
      - otherwise serve the file from HUB directly with the same range semantics as the CDN (step 4)
+  3b. GET {HUB}/api/resolve-cache/models/{owner}/{name}/{sha}/{path...}: serve the file (same range semantics as step 4,
+     no gating check); 404 if missing. These requests are recorded in self.requests, not in cdn_reads.
   4. GET {CDN}/{sha}/{path}: find the file by sha+path across repos (404 if missing).
      Range header "bytes=a-b" (inclusive) -> 206, body = data[a:b+1], headers Content-Range
      f"bytes {a}-{min(b,len-1)}/{len}" and Content-Length. No Range -> 200 full body.
@@ -57,6 +63,8 @@ acceptance:
     - "test_gated: 401 without token, 206 with the correct Bearer token"
     - "test_inject_reset: streaming read raises httpx.ReadError after exactly after_bytes bytes; second request succeeds"
     - "test_inject_ignore_range: 200 and full length"
+    - "test_relative307: add_repo(meta_redirect='relative307'); get(resolve url of config.json, follow_redirects=False) -> 307 with a Location starting with '/api/resolve-cache/'; following it (httpx auto) returns the file"
+    - "test_error_codes: X-Error-Code is RepoNotFound / RevisionNotFound / EntryNotFound / GatedRepo on the respective errors"
     - "uses tests.helpers.st_fixtures.write_dense_repo for data"
   commands:
     - pytest -q tests/test_fakehub.py

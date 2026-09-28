@@ -12,6 +12,7 @@ interface: |
     API_PATH = "@api/revision"                 # logged path for the API call (classified meta)
     REDIRECT_PATH = "@redirect"                # logged path for 3xx bodies (classified meta)
     MAX_REDIRECTS = 5
+    REDIRECT_MAX_BYTES = 64 * 1024             # per-hop cap and reservation for a 3xx body
     SHA_RE = re.compile(r"^[0-9a-f]{40}$")
     REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
@@ -39,10 +40,17 @@ behavior: |
   2. resolve(): r = log.preflight(API_PATH, 0, META_MAX_BYTES). GET
      f"{endpoint}/api/models/{repo}/revision/{quote(rev or 'main', safe='')}" with params {"blobs": "true"}, through
      _get(logged_path=API_PATH, start=None, cap=META_MAX_BYTES, reservation=r).
-     Status 401 or 404 with a body error containing "Repository Not Found" -> RepoNotFoundError(f"{repo}: not
-     found or private (HF_TOKEN {'set' if token else 'not set'})"). Other 404 -> RepoNotFoundError (revision not found).
-     403 -> GatedRepoError. Parse JSON: revision_sha = body["sha"]. If requested_revision matches SHA_RE and differs
-     -> RevisionMismatch. files = [RepoFile(s["rfilename"], s.get("size"))], sorted.
+     Error mapping for every non-2xx API response, applied in order:
+       a. Header X-Error-Code: "RepoNotFound" or "RepositoryNotFound" -> RepoNotFoundError(f"{repo}: not found or private
+          (HF_TOKEN {'set' if token else 'not set'})"); "RevisionNotFound" -> RepoNotFoundError(f"{repo}@{rev}: revision
+          not found"); "GatedRepo" -> GatedRepoError.
+       b. Else a case-insensitive body match: "repository not found" -> RepoNotFoundError; "revision not found" ->
+          RepoNotFoundError (revision); "gated" or "restricted" -> GatedRepoError.
+       c. Else by status: 401 -> RepoNotFoundError (not found or private); 403 -> GatedRepoError; 404 -> RepoNotFoundError;
+          429/5xx -> retryable (step 6); any other status -> HubAPIError(f"{repo}: API status {code}").
+     On 2xx: the body must be a JSON object with a str "sha" and a list "siblings", else HubAPIError (never a bare
+     KeyError). revision_sha = body["sha"]. If requested_revision matches SHA_RE and differs -> RevisionMismatch.
+     files = [RepoFile(s["rfilename"], s.get("size"))], sorted.
   3. File URL = f"{endpoint}/{repo}/resolve/{revision_sha}/{quote(path)}". Always the resolved sha, never the branch.
   4. read_file(path): None if path is not in files. n = size if known, else META_MAX_BYTES; r = preflight(path, 0, n).
      GET without Range, expect 200; _get(start=0, cap=n, reservation=r).
@@ -67,10 +75,11 @@ behavior: |
      On success: log.record(event="fetch", ..., url=str(final url), release=reservation).
      When attempts run out: log.note("error", ...) and raise NetworkError(f"{path}: {attempts} attempts failed: {last}").
      In every case, log.release(reservation) in a finally block.
-  7. Manual redirects: for status in (301, 302, 303, 307, 308), read the full 3xx body and record it as
-     event "fetch", path REDIRECT_PATH, start None, url=request url, status, note=f"-> {location host}". This is meta and
-     does not use the file's reservation; it is covered by the cap check of META_MAX_BYTES per redirect body (abort
-     with ReadThresholdExceeded beyond it). Resolve Location relative to the request URL. Send the next hop with the
+  7. Manual redirects: for status in (301, 302, 303, 307, 308): rr = log.preflight(REDIRECT_PATH, 0, REDIRECT_MAX_BYTES)
+     (a reservation per hop). Stream the 3xx body counting bytes; if it exceeds REDIRECT_MAX_BYTES, close, record what was
+     received and raise ReadThresholdExceeded. Record it as event "fetch", path REDIRECT_PATH, start None, url=request
+     url, status, note=f"-> {location host}", release=rr (meta); log.release(rr) in finally. Resolve Location relative
+     to the request URL (e.g. "/api/resolve-cache/..." -> the endpoint host). Send the next hop with the
      same Range header, with Authorization only if the new host equals the endpoint host. More than MAX_REDIRECTS hops
      -> NetworkError.
   8. No bytes are written to disk. No huggingface_hub import.
@@ -91,6 +100,9 @@ acceptance:
     - "test_cap: ByteLog(threshold_bytes=64MiB); read_file('config.json') where a wrapping MockTransport drops 'size' from that sibling in the API JSON and the file body is > META_MAX_BYTES (monkeypatch scout.hub.META_MAX_BYTES and scout.bytelog.META_MAX_BYTES to 100) -> ReadThresholdExceeded; the received bytes are recorded"
     - "test_gated: add_repo(gated=True, token='hf_x'): without a token read_file('config.json') raises GatedRepoError mentioning 'HF_TOKEN not set'; with token='hf_x' it succeeds"
     - "test_repo_not_found: RepoNotFoundError"
+    - "test_error_mapping: a wrapping MockTransport (1) keeps X-Error-Code RepoNotFound but changes the body to {'error':'nope'} -> RepoNotFoundError; (2) drops the header and lowercases the body to 'repository not found' -> RepoNotFoundError; (3) returns 400 with an empty body -> HubAPIError; (4) returns 200 with {'id':'x'} (no sha) -> HubAPIError. No KeyError in any case"
+    - "test_relative307_meta: add_repo(meta_redirect='relative307'): read_file('config.json') returns the right bytes; one '@redirect' fetch event of 18 bytes; the second hop goes to HUB '/api/resolve-cache/...'; totals.meta == 18 + file size (+ API bytes)"
+    - "test_redirect_body_cap: a transport returns a 302 with a 70 KiB body -> ReadThresholdExceeded; the received bytes are recorded; reserved == 0"
     - "test_env_token: monkeypatch HF_TOKEN -> the Authorization header is used for HUB requests"
   commands:
     - pytest -q tests/test_hub_source.py

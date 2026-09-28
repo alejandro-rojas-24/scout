@@ -35,3 +35,4 @@ Unscheduled
 - Environment: the egress proxy in the planning container blocks huggingface.co,
   cdn-lfs*.hf.co and cas-bridge.xethub.hf.co. Allowlisting them would let EXIT run here.
 - Local folder inside an HF cache `snapshots/<sha>/`: optionally use that SHA as the key after verifying blob hashes (validation round 1, rejected for P1).
+- Reuse the CDN/Xet Location from the 8-byte read for the [8, 8+N) read, re-resolving on 403/expiry, to save one hop per file (validation round 2, deferred: not needed for the 10 s budget).

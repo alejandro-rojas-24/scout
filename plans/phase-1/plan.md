@@ -11,17 +11,38 @@ bytes read.
 
 ## 2. Exit check (runnable, falsifiable)
 
-Pins: `exit/pins.json` maps each exit repo to a 40-hex commit SHA. It is committed
+**Target set (fixed).** The exit targets are exactly these three:
+- `Qwen/Qwen3-8B`
+- `Qwen/Qwen3-30B-A3B`
+- `Qwen/Qwen-Image`
+
+These are the keys of `DEFAULT_EXPECTATIONS` (T016).
+- `exit_check.py` FAILs with the named check **C0 target set** and a non-zero exit
+  whenever `set(pins) != set(expectations)`. It then runs no scans. A repo without
+  an expectation function can never be scanned by the exit check.
+- There is no fallback repo. Replacing any target is a human decision. That
+  decision is logged in `log.jsonl` before the run, and is followed by a plan
+  revision that adds an expectation function with tests (T016). It is never done
+  after a FAIL without that prior record.
+
+**Pins.** `exit/pins.json` maps each target to a 40-hex commit SHA. It is committed
 with the literal value `"UNPINNED"` in T015. At EXIT, on a machine that can reach
-huggingface.co, the orchestrator runs the commands below once, writes the printed
-SHAs into `exit/pins.json`, logs the action to `plans/phase-1/log.jsonl` and commits
-the file. After that the SHAs never change. Every scan then requests `repo@<sha>`,
-and `HubSource.resolve()` raises `RevisionMismatch` if the API returns a different SHA.
+huggingface.co, the operator runs `scripts/pin_exit.py` once (T015). For each target
+it:
+- runs `scout resolve <repo>` (subprocess)
+- independently runs `git ls-remote https://huggingface.co/<repo> refs/heads/main`.
+  This is plain git and involves no scout code.
+- requires both SHAs to be identical and 40-hex; otherwise it exits non-zero and
+  writes nothing
+- writes `exit/pins.json`
+- prints one JSON evidence line `{step:"PIN", hostname, repos:{repo:{scout, git_ls_remote}}}`
+
+The operator appends that line to `plans/phase-1/log.jsonl` and commits the pins.
+After that the SHAs never change. Every scan requests `repo@<sha>`, and
+`HubSource.resolve()` raises `RevisionMismatch` if the API returns a different SHA.
 
 ```bash
-scout resolve Qwen/Qwen3-8B          # prints one 40-hex sha to stdout, 0 weight bytes
-scout resolve Qwen/Qwen3-30B-A3B
-scout resolve Qwen/Qwen-Image
+python scripts/pin_exit.py --pins exit/pins.json   # exit 0 only if scout and git ls-remote agree for all 3
 ```
 
 When this plan was written, huggingface.co, cdn-lfs.hf.co and
@@ -68,10 +89,11 @@ that records for every request:
 It maps each redirect target back to its original resolve path, so opaque Xet or CDN
 URLs are still attributed to the right file.
 
-**Common checks for every target (C1–C11). C6 and C9 are sanity checks, not evidence:**
+**C0 once, then common checks for every target (C1–C11). C6 and C9 are sanity checks, not evidence:**
 
 | # | Check | Threshold |
 |---|-------|-----------|
+| C0 | target set: `set(pins) == set(expectations)` (checked before any scan) | equal, else FAIL and exit 1 |
 | C1 | wall time POST → done with views | `< 10.0 s` |
 | C2 | `totals.weight` from the server, from every Card's `fetch_log.totals.weight`, and the sum of `bytes_by_class.weight` over all events | all `== 0` |
 | C3 | header bytes in successful `fetch` events | `== Σ over weight files (8 + header_len)`, which means exactly the headers were read and nothing more |
@@ -141,9 +163,11 @@ Run `scout serve`, open http://127.0.0.1:8765 and scan each of the three `repo@p
 targets.
 
 For every target the page must show:
+- all view sections within 10 s of clicking Scan (stopwatch). Record the seconds
+  per target.
 - log lines streaming live
 - the counter showing `weight 0 B` in green
-- the "claimed by model card" box with `license` and `base_model`
+- the "claimed by model card" box with `license`, `base_model` and `tags`
 - the three standing disclaimers (§4.4)
 
 Per target:
@@ -350,7 +374,7 @@ keep every literal index; only the view summarizes them.
 | # | Decision | Default (recommended) | Rationale |
 |---|---|---|---|
 | D1 | **Frontend stack** | No-build vanilla stack: a single `index.html` + `app.js` (ES2020, inline SVG, no npm, no CDN) served by a Python stdlib `http.server.ThreadingHTTPServer`. The page polls the server every 250 ms for the live log. | This is a self-use tool for one person on localhost. The graph has ≤100 nodes and the strips ≤ ~100 cells, so SVG by hand is enough. No toolchain means nothing to install or keep in sync, and implementers and reviewers stay in Python. Revisit in P2 only if the diff view needs real interaction (then: Svelte + Vite). Rejected: React/Vite (toolchain), Streamlit/Gradio (weak control over live log and custom SVG), FastAPI (an extra dependency for 3 routes). |
-| D2 | Diffusion exit repo | `Qwen/Qwen-Image` (diffusers; `model_index.json`; sharded `text_encoder` = Qwen2.5-VL, sharded `transformer`, single-file `vae`; Apache-2.0, not gated) | It exercises sharded + multi-component together and matches the project's motivating case (a Qwen-derived text encoder). Fallback if the repo layout breaks the rules: `stabilityai/stable-diffusion-xl-base-1.0`, with expected components `{text_encoder, text_encoder_2, unet, vae}` and `stack down_blocks` depth 3. |
+| D2 | Diffusion exit repo | `Qwen/Qwen-Image` (diffusers; `model_index.json`; sharded `text_encoder` = Qwen2.5-VL, sharded `transformer`, single-file `vae`; Apache-2.0, not gated) | It exercises sharded + multi-component together and matches the project's motivating case (a Qwen-derived text encoder). No fallback. Replacing it is a human decision, logged before the run and followed by a plan revision (see §2 target set). |
 | D3 | Pinning when the Hub is unreachable here | Pins are resolved at EXIT with `scout resolve` on a host that can reach huggingface.co and its CDNs (`huggingface.co`, `cdn-lfs*.hf.co`, `cas-bridge.xethub.hf.co`), then committed. Implementation and the offline suite need no network. | The planning container's egress proxy rejected those hosts. A human must either allowlist them or run E1–E4 locally. |
 | D4 | HTTP client | Own thin `httpx` client, not `huggingface_hub` | Every body byte must be counted and classified at the source. `huggingface_hub` downloads through its own cache and would write files (which violates invariant 1) and hide byte counts. |
 | D5 | Read threshold | `64 MiB` of non-weight bytes per scan (`--max-read-bytes`). Weight reads are always refused in P1. | Qwen3-30B-A3B headers are ≈2–3 MB in total. 64 MiB leaves 20× headroom and still stops pathological headers. |
@@ -380,7 +404,7 @@ scout/view.py                          T011
 scout/cli.py                           T012
 scout/server.py                        T013
 scout/web/index.html, scout/web/app.js T014
-scripts/exit_check.py, exit/pins.json, tests/test_exit_network.py  T015
+scripts/exit_check.py, scripts/pin_exit.py, exit/pins.json, tests/test_exit_network.py  T015
 scripts/exit_expectations.py, tests/test_exit_expectations.py              T016
 tests/helpers/st_fixtures.py           T001  synthetic safetensors repos
 tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
@@ -409,12 +433,14 @@ tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 |---|---|
 | A weight byte slips through (the invariant fails) | Preflight refusal (T002 unit test). The exit wire checks C10 and C11 are independent of ByteLog. FakeHub counts CDN request ranges, and T010 asserts that every served range ends at or before `8+N`. Exit C2 and C3 (header bytes exactly Σ(8+N)). |
 | Server ignores Range or CDN returns 200 | T005 `test_range_ignored` checks honest counting plus an error. C3 would catch it live. |
-| Xet/CDN redirect drops Range or needs auth | `HubSource` follows redirects manually (≤ 5 hops): it resends Range, drops Authorization on a host change, and logs the 3xx body. FakeHub redirects every LFS read to a separate host (T003/T005). Live: E1–E3. |
-| 10 s budget on MoE (16 shards × 2 requests + redirect) | Headers are fetched with a thread pool (8 workers) and one shared `httpx.Client` (keep-alive). Budget ≈ 1 API call + 16×2 ranged requests ≈ 3–5 s. C1 measures it. |
+| Xet/CDN redirect drops Range or needs auth | `HubSource` follows redirects manually (≤ 5 hops): it resends Range, drops Authorization on a host change, and logs the 3xx body. FakeHub redirects every LFS read to a separate host with an absolute Location. With `meta_redirect="relative307"`, it also answers non-LFS resolves with a 307 and a relative `/api/resolve-cache/...` Location, like the current Hub. Both paths are used in T005 and in the T015 offline test. Live: E1–E3. |
+| 10 s budget on MoE (16 shards × 2 ranged reads × 2 hops) | Headers are fetched with a thread pool (8 workers) and one shared `httpx.Client` (keep-alive). Critical path ≈ 1 API call + ⌈16/8⌉ × 4 sequential round trips ≈ 9 RTTs, which is about 2 s at 200 ms RTT. C1 measures it; a latency-only FAIL goes to a human. |
 | Hub unreachable from build container | Offline suite with FakeHub; exit run on a host that has access (D3). |
 | Concurrent reads overshoot the threshold | Atomic reservation in `preflight()`. T002 test: 8 threads each request threshold/4 and at most 4 succeed. |
 | Graph too large for real diffusers VAEs | The view collapses every integer segment. The T001 fixture mirrors Wan-VAE naming, and T011 asserts ≤ 100 non-tensor nodes. |
 | Default E1–E3 expectations buggy (KeyError, vacuous match) | T016 unit-tests each expectation with a passing and a failing hand-built input. |
+| Target dropped or swapped in pins.json to dodge a FAIL | C0 target-set check; offline tests for a missing and an extra repo (T015); no fallback repo (D2). |
+| Pins wrong because scout resolve is buggy | `pin_exit.py` cross-checks every pin against `git ls-remote` and records both values. |
 | Wrong hard-coded constants | Cross-checked against `config.json` in the same Card; a mismatch FAILs and goes to a human, never gets tuned away. |
 | Partial Cards on failure | Cards are built in memory and written only after all units succeed, each by atomic temp+`os.replace`. T010 asserts the out dir stays empty on every error path. |
 | Weights persisted to disk | No `huggingface_hub`, no cache. T010 `test_no_extra_files` asserts only `*.card.json`/`*.tensors.parquet` exist under out dir and that `HOME`/tmp (monkeypatched) gain no files. |
@@ -439,7 +465,7 @@ tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 | T012 | CLI (`scan`, `resolve`, `serve`) | sonnet | T010, T013 |
 | T013 | HTTP server (stdlib) | sonnet | T010, T011 |
 | T014 | Frontend (index.html + app.js) | opus | T013 |
-| T015 | Exit check runner, CountingTransport, pins, network test | opus | T012, T013, T016 |
+| T015 | Exit check runner (C0 target set), CountingTransport, pin script, pins, network test | opus | T012, T013, T016 |
 | T016 | Exit expectations E1–E3 + C-checks as pure functions + offline tests | sonnet | T011 |
 
 Tasks that can run in parallel (no shared files): {T002, T003, T007}, then
@@ -489,4 +515,40 @@ Rejected (partially):
   as the key. A folder under an HF cache snapshot can be locally modified (symlink
   targets replaced), so claiming a git SHA for it would be unverifiable. The stat
   hash is honest about what it is. Deferred to later.md.
+
+## 11b. Validation responses (round 2)
+
+**Accepted:**
+- **Major, target set not enforced:**
+  - C0 fails the run unless `set(pins) == set(expectations)`, and no scans run in
+    that case.
+  - The generic path that gave unknown repos only the common checks is removed.
+  - The SDXL fallback is removed from D2; swapping a target is a logged human
+    decision followed by a plan revision.
+  - New offline tests in T015: pins missing a required repo → non-zero; pins with an
+    extra repo → non-zero; a renamed key → non-zero.
+- **Pins self-referential:** `scripts/pin_exit.py` requires `scout resolve` to equal
+  `git ls-remote https://huggingface.co/<repo> refs/heads/main`, and both are recorded
+  in log.jsonl.
+- **FakeHub never emits relative 307s for non-LFS files:** new option
+  `meta_redirect="relative307"` (T003). It is used in a T005 test and in T015
+  `test_offline_pass`.
+- **API error mapping:**
+  - The `X-Error-Code` header is checked first, then a case-insensitive body match.
+  - Any other non-2xx, or a body without `sha`, raises `HubAPIError` (new, T002,
+    exit code 4).
+  - FakeHub now sends `X-Error-Code`, and T005 has a test with a different body text.
+- **Unreserved redirect bodies:** each hop preflights and reserves
+  `REDIRECT_MAX_BYTES = 64 KiB` under `@redirect`, and larger bodies abort (T005).
+- **E5 render time and tags:** E5 now records seconds-to-sections (< 10 s) and tags
+  per target.
+
+**Rejected:**
+- **Minor, reuse the CDN Location for the second header read:**
+  - This adds a URL cache with expiry and re-resolve on 403, which is new state and
+    more failure paths.
+  - The gain is about 2 RTTs per file on a critical path already estimated at about
+    9 RTTs (about 2 s at 200 ms), so the 10 s budget is not at risk on any normal host.
+  - A latency-only C1 FAIL goes to a human per the plan.
+  - Recorded in later.md.
 
