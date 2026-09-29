@@ -1,0 +1,54 @@
+id: T204
+title: Tensor norm/std + spectral top-k in COMPUTE - TSTATS_PARAMS, compute_with_stats (same bytes, same pass as the sigma SVD)
+depends_on: [T107]
+files:
+  - scout/tstats.py
+  - scout/sigma.py
+  - tests/test_tstats.py
+route: opus
+spec_complete: true
+interface: |
+  scout/tstats.py:
+    TSTATS_PARAMS: dict = {"version": "tstats.v1", "topk": 16, "topk_normalization": "fro", "std_ddof": 0}
+    def tensor_stat(w: numpy.ndarray, sigma: numpy.ndarray) -> dict
+        # {"mean": float, "std": float, "fro": float, "topk": list[float]}; w float64 2-D, sigma descending
+    def stats_slots(stats_by_tensor: dict[str, dict]) -> tuple[dict, dict]
+        # (tensor_stats slot, spectral_topk slot) exactly as plan.md 4.1
+
+  scout/sigma.py (addition; compute_all, SIGMA_PARAMS, SampleBuffers unchanged):
+    @dataclass(frozen=True)
+    class ComputeResult:
+        sigma: dict[str, list[float]]      # as compute_all
+        stats: dict[str, dict]             # name -> tensor_stat(...)
+        released: int
+    def compute_with_stats(buffers: SampleBuffers, specs: list[tuple[str, str, tuple[int, int]]]) -> ComputeResult
+behavior: |
+  1. tensor_stat(w, sigma): mean = float(w.mean()); std = float(w.std(ddof=0)); fro = float(numpy.sqrt(numpy.sum(sigma**2)));
+     if fro <= 0 or not finite -> SigmaError("zero or non-finite norm"); k = min(TSTATS_PARAMS["topk"], len(sigma));
+     topk = [float(x) for x in sigma[:k] / fro]. (fro is computed from the singular values, so it is exactly the
+     orthogonally-invariant Frobenius norm; mean/std are descriptive only and never enter JEV features.)
+  2. stats_slots(sbt): n = len(sbt); tensor_stats = {"version": "tstats.v1", "n_tensors": n, "columns": ["stat_mean",
+     "stat_std", "stat_fro_norm"], "std_ddof": 0, "invariant_columns": ["stat_fro_norm"]}; spectral_topk = {"version":
+     "topk.v1", "k": TSTATS_PARAMS["topk"], "normalization": "fro", "n_tensors": n}.
+  3. compute_with_stats: identical control flow to compute_all (P2 T107 behavior 4: pop, released += len(raw), decode,
+     del raw, svd, ...) except that, while w is still alive, stats[name] = tensor_stat(w, s) is computed, then del w.
+     On ANY exception buffers.clear() is called (released adds its return) and the exception re-raised; after the loop,
+     resident_bytes != 0 -> SigmaError("buffers not empty after COMPUTE"). sigma values are identical to compute_all's.
+  4. No IO, no logging, no raw cosine.
+acceptance:
+  tests:
+    - "test_params_literal: TSTATS_PARAMS equals the plan.md 4.8 literal"
+    - "test_tensor_stat_known: w = diag(3,2,1) padded into 3x5 (float64) -> fro == sqrt(14) within 1e-12, topk == [3,2,1]/sqrt(14), mean == 6/15, std == numpy.std(w)"
+    - "test_invariance: W from weights_fixtures.structured_matrix (64x128); P W Q (row permutation, random orthogonal Q with sign flips) -> fro and topk equal within 1e-9 relative"
+    - "test_scale: tensor_stat(5*W) has fro 5x and identical topk (1e-12)"
+    - "test_compute_with_stats_matches: 3 buffers from BF16 arrays -> sigma equal to compute_all on a fresh copy of the same buffers (exact); stats keys == names; resident 0; released == total bytes"
+    - "test_compute_with_stats_error_clears: wrong shape in spec 2 -> SigmaError and resident_bytes == 0"
+    - "test_stats_slots: 32 entries -> n_tensors 32 in both slots, k == 16"
+  commands:
+    - pytest -q tests/test_tstats.py tests/test_sigma.py
+    - pytest -q
+out_of_scope:
+  - scan wiring (T207); Card writing (T202)
+  - pair features (T209)
+invariants_touched: [1, 4]
+decisions: []

@@ -1,0 +1,137 @@
+id: T212
+title: System 2 - Card digests, no-weights guard, s2p.v1 prompt, structured-output schema, Anthropic client + stub, post-processing that can only keep or soften
+depends_on: [T211]
+files:
+  - pyproject.toml
+  - scout/system2.py
+  - tests/test_system2.py
+route: opus
+spec_complete: true
+interface: |
+  pyproject.toml: dependencies += "anthropic>=<installed version at implementation>" (record the exact version in the task log;
+    it must support messages.create(output_config=...), thinking {"type": "adaptive"} and client.beta.messages.create)
+
+  scout/system2.py:
+    PROMPT_VERSION = "s2p.v1"; INPUT_SCHEMA = "s2in.v1"; OUTPUT_SCHEMA = "s2.v1"
+    DEFAULT_MODEL = "claude-opus-5-5"; CHEAP_MODEL = "claude-sonnet-5"
+    FALLBACK_BETA = "server-side-fallback-2026-07-01"; FALLBACK_MODELS = frozenset({"claude-opus-5-5"})
+    VERDICTS = ("derived", "not_derived", "abstain")
+    REASON_CODES = ("agree", "claim_conflict", "weak_evidence", "structure_mismatch", "missing_weight_evidence",
+                    "config_inconsistent", "s2_unavailable", "s2_missing", "other")
+    ALLOWED: dict[str, frozenset[str]] = {"derived": {"derived","abstain"}, "not_derived": {"not_derived","abstain"},
+                                          "abstain": {"abstain"}}
+    SYSTEM_PROMPT: str        # literal below
+    S2_LLM_SCHEMA: dict       # JSON schema, plan.md 4.7 (additionalProperties false everywhere; enums from VERDICTS/REASON_CODES)
+
+    @dataclass(frozen=True)
+    class S2Config:
+        model: str = DEFAULT_MODEL; effort: str = "high"; max_tokens: int = 16000; server_fallback: bool = True
+        @classmethod
+        def from_env(cls, model: str | None = None) -> "S2Config"   # model arg > env SCOUT_S2_MODEL > DEFAULT_MODEL
+
+    @dataclass(frozen=True)
+    class S2Raw:
+        text: str | None; served_model: str | None; stop_reason: str | None; usage: dict | None
+
+    class S2Client(Protocol):
+        def complete(self, system: str, user: str, schema: dict, config: S2Config) -> S2Raw
+
+    class AnthropicS2Client:                      # implements S2Client
+        def __init__(self, client: "anthropic.Anthropic | None" = None) -> None   # default anthropic.Anthropic()
+    class StubS2Client:                           # implements S2Client (tests + offline rehearsal)
+        def __init__(self, responder: Callable[[dict], dict | str | Exception | S2Raw]) -> None
+            # responder receives the parsed s2in.v1 dict; dict -> json text; str -> raw text; Exception -> raised; S2Raw as is
+
+    def card_digest(lc: LoadedCard) -> dict
+    def build_input(report: dict, subject: LoadedCard, references: list[LoadedCard]) -> dict   # s2in.v1
+    def assert_no_weights(obj) -> None                                                          # ValueError on violation
+    def run_system2(report: dict, subject: LoadedCard, references: list[LoadedCard], client: S2Client,
+                    config: S2Config) -> dict                                                   # s2.v1
+    def format_s2(out: dict) -> str
+
+  SYSTEM_PROMPT (exact text):
+    You are System 2 of scout, a model-lineage forensics tool. You receive one JSON object: digests of model Cards (metadata,
+    config, structure, which weight statistics exist) and the output of System 1, a calibrated classifier over
+    weight-similarity features. You never see weights and must not ask for them.
+    Verdicts: "derived" means shared weight lineage (one model was initialised from the other's weights, or both from a
+    common checkpoint); weights cannot show direction, so never claim which model came first except as "the metadata
+    presents X as the base". "not_derived" means the weights are consistent with independent initialisation.
+    "abstain" means System 1 does not commit.
+    For each pair you may keep System 1's verdict, or change it to "abstain" when the digests show a concrete reason
+    System 1 may be wrong. Never output "derived" unless System 1 said "derived", and never "not_derived" unless System 1
+    said "not_derived". Pick one reason_code per pair: agree, claim_conflict, weak_evidence, structure_mismatch,
+    missing_weight_evidence, config_inconsistent, or other.
+    A model card's base_model is a claim, not evidence. Tokenizer and config similarity are context, never proof.
+    Always keep in mind and do not contradict: distillation is invisible to weight forensics; tokenizer reuse alone is
+    not proof; licensing is a human decision (report the claimed license, never judge compliance).
+    Reply with the JSON object required by the output schema only. Keep each explanation under 80 words and the summary
+    under 150 words. List anything a human should check in needs_human.
+behavior: |
+  1. card_digest(lc): {"card_key": key with repo "local:/..." replaced by "local:" + sha256(repo)[:8], "model_card":
+     {base_model, base_model_relation, license, license_name, tags[:20], pipeline_tag, library_name}, "config":
+     {"model_type", "architectures", and every suggest.CONFIG_MATCH_KEYS key via suggest.config_value (present keys only)},
+     "structure": {"stacks": [{"prefix", "depth"}...], "n_expert_groups"}, "weights": {"params_total", "n_tensors",
+     "dtypes": sorted(params_by_dtype)}, "evidence": {"sigma": stats.sigma_curves is not None, "tensor_stats": ...,
+     "anchors": stats.anchor_embedding is not None, "tokenizer": stats.tokenizer_minhash is not None}}.
+  2. build_input: {"schema": INPUT_SCHEMA, "subject": digest, "references": [digest per reference, same order as
+     report.pairs], "analysis": report with every float rounded to 4 decimals and each pair's "features" reduced to
+     {"values", "missing", "alignment", "cka_common"} (the "reasons" dict is dropped), "disclaimers": list(DISCLAIMERS)}.
+     Local repo strings inside the analysis are redacted the same way. Then assert_no_weights(result).
+  3. assert_no_weights(obj): walk recursively; ValueError if any list has more than 64 elements that are all int/float,
+     any dict key starts with "stat_", or any dict key is one of {"gram", "signature", "sigma", "tensors", "token_ids"}.
+  4. AnthropicS2Client.complete: kwargs = {"model": config.model, "max_tokens": config.max_tokens, "system": system,
+     "messages": [{"role": "user", "content": user}], "thinking": {"type": "adaptive"},
+     "output_config": {"effort": config.effort, "format": {"type": "json_schema", "schema": schema}}}.
+     If config.server_fallback and config.model in FALLBACK_MODELS: resp = client.beta.messages.create(**kwargs,
+     betas=[FALLBACK_BETA], fallbacks="default") (if the installed SDK rejects the `fallbacks` keyword with TypeError, pass
+     extra_body={"fallbacks": "default"} instead; record which in the task log). Else resp = client.messages.create(**kwargs).
+     No temperature/top_p/top_k, no assistant prefill. Return S2Raw(text = the first content block with type "text" (None if
+     none), served_model = resp.model, stop_reason = resp.stop_reason, usage = {"input_tokens", "output_tokens"}).
+     anthropic.APIError subclasses propagate to run_system2.
+  5. run_system2:
+     a. inp = build_input(...); user = json.dumps(inp, sort_keys=True).
+     b. try raw = client.complete(SYSTEM_PROMPT, user, S2_LLM_SCHEMA, config) except Exception as e -> unavailable
+        (reason f"error: {type(e).__name__}"). raw.stop_reason == "refusal" -> unavailable "refusal". text None or
+        json.loads fails or the object fails validation against S2_LLM_SCHEMA (hand-written structural validator: required
+        keys, types, enums, no extra keys) -> unavailable "malformed output".
+     c. When unavailable: every pair final_verdict = system1 verdict, changed False, reason_code "s2_unavailable",
+        explanation "", override_blocked False; claims = deterministic claims with comment ""; summary ""; needs_human
+        ["System 2 unavailable: <reason>"]; available False.
+     d. When available: for each report pair index k: take the LLM entry with pair_index == k (the first if duplicated; none ->
+        final = S1, reason "s2_missing"). s1 = report.pairs[k].system1.verdict; if llm.final_verdict not in ALLOWED[s1]:
+        final = s1, override_blocked True (the explanation is kept, prefixed "[blocked] "); else final = llm.final_verdict.
+        changed = final != s1.
+     e. claims: status ALWAYS from report.claims (deterministic); comment from the LLM claim with the same claimed_base (else "").
+     f. out = {"schema": OUTPUT_SCHEMA, "prompt_version": PROMPT_VERSION, "requested_model": config.model, "served_model",
+        "available", "unavailable_reason", "pairs", "claims", "summary", "needs_human", "caveats": list(DISCLAIMERS),
+        "usage"}. caveats are set by code regardless of the LLM output.
+  6. format_s2(out): "SYSTEM 2 ({served_model or requested_model}):" then per pair "  pair {k}: {s1} -> {final}
+     [{reason_code}]{' (blocked upgrade)' if override_blocked}" and the explanation, the summary, needs_human lines, then the
+     3 caveats each prefixed "  NOTE: ".
+  7. The module never imports scout.hub, scout.sources, scout.scan or scout.gate, and never opens files.
+acceptance:
+  tests:
+    - "Reports come from T211 test helpers (small local Cards + a hand-trained JevModel); StubS2Client for behaviour tests"
+    - "test_prompt_literal: SYSTEM_PROMPT equals the literal of this task; PROMPT_VERSION s2p.v1; DEFAULT_MODEL 'claude-opus-5-5'; CHEAP_MODEL 'claude-sonnet-5'"
+    - "test_config_env: SCOUT_S2_MODEL=claude-sonnet-5 -> from_env().model == 'claude-sonnet-5'; explicit arg wins over env"
+    - "test_input_no_weights: build_input passes assert_no_weights; json size < 64 KiB for 3 references; a planted list of 65 floats, a key 'stat_fro_norm', a key 'gram' each raise ValueError"
+    - "test_local_redaction: a local Card's repo 'local:/home/x/m' appears only as 'local:<8 hex>' anywhere in the input text"
+    - "test_keep: stub returns agree for all -> finals == S1; available True; caveats == DISCLAIMERS"
+    - "test_soften: S1 derived, stub abstain with weak_evidence -> final abstain, changed True"
+    - "test_block_upgrade: S1 abstain, stub derived -> final abstain, override_blocked True; S1 not_derived, stub derived -> final not_derived, blocked"
+    - "test_claims_deterministic: stub says a contradicted claim is confirmed (in comment) -> status stays 'contradicted'"
+    - "test_caveats_forced: stub output without any caveat text -> out.caveats == DISCLAIMERS; format_s2 contains all three"
+    - "test_unavailable: stub raising RuntimeError; S2Raw(stop_reason='refusal'); text 'not json'; JSON with an extra key -> available False, finals == S1, reason_code s2_unavailable"
+    - "test_missing_pair: stub omits pair 1 -> pair 1 final == S1 with reason s2_missing"
+    - "test_anthropic_request_offline: anthropic.Anthropic(api_key='test', http_client=httpx.Client(transport=httpx.MockTransport(handler))) where handler records the request and returns a canned Messages API JSON response {id, type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{type: 'text', text: <valid S2 JSON>}], stop_reason: 'end_turn', usage: {input_tokens: 10, output_tokens: 20}} -> request path /v1/messages; body has model 'claude-opus-5-5', thinking {'type': 'adaptive'}, output_config.format.type 'json_schema', output_config.effort 'high', max_tokens 16000, no 'temperature'; header anthropic-beta contains 'server-side-fallback-2026-07-01'; body fallbacks == 'default'; S2Raw parsed. With model claude-sonnet-5: no anthropic-beta fallback header and no 'fallbacks' key"
+    - "test_no_forbidden_imports: ast check of scout/system2.py"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_system2.py
+    - pytest -q
+out_of_scope:
+  - real API calls (E7 at exit only)
+  - UI (P5)
+  - persisting S2 output (never)
+invariants_touched: [3, 5]
+decisions: [D42, D43, D44, D50]

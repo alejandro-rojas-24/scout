@@ -1,0 +1,84 @@
+id: T217
+title: P3 exit runner (S1 held-out eval + sweep, optional S2) and the offline synthetic end-to-end rehearsal
+depends_on: [T208, T213, T214, T216]
+files:
+  - scripts/exit_check_p3.py
+  - tests/test_exit_check_p3_offline.py
+  - tests/test_exit_p3_network.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_check_p3.py:
+    def build_inputs(*, pins_path, labeled_path, manifest_path, cards_dir, model_path, log_path,
+                     allow_synthetic: bool = False, repo_root: Path) -> P3Inputs           # S1 part (s2 fields None)
+    def run_s2(inp: P3Inputs, *, client: S2Client, config: S2Config, host_recorder: list[str]) -> None   # fills s2 fields
+    def main(argv=None, *, s2_client_factory: Callable[[list[str]], S2Client] | None = None,
+             sizes: Sizes | None = None) -> int
+      # flags: --pins (exit/pins_p3.json) --labeled (groundtruth/labeled_v1.yaml) --manifest (library/manifest.yaml)
+      #        --cards (cards/p3) --model (models/jev_v1.json) --log (plans/phase-3/log.jsonl) [--s2] [--s2-model ID]
+      #        [--allow-synthetic]   (tests only; the real exit never passes it; C1 then requires synthetic false)
+      # s2_client_factory / sizes are keyword-only for tests (no CLI flags); sizes defaults to Sizes()
+  tests/test_exit_p3_network.py: @pytest.mark.network; skipped unless SCOUT_P3_EXIT=1; runs main([... "--s2"]) == 0
+behavior: |
+  1. main: HF_ENDPOINT foreign -> 1 (P1 message; the exit reads only local Cards, but the rule is kept for evidence
+     consistency). Load everything with build_inputs; run s1_checks(inp, sizes). If --s2: run_s2 and s2_checks.
+     Print the table `target | check | expected | actual | PASS/FAIL`, then "EXIT CHECK (S1): PASS|FAIL" (and
+     "EXIT CHECK (S2): PASS|FAIL" with --s2), then one JSON line plan.md 4.9 EXIT (stage "s2" when --s2, else "s1") with
+     per-pair rows, sweep {n, derived}, metrics (S1 and, with --s2, S2), nulls (for the train and calibration splits
+     separately: median r_med and median cka over their not_derived pairs, computed with features.pair_features on the
+     Cards; reported only), thresholds (the exit_expectations_p3 constants), model_sha256, labeled_sha256,
+     s2 {requested_model, served_models, usage totals} or null, git_commit, git_dirty, hostname. Return 0 iff every
+     evaluated check is ok.
+  2. build_inputs (S1):
+     a. Guard the network: for the whole of build_inputs, monkeypatch httpx.HTTPTransport.handle_request (class attribute)
+        with a function that increments a counter and raises RuntimeError("network disabled during S1 evaluation"); restore
+        in finally. s1_requests = the counter.
+     b. pins = json; labeled via load_labeled (errors captured into labeled_error); targets = p3_set.p3_targets(...).
+     c. cards[repo] = LoadedCard(*load_card(card_paths(cards_dir, repo, pins[repo], None).json_path)) or None on any error.
+     d. model = jev.load(model_path) (errors captured).
+     e. For each held-out pair (file order): feats = features.pair_features(ref, subj); r = model.predict(feats);
+        report = analysis.analyze(subj, [ref], model) (its pairs[0].system1 equals r by construction); rows as
+        P3Inputs.heldout. A pair whose Card is missing gets verdict "abstain" with abstain_reason "card missing" (and C3
+        already fails for that repo).
+     f. For each (a, b) in labeled.sweep_pairs("heldout"): reference a, subject b; predict -> sweep rows.
+     g. import_violations = static_import_violations(repo_root); log_lines = parsed JSON lines of log_path (non-JSON lines
+        skipped).
+  3. run_s2: for each held-out report k: out = system2.run_system2(report_k, subj, [ref], client, config); s2_inputs[k] =
+     system2.build_input(report_k, subj, [ref]). The real client is AnthropicS2Client(anthropic.Anthropic(
+     http_client=httpx.Client(event_hooks={"request": [lambda req: host_recorder.append(req.url.host)]}))); s2_hosts =
+     host_recorder. The HF network guard of step 2a is NOT active here, but no Source is ever constructed.
+  4. Offline rehearsal (tests/test_exit_check_p3_offline.py), end to end through the real scripts with FakeHub:
+     a. hub = FakeHub(); repos = p3_fixtures.write_synth_set(tmp/"repos", hub); labeled = p3_fixtures.synth_labeled_yaml(tmp/
+        "labeled.yaml"); manifest = a tmp library.v1 file with 2 entries: {repo: fa/base, family: qwen} and {repo: fg/base,
+        family: llama} (family names are labels only; both repos are already in the labeled set, so targets == the 24
+        synthetic repos).
+     b. pins = {repo: sha} from write_synth_set; pins file written to tmp.
+     c. p3_set.scan_set(pins, cards, mode="plan", client_factory=hub.client, endpoint=HUB) -> plans; the rehearsal writes the
+        SCAN(plan) line into tmp log.
+     d. p3_freeze labeled (allow_synthetic) -> FREEZE line appended to tmp log (ts earlier than the scans in e).
+     e. p3_set.scan_set(..., mode="confirm", confirm_plans={id: cap of every plan}) -> 24 Cards; SCAN(confirm) line appended.
+     f. p3_train.train_from_files(..., allow_synthetic=True) -> model; p3_freeze model -> FREEZE line appended.
+     g. main([... all tmp paths ..., "--allow-synthetic", "--s2"], s2_client_factory=lambda hosts: StubS2Client(agree-and-record
+        host "api.anthropic.com" into hosts), sizes=Sizes(sweep_min=20)) -> 0. Only sweep_min is overridden (the synthetic
+        held-out has 16 pairs, 6 derived, 10 not_derived, 10 hard, and 20 sweep pairs); every threshold is the frozen one.
+acceptance:
+  tests:
+    - "test_rehearsal_pass: the full flow of behavior 4 -> exit 0; C0..C12 all ok; S1 metrics fd == 0, acc >= 0.90, abstain <= 0.30; the lying-claim pair S29 is not derived and its report claim status for fh/ft vs fg/base is 'contradicted' (checked in the same test via analysis.analyze(fh/ft, [fg/base], model))"
+    - "test_rehearsal_leak: re-run training with one held-out pair relabeled as train in a copy of the labeled file (and re-frozen) -> C1 or C2 fails (pair crosses splits) and main returns non-zero"
+    - "test_rehearsal_labeled_changed_after_freeze: edit a note in the labeled file after FREEZE -> C1 FAIL"
+    - "test_rehearsal_model_changed: rewrite the model file after its FREEZE -> C4 FAIL"
+    - "test_rehearsal_s2_upgrade_is_blocked: stub always answers 'derived' -> finals never 'derived' where S1 was not; C12 ok (blocked, not violated)"
+    - "test_rehearsal_s2_violation_detected: monkeypatch run_system2 to return an out with a final 'derived' for an S1 abstain -> C12 FAIL"
+    - "test_rehearsal_s2_unavailable: stub raising -> every S2 final == S1; C12 metrics equal S1 metrics"
+    - "test_s1_network_guard: monkeypatch features.pair_features to perform httpx.get('https://huggingface.co') -> caught; s1_requests == 1; C10 FAIL"
+    - "test_real_files_c0: with the committed exit/pins_p3.json (UNPINNED) and real labeled/manifest -> C0 ok (46 targets) and C1 FAIL (no FREEZE); returns non-zero without raising"
+    - "tests/test_exit_p3_network.py is deselected by default"
+  commands:
+    - pytest -q tests/test_exit_check_p3_offline.py
+    - pytest -q
+    - "at EXIT only: python scripts/exit_check_p3.py (E6) and python scripts/exit_check_p3.py --s2 (E7); append the JSON lines to plans/phase-3/log.jsonl"
+out_of_scope:
+  - scanning (T213), training (T214)
+  - changing thresholds or sizes for the real exit (Sizes overrides are test-only keyword arguments)
+invariants_touched: [1, 2, 3, 4, 5, 6]
+decisions: [D42, D45]

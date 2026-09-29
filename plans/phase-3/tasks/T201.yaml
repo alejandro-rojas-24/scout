@@ -1,0 +1,99 @@
+id: T201
+title: Labeled ground-truth set - labeled.v1 schema, validator, split/leak rules, draft groundtruth/labeled_v1.yaml
+depends_on: [T001]
+files:
+  - scout/groundtruth.py
+  - groundtruth/labeled_v1.yaml
+  - tests/test_groundtruth.py
+route: opus
+spec_complete: true
+interface: |
+  scout/groundtruth.py:
+    SCHEMA = "labeled.v1"
+    SPLITS: tuple[str, ...] = ("train", "calibration", "heldout")
+    EVIDENCE_KINDS: frozenset[str] = frozenset({"paper", "model_card_text", "org_blog", "mergekit_config", "hub_metadata", "fixture"})
+    STRONG_KINDS: frozenset[str] = EVIDENCE_KINDS - {"hub_metadata"}
+    LABELS = ("derived", "not_derived")
+    RELATIONS: frozenset[str] = frozenset({"post_train", "fine_tune", "continued_pretrain", "merge", "depth_upscale", "independent"})
+
+    @dataclass(frozen=True)
+    class Evidence: id: str; kind: str; url: str; quote: str | None; retrieved: str | None; verify: bool
+    @dataclass(frozen=True)
+    class Family: id: str; split: str; independence_evidence: tuple[str, ...]; note: str
+    @dataclass(frozen=True)
+    class RepoEntry: repo: str; family: str; verify: bool; note: str
+    @dataclass(frozen=True)
+    class Pair:
+        id: str; reference: str; subject: str; label: str; relation: str; hard_negative: bool
+        evidence: tuple[str, ...]; verify: bool; note: str
+        split: str                      # derived from the families (not stored in YAML)
+    @dataclass(frozen=True)
+    class LabeledSet:
+        synthetic: bool; evidence: dict[str, Evidence]; families: dict[str, Family]; repos: dict[str, RepoEntry]
+        pairs: list[Pair]               # file order
+        def pairs_in(self, *splits: str) -> list[Pair]
+        def repos_in(self, *splits: str) -> list[str]           # sorted
+        def family_of(self, repo: str) -> str
+        def sweep_pairs(self, split: str = "heldout") -> list[tuple[str, str]]
+            # every unordered pair of repos of `split` whose families differ, as (min(a,b), max(a,b)), sorted
+
+    class LabeledSetError(ValueError)   # message lists every violation, one per line
+
+    def load_labeled(path: pathlib.Path, *, allow_synthetic: bool = False) -> LabeledSet     # parse + validate
+    def validate(raw: dict, *, allow_synthetic: bool = False) -> LabeledSet                  # raises LabeledSetError
+    def unresolved(ls: LabeledSet) -> list[str]     # ids of evidence/repos/pairs with verify True, "kind:id" strings, sorted
+    def file_sha256(path: pathlib.Path) -> str      # hex of the raw file bytes
+behavior: |
+  1. load_labeled: yaml.safe_load the file; validate(raw, allow_synthetic=...).
+  2. validate collects ALL violations (does not stop at the first), then raises LabeledSetError("\n".join(violations)) if any.
+     Rules (each is one violation string naming the offending id):
+     a. raw["schema"] == SCHEMA; raw["splits"] == list(SPLITS); raw["synthetic"] is bool; synthetic True requires
+        allow_synthetic.
+     b. Top-level keys exactly {schema, synthetic, splits, evidence, families, repos, pairs}; each entry has exactly the
+        keys of plan.md 4.2 (missing or extra key -> violation).
+     c. ids unique within evidence, families, repos (by repo string) and pairs.
+     d. evidence: kind in EVIDENCE_KINDS; "fixture" only when synthetic; url non-empty string; if verify is False then
+        quote is a non-empty string of <= 400 chars and retrieved matches ^\d{4}-\d{2}-\d{2}$.
+     e. families: split in SPLITS; every independence_evidence id exists; at least 1 independence_evidence entry.
+     f. repos: family exists; repo matches ^[A-Za-z0-9][\w.-]*/[\w.-]+$ (P1 REPO_RE).
+     g. pairs: reference and subject are listed repos and differ; label in LABELS; relation in RELATIONS;
+        relation == "independent" iff label == "not_derived"; hard_negative implies label == "not_derived";
+        evidence ids exist and at least one has kind in STRONG_KINDS (a base_model claim alone is never evidence);
+        label derived -> family_of(reference) == family_of(subject); label not_derived -> families differ;
+        split(reference family) == split(subject family) (else "pair crosses splits"); the unordered pair
+        {reference, subject} appears at most once.
+     h. Every family has at least one repo; every repo appears in at least one pair.
+     Pair.split = the (common) split of its families.
+  3. unresolved lists f"evidence:{id}", f"repo:{repo}", f"pair:{id}" for every entry with verify True.
+  4. sweep_pairs(split): repos = repos_in(split); all (a, b) with a < b and family_of(a) != family_of(b).
+  5. groundtruth/labeled_v1.yaml: transcribe plan.md section 5 EXACTLY:
+     - synthetic: false.
+     - evidence: one entry per citation used in section 5. Use ids E_<short> (e.g. E_QWEN25_TR, E_R1, E_QM, E_QC, E_Z, E_S,
+       E_MK_L30, E_MC_<pair id> for model-card text of a pair's subject). url: the arXiv abs URL (https://arxiv.org/abs/<id>)
+       or https://huggingface.co/<subject repo> for model-card text. quote: null, retrieved: null, verify: true for EVERY
+       evidence entry (this container cannot retrieve them; they are filled at E2).
+     - families: the 10 families with their splits and independence evidence as in the section 5 table.
+     - repos: the 40 repos with family; verify true exactly for the entries marked V in section 5.
+     - pairs: L01..L45 with reference/subject full repo ids, label, relation (not_derived -> "independent"),
+       hard_negative exactly as the "hard" column (L10, L11, L23, L25, L37, L38, L39, L40, L41, L42, L44 are true),
+       evidence = [family independence evidence of both families] for not_derived pairs and the listed citation(s)
+       for derived pairs, verify true for the entries marked V, note = the section 5 note (or "").
+     The file must pass validate() (with verify flags present) and its counts must be: 45 pairs; train 9/9, calibration
+     4/4, heldout 10/9; heldout hard 7; sweep_pairs("heldout") has 104 entries.
+  6. No network, no scout imports beyond stdlib + yaml.
+acceptance:
+  tests:
+    - "test_draft_file_valid: load_labeled('groundtruth/labeled_v1.yaml') succeeds; synthetic False; 45 pairs; per split (derived, not_derived) == train (9,9), calibration (4,4), heldout (10,9); heldout hard_negative count 7; len(sweep_pairs('heldout')) == 104; 10 families; 40 repos"
+    - "test_draft_unresolved: unresolved() is non-empty and contains every evidence id (all quotes are pending) and pair:L10, pair:L30, repo:allenai/OLMo-2-0425-1B"
+    - "test_rules (parametrized, each on a minimal valid dict built in the test, one mutation at a time, asserting the violation text names the id): duplicate pair id; unknown evidence id; derived pair across families; not_derived pair within one family; pair crossing splits; hard_negative on a derived pair; relation independent with label derived; evidence only hub_metadata; fixture kind with synthetic False; synthetic True without allow_synthetic; verify False with null quote; quote of 401 chars; bad retrieved date; extra key in a pair; missing key in a family; repo without pairs; family without repos; the same unordered pair twice (reversed)"
+    - "test_all_violations_reported: a dict with 3 independent violations -> one LabeledSetError whose message has 3 lines"
+    - "test_sweep_pairs: 2 heldout families with 2 and 3 repos -> 6 pairs, each (min, max), sorted"
+    - "test_file_sha256: equals hashlib.sha256(path.read_bytes()).hexdigest()"
+  commands:
+    - pytest -q tests/test_groundtruth.py
+    - pytest -q
+out_of_scope:
+  - retrieving evidence quotes (human, at E2 on a Hub host)
+  - freezing (T214) and pins (T213)
+invariants_touched: [5]
+decisions: [D34, D45]

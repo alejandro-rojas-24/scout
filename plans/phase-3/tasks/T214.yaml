@@ -1,0 +1,75 @@
+id: T214
+title: Freeze + train scripts - FREEZE lines (labeled, model), p3_train on train+calibration only, null diagnostics (e=1 vs e=2)
+depends_on: [T210, T213]
+files:
+  - scripts/p3_common.py
+  - scripts/p3_freeze.py
+  - scripts/p3_train.py
+  - models/.gitkeep
+  - tests/test_p3_train.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/p3_common.py:
+    def load_pair_cards(ls: LabeledSet, pins: dict[str, str], cards_dir: Path) -> dict[str, LoadedCard]
+        # repo -> LoadedCard at card_paths(cards_dir, repo, pins[repo], None); missing -> ScoutError naming the repo
+    def examples_for(ls: LabeledSet, pairs: list[Pair], cards: dict[str, LoadedCard]) -> tuple[list[Example], dict[str, list[dict]]]
+        # Example(id, frozenset({family_of(ref), family_of(subj)}), y = 1 if derived else 0, x = pair_features(...).values)
+        # and card_keys {pair_id: [ref key, subj key]}
+    def git_info(repo_root: Path) -> tuple[str | None, bool | None]     # (commit, dirty); never raises
+    def freeze_lines(log_path: Path, what: str) -> list[dict]           # FREEZE lines with that "what", file order
+
+  scripts/p3_freeze.py:
+    def main(argv=None) -> int
+      # p3_freeze.py labeled --labeled PATH --pins PATH [--allow-synthetic]
+      # p3_freeze.py model --model PATH --labeled PATH
+  scripts/p3_train.py:
+    def train_from_files(labeled: Path, pins: Path, cards: Path, out: Path, *, allow_synthetic: bool = False) -> dict
+    def diagnostics(ls, cards) -> dict
+    def main(argv=None) -> int
+      # --labeled --pins --cards --out [--diagnostics] [--allow-synthetic]
+behavior: |
+  1. p3_freeze labeled: ls = load_labeled(path, allow_synthetic=flag). u = unresolved(ls); non-empty -> print each and
+     "FREEZE REFUSED: resolve every verify:true entry first", return 1. pins: every value 40-hex and set(pins) ⊇ repos of ls,
+     else return 2. Print one JSON line {"step": "FREEZE", "phase": 3, "what": "labeled", "ts": UTC ISO Z, "hostname",
+     "sha256": file_sha256(labeled), "pins_sha256": file_sha256(pins), "counts": {split: {"derived", "not_derived", "hard"}},
+     "synthetic": ls.synthetic, "git_commit"}. Return 0. (The operator appends it to log.jsonl; the script never writes it.)
+  2. p3_freeze model: m = jev.load(model) (validates params/features); ls = load_labeled(labeled, allow_synthetic=True if
+     the file says synthetic else False); m.doc["labeled_sha256"] must equal file_sha256(labeled) (else 1); heldout ids and
+     heldout repos must not occur anywhere in json.dumps(m.doc) (else 1, naming them). Print {"step": "FREEZE", "phase": 3,
+     "what": "model", "ts", "hostname", "sha256": m.sha256, "labeled_sha256", "thresholds": {"hi", "lo"},
+     "warnings": threshold_inputs.warnings, "git_commit"}. Return 0.
+  3. train_from_files: ls = load_labeled(...); unresolved(ls) non-empty -> ScoutError (never train on unverified labels).
+     cards = load_pair_cards over ls.repos_in("train", "calibration") ONLY (held-out Cards are never loaded here).
+     train_ex = examples_for(ls, ls.pairs_in("train"), cards); cal_ex = examples_for(ls, ls.pairs_in("calibration"), cards).
+     model = jev.train(train_ex, cal_ex, labeled_sha256=file_sha256(labeled), card_keys=..., git_commit=git_info(...)[0]);
+     sha = jev.save(model, out). Print a summary: per train/calibration pair id, label, oof or calibration p, thresholds,
+     warnings; last line JSON {"step": "TRAIN", "phase": 3, "model_sha256": sha, "thresholds", "warnings", "n_train",
+     "n_calibration", "n_pool"}. Return the dict.
+  4. diagnostics(ls, cards) (only --diagnostics; train and calibration not_derived pairs only): per family pair
+     (sorted family ids) the median over its pairs of r_med computed twice: with the frozen statistic (edge 1, as in
+     features) and at edge 2: rebuild R2 per side with layercorr.role_matrix -> residuals(..., edge=2) -> layer_vectors ->
+     pearson_matrix, then in_run_null(R2, a, edge=2) on the same structure-only alignment a; plus the median
+     participation ratios and median cka. Printed as a table and as {"step": "DIAG", ...}. It never changes the model
+     (plan.md D49).
+  5. main returns 0 on success, 1 on ScoutError/ValueError (printing the message).
+acceptance:
+  tests:
+    - "tests/test_p3_train.py builds Cards with scan(sample, tokenizer, anchors) on LocalSource repos and a tiny labeled.v1 file (synthetic: true) written in the test: 6 families x (base, ft) with 2 train, 2 calibration, 2 heldout families and cross-family not_derived pairs; ByteLevel anchor tokenizer as in T207 tests (T208 is not a dependency)"
+    - "test_freeze_labeled_refuses_verify: a file with one verify:true -> exit 1, 'FREEZE REFUSED' printed, no JSON line"
+    - "test_freeze_labeled_ok: resolved file -> JSON line with sha256 == file_sha256 and counts per split"
+    - "test_train_never_loads_heldout: delete the held-out Cards from the cards dir -> training still succeeds; a spy on load_card sees no held-out repo"
+    - "test_train_output: model file loads with jev.load; train_pairs == train ids; calibration_pool sources in {oof, calibration}; no held-out id or repo string in the file"
+    - "test_freeze_model_leak: inject a held-out repo string into the model doc (and re-save) -> p3_freeze model returns 1 naming it"
+    - "test_freeze_model_sha_mismatch: labeled file edited after training -> p3_freeze model returns 1"
+    - "test_diagnostics: runs and prints one row per family pair with r_med_e1 and r_med_e2 keys; the model file is unchanged (sha)"
+    - "test_unresolved_blocks_training: train_from_files on a file with verify:true -> ScoutError"
+  commands:
+    - pytest -q tests/test_p3_train.py
+    - pytest -q
+    - "at EXIT only: python scripts/p3_freeze.py labeled ...; python scripts/p3_train.py ...; python scripts/p3_freeze.py model ..."
+out_of_scope:
+  - held-out evaluation (T216/T217)
+  - writing log.jsonl (the operator appends the printed lines)
+invariants_touched: [3, 4]
+decisions: [D37, D38, D49]

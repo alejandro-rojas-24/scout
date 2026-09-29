@@ -1,0 +1,68 @@
+id: T202
+title: Card v2 schema - tensor_stats/spectral_topk slots filled, anchor_embedding slot, stat_anchor_gram column, options.anchors, v0/v1 loadable
+depends_on: [T102]
+files:
+  - scout/card.py
+  - tests/test_card.py
+  - tests/test_card_v1.py
+  - tests/test_card_v2.py
+route: opus
+spec_complete: true
+interface: |
+  scout/card.py (changes relative to P2 T102):
+    SCHEMA_VERSION = "card.v2"
+    SUPPORTED_SCHEMA_VERSIONS = ("card.v0", "card.v1", "card.v2")
+    STATS_SLOTS = ("tensor_stats", "spectral_topk", "sigma_curves", "tokenizer_minhash", "attribution", "anchor_embedding")
+    PARQUET_SCHEMA: the P1 columns in order, then ("stat_anchor_gram", list<float64>, nullable) appended LAST
+    NULL_STAT_COLUMNS += ("stat_anchor_gram",)
+
+    def build_card(*, <all P2 T102 kwargs unchanged>,
+                   options: dict | None = None,                       # {"sample","tokenizer","anchors"}; None -> all False; missing keys -> False
+                   tensor_stats: dict | None = None,                  # plan.md 4.1 stats.tensor_stats
+                   spectral_topk: dict | None = None,                 # plan.md 4.1 stats.spectral_topk
+                   stats_by_tensor: dict[str, dict] | None = None,    # name -> {"mean": float, "std": float, "fro": float, "topk": list[float]}
+                   anchor_embedding: dict | None = None,              # plan.md 4.1 stats.anchor_embedding
+                   anchor_gram: list[float] | None = None) -> BuiltCard   # upper triangle for anchor_embedding["tensor"]
+    def load_card(json_path) -> tuple[dict, pyarrow.Table]          # accepts SUPPORTED_SCHEMA_VERSIONS; a v0/v1 parquet
+                                                                     # without stat_anchor_gram is returned as stored
+behavior: |
+  1. Card dict: P2 key order; schema_version "card.v2"; scan.options = {"sample": b, "tokenizer": b, "anchors": b}
+     (exactly these 3 keys, bools). stats = {slot: None for slot in STATS_SLOTS} then fill sigma_curves,
+     tokenizer_minhash (P2 behaviour), tensor_stats, spectral_topk, anchor_embedding from the kwargs.
+  2. Parquet: stat_sigma_curve as P2. For name in stats_by_tensor: stat_mean = mean, stat_std = std, stat_fro_norm = fro,
+     stat_spectral_topk = [float(x) for x in topk]. stat_anchor_gram = [float(x) for x in anchor_gram] on the row whose
+     name == anchor_embedding["tensor"]. Every other stat cell stays null. Metadata schema_version b"card.v2".
+  3. Validation (ValueError; all checks before anything is returned):
+     - stats_by_tensor not None requires tensor_stats and spectral_topk not None and sigma_curves not None;
+       set(stats_by_tensor) == {t["name"] for t in sigma_curves["tensors"]}; each entry has exactly the keys
+       mean/std/fro/topk; all finite; fro > 0; std >= 0; 1 <= len(topk) <= spectral_topk["k"]; topk non-increasing and
+       every value in (0, 1]; tensor_stats["n_tensors"] == spectral_topk["n_tensors"] == len(stats_by_tensor);
+       tensor_stats["version"] == "tstats.v1"; spectral_topk["version"] == "topk.v1".
+     - tensor_stats or spectral_topk given without stats_by_tensor -> ValueError.
+     - anchor_embedding not None iff anchor_gram not None. If given: version "anchor.v1"; tensor exists in the table;
+       n_present == len(present) == len(token_ids); present strictly increasing, each in [0, 256); token_ids each in
+       [0, vocab_rows); len(anchor_gram) == n_present*(n_present+1)//2; all finite; diagonal entries (positions
+       i*n - i*(i-1)//2 for i in range(n), row-major upper triangle incl. diagonal) >= 0.
+     - options values must be bool.
+  4. load_card: ScoutError for an unsupported schema_version. v0/v1 Cards are returned unchanged (no stat_anchor_gram
+     column; consumers use `"stat_anchor_gram" in table.column_names`).
+  5. Update tests/test_card.py (P1) and tests/test_card_v1.py (P2): "card.v1" assertions become "card.v2"; key-set
+     assertions include the options key "anchors", the stats slot "anchor_embedding" and the parquet column
+     "stat_anchor_gram"; test_v1_plain's "every stat_* column is fully null" still holds and must still be asserted.
+     All other assertions unchanged.
+acceptance:
+  tests:
+    - "tests/test_card.py and tests/test_card_v1.py (updated) pass"
+    - "test_v2_plain: build_fixture_card -> schema card.v2; options == {'sample': False, 'tokenizer': False, 'anchors': False}; stats has 6 slots all None; every stat_* column (6 columns) fully null; parquet column order ends with stat_anchor_gram"
+    - "test_v2_stats: sigma_curves for 2 tensors + stats_by_tensor for the same 2 + tensor_stats/spectral_topk dicts -> stat_mean/std/fro/topk non-null for exactly those 2 rows; round trip write_card/load_card equal"
+    - "test_v2_anchor: anchor_embedding with n_present 3 (present [0, 5, 9], token_ids [10, 11, 40]) and a 6-value gram on the embed row -> stat_anchor_gram non-null on that row only, length 6; round trip equal"
+    - "test_v2_validation (parametrized): stats names != sigma names; topk increasing; topk value 1.5; fro 0; tensor_stats without stats_by_tensor; anchor_gram without anchor_embedding; gram length 5 for n=3; negative diagonal; present not increasing; token_id >= vocab_rows; options value 'yes' -> ValueError each"
+    - "test_load_older: hand-written v0 and v1 Card JSON + parquet (without stat_anchor_gram) load unchanged; 'card.v9' -> ScoutError"
+  commands:
+    - pytest -q tests/test_card.py tests/test_card_v1.py tests/test_card_v2.py
+    - pytest -q
+out_of_scope:
+  - computing stats or Grams (T204, T205, T207)
+  - migrating files on disk
+invariants_touched: [1, 4]
+decisions: [D36, D48]

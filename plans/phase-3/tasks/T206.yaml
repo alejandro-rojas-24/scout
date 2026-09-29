@@ -1,0 +1,74 @@
+id: T206
+title: Gated sample plan - anchor embedding-row reads (AnchorUnit, consecutive-id coalescing) in the same SamplePlan/grant
+depends_on: [T106, T203, T205]
+files:
+  - scout/gate.py
+  - tests/test_gate_anchors.py
+route: opus
+spec_complete: true
+interface: |
+  scout/gate.py (additions; every P2 signature keeps working):
+    ANCHOR_ROLE = "embed.anchor"
+
+    @dataclass(frozen=True)
+    class AnchorUnit:
+        component: str | None
+        headers: list[SafetensorsHeader]
+        present: list[int]            # anchor indices, ascending (scout.anchors.anchor_ids)
+        token_ids: list[int]          # same order
+        tokenizer_file: str
+        normalization: str
+
+    @dataclass(frozen=True)
+    class AnchorPlan:
+        component: str | None; tensor: str; file: str; dtype: str; vocab_rows: int; hidden: int
+        present: list[int]; token_ids: list[int]; tokenizer_file: str; normalization: str
+        reads: list[PlannedRead]      # role ANCHOR_ROLE
+        def to_dict(self) -> dict     # reads as dicts
+
+    def plan_anchor_unit(u: AnchorUnit) -> tuple[AnchorPlan | None, str | None]   # (plan, skip reason)
+    def plan_sample(repo, revision_sha, units, threshold_bytes=DEFAULT_GATE_THRESHOLD_BYTES, *,
+                    anchors: list[AnchorUnit] | None = None) -> SamplePlan
+    SamplePlan gains field `anchors: list[AnchorPlan]` (default []) and to_dict() gains key "anchors": [a.to_dict()].
+behavior: |
+  1. plan_anchor_unit(u):
+     - emb = scout.cka.find_embedding([(t.name, tuple(t.shape), t.dtype) for h in u.headers for t in h.tensors]).
+       None -> (None, "no input embedding tensor with a supported dtype").
+     - len(u.present) < CKA_PARAMS["min_present"] -> (None, f"only {len(u.present)} anchor words in the vocabulary").
+     - t = that TensorInfo; N = header_len of t's file; rows, hidden = t.shape; esize = {BF16:2, F16:2, F32:4}[dtype];
+       keep only (k, id) with id < rows (ids were already filtered by anchor_ids; assert).
+     - Coalesce: sort the (id, k) pairs by id; group maximal runs of consecutive ids; for each run [a, b]:
+       PlannedRead(component, t.file, f"{t.name}[{a}:{b+1}]", ANCHOR_ROLE, -1,
+                   8 + N + t.data_begin + a*hidden*esize, 8 + N + t.data_begin + (b+1)*hidden*esize, dtype, (b-a+1, hidden)).
+       Reads are ordered by start offset.
+     - bytes = sum(end - start); if bytes > cap where cap = SIGMA_PARAMS["max_bytes_per_layer"] (16 MiB) ->
+       (None, f"anchor rows would exceed {cap} B").
+     - return AnchorPlan(...), None.
+  2. plan_sample(..., anchors): the P2 algorithm builds the sigma reads exactly as before. If anchors is None: the result
+     is byte-identical to P2 (same reads, reason, plan_id, bytes, memory) and SamplePlan.anchors == [].
+     Otherwise, for each AnchorUnit: (ap, why) = plan_anchor_unit(u); why -> skipped += {"component", "reason":
+     f"anchors: {why}"}; ap -> anchors_list.append(ap). All reads = sigma reads followed by every ap.reads (in unit order).
+     bytes_planned/bytes_cap/memory_peak_bytes/plan_id use the combined reads with the P2 formulas (memory max m*n
+     includes anchor read shapes). reason = P2 reason text, then for each ap: "; anchor-embedding CKA: {n_present} rows of
+     {tensor}" + (f" ({component})" if component else ""). If there are no sigma reads but anchor reads exist, reason is just
+     the anchor clause(s) (without the leading "; ").
+  3. format_plan / format_plan_dict are unchanged: the per-file table already includes the anchor bytes; a skipped anchor
+     unit shows as a "skipped:" line.
+  4. run_gate is unchanged (the anchor reads are part of the displayed plan, the confirmed cap and the grant).
+acceptance:
+  tests:
+    - "fixtures: tests/helpers/weights_fixtures.write_family_repo(FamilySpec(seed=1, vocab=512)) read via LocalSource + read_header + analyze; present/token_ids built by hand in the test (e.g. present = list(range(200)), token_ids = [0..199] with a gap: ids 0..99 and 150..249)"
+    - "test_p2_identical: plan_sample(..., anchors=None) equals the P2 plan for the same inputs in reads, plan_id, bytes_planned, bytes_cap, memory_peak_bytes and reason; to_dict()['anchors'] == []"
+    - "test_anchor_reads: ids 0..99 and 150..249 -> exactly 2 anchor reads; ranges == [8+N+data_begin + a*hidden*2, 8+N+data_begin+(b+1)*hidden*2) for (0,99) and (150,249); role 'embed.anchor'; block_index -1; shape (100,128); plan_id differs from the anchors=None plan; bytes_planned grows by 200*128*2"
+    - "test_anchor_reason_and_display: reason ends with 'anchor-embedding CKA: 200 rows of model.embed_tokens.weight'; format_plan lists the embedding's file with the combined read count"
+    - "test_anchor_skips: present of 127 -> skipped reason contains 'only 127 anchor words'; embedding dtype F8_E4M3 (hand-built TensorInfo) -> skipped 'no input embedding'; sigma reads still planned"
+    - "test_anchor_only_plan: a family whose stack is shallower than 8 (no sigma reads) plus a valid AnchorUnit -> reads are only anchor reads; reason starts with 'anchor-embedding CKA'"
+    - "test_run_gate_with_anchors: run_gate below threshold approves; the logged plan text contains the anchor bytes in the per-file line"
+  commands:
+    - pytest -q tests/test_gate_anchors.py tests/test_gate.py
+    - pytest -q
+out_of_scope:
+  - performing reads, COMPUTE (T207)
+  - tokenizer parsing (T203)
+invariants_touched: [1, 2, 4]
+decisions: [D35, D48]

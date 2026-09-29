@@ -1,0 +1,109 @@
+id: T216
+title: P3 exit expectations - C0..C12 as pure functions, frozen parameter literals and thresholds; P2 C8 accepts card.v2
+depends_on: [T115, T210, T211, T212]
+files:
+  - scripts/exit_expectations_p3.py
+  - scripts/exit_expectations_p2.py
+  - tests/test_exit_expectations_p3.py
+  - tests/test_exit_expectations_p2.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_expectations_p3.py:
+    from scripts.exit_expectations import Check                       # P1 T016
+    HELDOUT_MIN_PAIRS = 16; HELDOUT_MIN_DERIVED = 6; HELDOUT_MIN_NOT_DERIVED = 8; HELDOUT_MIN_HARD = 4
+    FALSE_DERIVED_MAX = 0; ACC_NONABSTAIN_MIN = 0.90; ABSTAIN_MAX = 0.30
+    SWEEP_MIN_PAIRS = 100; SWEEP_FALSE_DERIVED_MAX = 0
+    ANCHOR_SHA256 = "466fcb0770645851483e61a7c7a72041d80c7155a2f0e24530c2a1099c421516"
+    FROZEN_CKA_PARAMS, FROZEN_TSTATS_PARAMS, FROZEN_FEATURE_PARAMS, FROZEN_JEV_PARAMS: dict   # literal copies of plan.md 4.8
+    FROZEN_JEV_FEATURES: tuple[str, ...]
+    ALLOWED_S2 = {"derived": {"derived", "abstain"}, "not_derived": {"not_derived", "abstain"}, "abstain": {"abstain"}}
+    S2_HOSTS = frozenset({"api.anthropic.com"})
+
+    @dataclass(frozen=True)
+    class Sizes:                     # the only knobs the offline rehearsal may override (plan.md 8); thresholds are not knobs
+        min_pairs: int = HELDOUT_MIN_PAIRS; min_derived: int = HELDOUT_MIN_DERIVED
+        min_not_derived: int = HELDOUT_MIN_NOT_DERIVED; min_hard: int = HELDOUT_MIN_HARD; sweep_min: int = SWEEP_MIN_PAIRS
+
+    @dataclass
+    class P3Inputs:
+        pins: dict[str, str]; targets: list[str]                   # targets = labeled repos ∪ library repos
+        labeled_path: Path; labeled: LabeledSet | None; labeled_error: str | None; synthetic_allowed: bool
+        pins_path: Path; log_lines: list[dict]                     # parsed plans/phase-3/log.jsonl
+        cards: dict[str, LoadedCard | None]                        # repo -> Card at its pin (None if missing/unloadable)
+        model_path: Path; model: JevModel | None; model_error: str | None
+        heldout: list[dict]                  # per held-out pair: {"id","label","hard","verdict","p_derived","features","missing","abstain_reason"}
+        sweep: list[dict]                    # per sweep pair: {"reference","subject","verdict","p_derived"}
+        reports: list[dict]                  # analysis.v1 per held-out pair (one reference each)
+        report_texts: list[str]              # format_analysis of each
+        s1_requests: int                     # network requests counted during S1 evaluation
+        import_violations: list[str]         # from the static AST check
+        s2: list[dict] | None = None         # s2.v1 per held-out pair (E7), in heldout order
+        s2_inputs: list[dict] | None = None
+        s2_hosts: list[str] | None = None
+
+    def static_import_violations(repo_root: Path) -> list[str]
+        # ast-parse scout/analysis.py, scout/features.py, scout/jev.py, scout/system2.py; any import of scout.hub, scout.sources,
+        # scout.scan, scout.gate (import X / from X import ... / from scout import hub...) -> "file: module"
+    def metrics(rows: list[dict]) -> dict
+        # {"n","n_derived","n_not_derived","n_hard","fd","n_nonabstained","correct","acc_nonabstain","abstain_rate","derived_recall"}
+    def s1_checks(inp: P3Inputs, sizes: Sizes = Sizes()) -> list[Check]      # C0..C11
+    def s2_checks(inp: P3Inputs) -> list[Check]                            # C12 (several rows)
+
+  scripts/exit_expectations_p2.py (P2 T115) change: in C8, `schema_version == "card.v1"` becomes
+    `schema_version in ("card.v1", "card.v2")`. Nothing else changes (every P2 threshold stays frozen).
+behavior: |
+  1. Checks never raise (P1 convention: exception -> ok False, actual "error: ..."). One Check per assertion; names "C<n> <short>".
+     target "*" for global checks, the repo for per-repo checks, the pair id for per-pair rows.
+  2. C0: set(pins) == set(targets).
+  3. C1: labeled loaded without error; synthetic is False unless synthetic_allowed; unresolved(labeled) == [];
+     L = last log line with step FREEZE and what "labeled" (missing -> FAIL); L.sha256 == file_sha256(labeled_path) and
+     L.pins_sha256 == file_sha256(pins_path); L.ts <= min(card.scan.scanned_at over cards with a non-empty fetch_log.gate)
+     (ISO strings parsed to datetimes; <= because both can fall in the same second in the offline rehearsal).
+  4. C2: families disjoint across splits (by construction of the loader; re-checked); for every pair both repos' families are
+     in the pair's split; derived pairs within one family. Held-out rows: n >= min_pairs, derived >= min_derived,
+     not_derived >= min_not_derived, hard >= min_hard where hard is COMPUTED: label not_derived and the two Cards'
+     hidden_size equal (config.raw["hidden_size"], falling back to text_config); computed hard must equal the YAML flag for
+     every pair (else FAIL naming the pair).
+  5. C3 (per repo in targets): card present; schema card.v2; key.revision_sha == pins[repo]; scan.options == {"sample": True,
+     "tokenizer": True, "anchors": True}; fetch_log.gate has exactly 1 decision, approved, via in {"cli-flag",
+     "below-threshold"}, and for cli-flag bytes_confirmed == bytes_cap and (plan_id, bytes_cap) in the union of
+     confirm_plans over log lines with step SCAN and mode confirm; bytes_planned <= fetch_log.totals.weight <= bytes_cap;
+     a fetch_log event with event "purge", stage "COMPUTE" and "resident=0" in the note.
+  6. C4: model loaded; S = last FREEZE "model" line; S.sha256 == model.sha256; S appears after L in log.jsonl and S.ts >= L.ts; model.doc.labeled_sha256 ==
+     L.sha256; set(model.doc.train_pairs) ⊆ train pair ids; pool ids ⊆ train ∪ calibration ids; json.dumps(model.doc)
+     contains no held-out pair id (as a quoted string, e.g. '"L27"') and no held-out repo string; model.doc.features ==
+     list(FROZEN_JEV_FEATURES).
+  7. C5: scout.cka.CKA_PARAMS == FROZEN_CKA_PARAMS; scout.tstats.TSTATS_PARAMS == FROZEN_TSTATS_PARAMS;
+     scout.features.FEATURE_PARAMS == FROZEN_FEATURE_PARAMS; scout.jev.JEV_PARAMS == FROZEN_JEV_PARAMS;
+     scout.features.JEV_FEATURES == FROZEN_JEV_FEATURES; scout.anchors.ANCHOR_SHA256 == ANCHOR_SHA256 and the packaged file
+     hashes to it; and the P2 frozen checks: scripts.exit_expectations_p2.params_check() all ok.
+  8. m = metrics(heldout). C6: m.fd <= FALSE_DERIVED_MAX (fd = #label not_derived with verdict derived; one extra row per
+     offending pair id). C7: m.n_nonabstained >= 1 and m.acc_nonabstain >= ACC_NONABSTAIN_MIN. C8: m.abstain_rate <= ABSTAIN_MAX.
+  9. C9: len(sweep) >= sizes.sweep_min and #derived in sweep <= SWEEP_FALSE_DERIVED_MAX (rows name each offender).
+  10. C10: s1_requests == 0 and import_violations == [].
+  11. C11: every report has disclaimers == list(DISCLAIMERS); every report text contains all three disclaimer strings.
+  12. C12 (s2_checks; if inp.s2 is None -> one FAIL row "C12 system2 not run"): len(s2) == len(heldout); each out has
+      schema "s2.v1", caveats == DISCLAIMERS, and for each pair final_verdict in ALLOWED_S2[system1_verdict]; for each s2 input
+      system2.assert_no_weights passes; set(s2_hosts) ⊆ S2_HOSTS and s2_hosts non-empty unless every out is unavailable;
+      served_model recorded (non-null) for every available out; metrics over rows with verdict = S2 final:
+      fd <= 0, acc_nonabstain >= 0.90, abstain_rate <= 0.30.
+  13. metrics: correct = verdict == label among non-abstained; acc = correct / n_nonabstained (None if 0 -> C7 FAIL);
+      abstain_rate = #abstain / n; derived_recall = #(label derived and verdict derived) / #derived (reported only).
+acceptance:
+  tests:
+    - "tests/test_exit_expectations_p3.py builds hand-written P3Inputs (tiny labeled.v1 dicts via scout.groundtruth.validate, fake LoadedCards with minimal dicts + empty pyarrow tables, log lines, a JevModel from T210 helpers)"
+    - "a passing input -> every s1_checks and s2_checks row ok"
+    - "failing inputs (parametrized; each makes at least the named check fail and nothing raises): pins missing a repo (C0); labeled sha differs from FREEZE (C1); FREEZE later than a Card's scanned_at (C1); a verify:true entry (C1); synthetic without allowance (C1); a pair crossing splits (C2); 15 held-out pairs (C2); YAML hard flag disagreeing with hidden sizes (C2); Card v1 (C3); options anchors False (C3); gate via api-confirm (C3); cli-flag pair not in any SCAN line (C3); totals.weight > cap (C3); no COMPUTE purge (C3); model sha differs from FREEZE (C4); model FREEZE before labeled FREEZE (C4); model doc containing '\"L27\"' (C4); CKA_PARAMS min_common changed (C5); JEV_PARAMS l2_lambda changed (C5); one held-out not_derived with verdict derived (C6); acc 0.857 (C7); all abstain (C7 and C8); abstain 6/19 (C8); sweep of 99 (C9); 1 derived in sweep (C9); s1_requests 1 (C10); an import of scout.hub in scout/features.py (C10, via a tmp tree); a report without disclaimers (C11); s2 None (C12); an S2 final derived where S1 abstained (C12); S2 caveats missing (C12); an s2 input with a 65-float list (C12); s2 host 'evil.example' (C12); S2 abstaining on 7/19 (C12)"
+    - "test_boundaries: acc exactly 0.90 passes; abstain exactly 0.30 passes (e.g. 3/10); fd 0 passes"
+    - "test_frozen_literals: every FROZEN_* equals the live module value today"
+    - "test_threshold_constants: the constants have exactly the values of this task"
+    - "tests/test_exit_expectations_p2.py (P2, updated): the 'card.v0 (C8)' failing case still fails; a new passing case with schema card.v2"
+  commands:
+    - pytest -q tests/test_exit_expectations_p3.py tests/test_exit_expectations_p2.py
+    - pytest -q
+out_of_scope:
+  - loading files, running S1/S2, network (T217)
+  - changing any threshold after a real run (human decision + plan revision)
+invariants_touched: [1, 2, 3, 4, 5]
+decisions: [D45]

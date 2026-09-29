@@ -1,0 +1,82 @@
+id: T203
+title: Anchor word set (anchors.v1) + tokenizer vocab-id mapping with byte-level / metaspace / plain normalisation
+depends_on: [T104]
+files:
+  - scout/data/anchors_v1.txt
+  - scout/anchors.py
+  - pyproject.toml
+  - tests/test_anchors.py
+route: opus
+spec_complete: true
+interface: |
+  scout/data/anchors_v1.txt: exactly 256 lines, one lowercase word per line, no leading/trailing spaces, "\n" line
+    endings, trailing newline, in THIS order (the words of the plan's anchor list, space-separated here):
+    the of and to in is was for on that with as by at from his he it an were are which this be or has had not first one
+    their its new after but who they have her she two been other when there all into school time may years more most only
+    over city some world would where later up such used many can state about national out known university united then
+    made also three well while part team year age him them between under than second both through war area south north
+    life film no west group east so these high us early season including four since game became found called being series
+    music club work several each family did based name same home best following people could should make like just now
+    what how any way even back good very long old great little own right big small last few next end day man men woman
+    house water number word place country government company system power law party public point case week month order
+    report history church free open light land line side head hand book story money food love help play run need read
+    write think show give take come look want tell ask feel try leave call keep let begin seem turn start hear move live
+    believe hold bring happen stand lose pay meet include continue set learn change lead understand watch follow stop
+    create speak allow add spend grow offer remember consider appear buy wait serve die send expect
+    sha256 of the file bytes == "466fcb0770645851483e61a7c7a72041d80c7155a2f0e24530c2a1099c421516"
+  pyproject.toml: package data includes scout/data/*.txt (so importlib.resources finds it after pip install -e)
+
+  scout/anchors.py:
+    ANCHOR_SET = "anchors.v1"
+    ANCHOR_SHA256 = "466fcb0770645851483e61a7c7a72041d80c7155a2f0e24530c2a1099c421516"
+    def anchor_words() -> tuple[str, ...]              # 256 words (no spaces), cached; verifies sha256 on first load (ScoutError if different)
+    def anchor_strings() -> tuple[str, ...]            # " " + word for each word (the text form matched against vocabularies)
+    BYTE_DECODER: dict[str, int]                        # inverse of GPT-2 bytes_to_unicode()
+
+    @dataclass(frozen=True)
+    class VocabIds:
+        normalization: str                              # "byte-level" | "metaspace" | "plain"
+        ids: dict[str, int]                             # normalized text -> smallest id with that normalized form
+
+    def vocab_ids(path: str, raw: bytes) -> VocabIds    # raises ValueError on unparseable input
+    def normalize_token(tok: str, normalization: str) -> str | None
+    def anchor_ids(v: VocabIds, n_rows: int) -> tuple[list[int], list[int]]
+        # (present anchor indices ascending, token ids in the same order); ids >= n_rows are dropped
+behavior: |
+  1. bytes_to_unicode (GPT-2): bs = list(range(ord("!"), ord("~")+1)) + list(range(ord("¡"), ord("¬")+1)) +
+     list(range(ord("®"), ord("ÿ")+1)); cs = bs[:]; n = 0; for b in range(256): if b not in bs: bs.append(b);
+     cs.append(256 + n); n += 1. Map chr(c) -> b for the pairs => BYTE_DECODER.
+  2. vocab_ids(path, raw):
+     - path ending "vocab.json": the JSON object token -> id (ints); normalization "byte-level".
+     - otherwise tokenizer.json: d = json.loads(raw); model = d["model"]; vocab:
+       BPE/WordPiece/WordLevel: model["vocab"] dict token -> id; Unigram: model["vocab"] list of [piece, score], id = index.
+       Added tokens are NOT used. normalization: "byte-level" if any object with "type" == "ByteLevel" occurs anywhere
+       (recursively) inside d.get("pre_tokenizer") or d.get("decoder"); else "metaspace" if any vocab key starts with "▁"
+       (U+2581); else "plain".
+     - Any KeyError/TypeError/JSONDecodeError -> ValueError(f"{path}: cannot read vocabulary: {e}").
+     - ids: for each (tok, id): t = normalize_token(tok, normalization); if t is not None and (t not in ids or id < ids[t]):
+       ids[t] = id.
+  3. normalize_token: byte-level: bytes(BYTE_DECODER[c] for c in tok).decode("utf-8") (KeyError or UnicodeDecodeError ->
+     None); metaspace: tok.replace("▁", " "); plain: tok.
+  4. anchor_ids(v, n_rows): for index k, s in enumerate(anchor_strings()): key = s if v.normalization != "plain" else
+     s.strip(); if key in v.ids and v.ids[key] < n_rows: present.append(k), ids.append(v.ids[key]). Returns in ascending k.
+  5. Pure, no network, no weights.
+acceptance:
+  tests:
+    - "test_anchor_file: len(anchor_words()) == 256, all distinct, anchor_words()[0] == 'the', [-1] == 'expect'; sha256 of the packaged file == ANCHOR_SHA256; a monkeypatched file with one changed word -> ScoutError"
+    - "test_byte_level: tokenizer.json with pre_tokenizer {'type':'Sequence','pretokenizers':[{'type':'ByteLevel'}]} and vocab {'Ġthe': 5, 'the': 6, 'Ġof': 7, 'Ġand': 900} -> normalization byte-level; anchor_ids(v, 800) == ([0, 1], [5, 7]) (and 'Ġand' dropped as >= n_rows)"
+    - "test_metaspace: vocab {'▁the': 3, '▁of': 4} with decoder {'type':'Sequence','decoders':[{'type':'Replace'}]} -> metaspace; anchors 0,1 present with ids 3,4"
+    - "test_unigram: Unigram vocab [['▁the', -1.0], ['▁of', -2.0]] -> ids by index 0 and 1"
+    - "test_plain_wordpiece: WordPiece vocab {'the': 10, 'of': 11} (no ByteLevel, no ▁) -> plain; anchors 0,1 -> 10,11"
+    - "test_vocab_json: vocab.json {'Ġthe': 1} -> byte-level, anchor 0 -> 1"
+    - "test_duplicate_forms: byte-level vocab where two tokens normalize to ' the' (ids 9 and 4) -> 4"
+    - "test_invalid_utf8: a byte-level token decoding to invalid UTF-8 is skipped, not an error"
+    - "test_bad_input: non-JSON bytes and a JSON without model -> ValueError"
+  commands:
+    - pytest -q tests/test_anchors.py
+    - pytest -q
+out_of_scope:
+  - reading embedding rows or computing Grams (T205-T207)
+  - SentencePiece tokenizer.model protobuf (later.md, unscheduled)
+invariants_touched: [4, 5]
+decisions: [D35]

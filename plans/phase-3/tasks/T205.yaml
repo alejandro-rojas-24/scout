@@ -1,0 +1,62 @@
+id: T205
+title: Anchor Gram + debiased linear CKA (unbiased HSIC, Song et al. 2012) - CKA_PARAMS, gram packing, cka between two Cards
+depends_on: [T203]
+files:
+  - scout/cka.py
+  - tests/test_cka.py
+route: opus
+spec_complete: true
+interface: |
+  scout/cka.py:
+    CKA_PARAMS: dict      # EXACTLY the plan.md 4.8 literal
+    def find_embedding(names_shapes_dtypes: list[tuple[str, tuple[int, ...], str]]) -> tuple[str, tuple[int, int], str] | None
+        # (name, (rows, hidden), dtype) of the input embedding, or None
+    def anchor_gram(X: numpy.ndarray) -> list[float]
+        # X (n, hidden) float64 rows in `present` order -> upper triangle incl. diagonal, row-major, of X @ X.T / hidden
+    def unpack_gram(upper: Sequence[float], n: int) -> numpy.ndarray      # (n, n) symmetric
+    def hsic_unbiased(K: numpy.ndarray, L: numpy.ndarray) -> float
+    def cka_debiased(K: numpy.ndarray, L: numpy.ndarray) -> float | None
+    def card_anchor(card: dict, table: pyarrow.Table) -> tuple[list[int], numpy.ndarray] | None
+        # (present, full Gram) from a v2 Card, or None if the card has no anchor_embedding / column
+    def cka_cards(ref_card, ref_table, subj_card, subj_table) -> tuple[float | None, int, str | None]
+        # (cka or None, n_common, reason or None)
+behavior: |
+  1. find_embedding: first an exact name match in CKA_PARAMS["embed_names"]; else the unique name ending with
+     "." + CKA_PARAMS["embed_suffix"] or equal to it (0 or >1 matches -> None). Require len(shape) == 2 and dtype in
+     CKA_PARAMS["dtypes"]; else None.
+  2. anchor_gram(X): G = (X @ X.T) / X.shape[1] (float64); return [float(G[i, j]) for i in range(n) for j in range(i, n)].
+  3. unpack_gram(upper, n): len(upper) must equal n*(n+1)//2 (ValueError); fill upper and mirror.
+  4. hsic_unbiased(K, L): n = K.shape[0] (n >= 4 else ValueError); Kt = K with zero diagonal, Lt likewise (copies);
+     one = ones(n); t1 = sum(Kt * Lt); t2 = (one @ Kt @ one) * (one @ Lt @ one) / ((n - 1) * (n - 2));
+     t3 = 2.0 / (n - 2) * (one @ Kt @ Lt @ one); return float((t1 + t2 - t3) / (n * (n - 3))).
+  5. cka_debiased(K, L): a = hsic(K, L); b = hsic(K, K); c = hsic(L, L); if b <= 0 or c <= 0 -> None;
+     return round(float(clip(a / sqrt(b * c), -1, 1)), 6).
+  6. card_anchor(card, table): ae = (card.get("stats") or {}).get("anchor_embedding"); None if absent or the table has no
+     "stat_anchor_gram" column or the row of ae["tensor"] has a null gram; else (ae["present"], unpack_gram(gram, ae["n_present"])).
+  7. cka_cards: a = card_anchor(ref), b = card_anchor(subj); missing -> (None, 0, "anchors missing on reference" /
+     "... on subject"); anchor_sha256 or anchor_set differing between the two -> (None, 0, "anchor sets differ");
+     common = sorted(set(pa) & set(pb)); n < CKA_PARAMS["min_common"] -> (None, n, f"only {n} common anchors");
+     index maps into each Gram; K = Ga[ix_a][:, ix_a], L = Gb[ix_b][:, ix_b]; v = cka_debiased(K, L);
+     v None -> (None, n, "degenerate Gram"); else (v, n, None).
+  8. Invariance statement to put in the module docstring (plan.md 3.2): G = E E^T is unchanged by E -> E Q for any
+     orthogonal Q (hidden permutations, sign flips, rotations); CKA is scale-invariant; examples are matched by token
+     string. Not invariant to non-orthogonal hidden transforms (documented limitation).
+  9. No IO, no network, no raw cosine.
+acceptance:
+  tests:
+    - "test_params_literal: CKA_PARAMS equals the plan.md 4.8 literal (incl. anchor_sha256 == scout.anchors.ANCHOR_SHA256)"
+    - "test_pack_roundtrip: random X (10x7) -> unpack_gram(anchor_gram(X), 10) == X@X.T/7 within 1e-12"
+    - "test_identity_and_rotation: X (256x128, rng 1) -> cka_debiased(G(X), G(X)) == 1.0; G(X @ Q) for a random orthogonal Q, a column permutation with sign flips, and 3.7*X -> >= 0.999999"
+    - "test_debiased_null: 20 pairs of independent standard-normal X, Y (256 x 2048, seeds 2p+1, 2p+2) -> |cka_debiased| <= 0.05 for all 20; and the plain linear CKA (computed in the test on column-centred X, Y as ||Y^T X||_F^2/(||X^T X||_F ||Y^T Y||_F)) >= 0.80 for all 20 (planner measured 0.889: proves the bias the estimator removes)"
+    - "test_finetune: Y = X + eps * N * ||X||/sqrt(X.size) for eps 0.02 -> >= 0.999; eps 1.0 -> in (0.3, 0.8) (measured ~0.50 at d=128)"
+    - "test_hsic_small_n: n=3 -> ValueError; K = L = 0 matrix -> cka_debiased None"
+    - "test_find_embedding: names [('model.embed_tokens.weight',(512,128),'BF16')] -> found; only 'transformer.x.embed_tokens.weight' -> found by suffix; two suffix matches -> None; dtype F8_E4M3 -> None; 1-D -> None"
+    - "test_cka_cards: two hand-built Card dicts + pyarrow tables (name, stat_anchor_gram) with present [0..199] and [50..255] -> n_common 150, value equals cka_debiased on the sub-Grams computed directly; present sets with 100 common -> (None, 100, reason); anchor_sha256 differing -> reason 'anchor sets differ'; v1 table without the column -> None with reason"
+  commands:
+    - pytest -q tests/test_cka.py
+    - pytest -q
+out_of_scope:
+  - planning or reading rows (T206, T207)
+  - JEV features (T209)
+invariants_touched: [1, 4]
+decisions: [D35, D36]
