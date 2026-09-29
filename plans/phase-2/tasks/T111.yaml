@@ -33,12 +33,15 @@ behavior: |
          C = align.combine_cost(S, Rp); a = align.viterbi(C); mode = "dp-structure+weights" if Rp is not None else "dp-structure";
          used_weights = Rp is not None.
        summary = align.summarize(a, nA, S, used_weights, mode, ref_idx, subj_idx).
+       If p == weight_pair and R is not None: nul = layercorr.in_run_null(R, a) (default edge = SIGMA_PARAMS["edge_blocks_excluded"]);
+       scored = set(nul["scored"]); else scored = set().
        layers[i] = {"subject_index": subj_idx[i], "reference_index": ref_idx[a[i]], "op": summary.ops[i],
-                    "struct_cost": float(S[i, a[i]]), "r": round(float(R[i, a[i]]), 6) if p == weight_pair and R is not None else None}.
+                    "struct_cost": float(S[i, a[i]]), "r": round(float(R[i, a[i]]), 6) if i in scored else None}
+       (edge blocks and layers aligned to a reference edge block get r null: they are not scored, plan.md 3.4 step 6).
        The stack_pairs entry has exactly the keys of plan.md 4.5 (ops go only into layers).
   5. weight = {"available": R is not None, "reason": reason, "roles": roles, "pair_index": weight_pair if R is not None else None,
-     "n_layers": nB of that pair (0 if none), "n_with_r": the count of non-null r, and, from nul = layercorr.in_run_null(R, a)
-     with a = the displayed alignment of that pair (null values for every key below when R is None):
+     "n_layers": nB of that pair (0 if none), "n_with_r": the count of non-null r (== len(nul["scored"])), and, from the nul of
+     step 4 (the displayed alignment of that pair; null values for every key below when R is None):
      "median_r": nul.median_r, "q10_r": nul.q10_r, "offdiag_median_r": nul.offdiag_median_r,
      "diag_top1_frac": nul.diag_top1_frac, "shift_null": nul.shift_null, "z_shift": nul.z_shift,
      "participation_ratio": {"reference": round(cmp.pr_reference, 6), "subject": round(cmp.pr_subject, 6)}}.
@@ -50,9 +53,9 @@ behavior: |
 acceptance:
   tests:
     - "Cards are produced by T108 scan(sample=True, tokenizer=True, gate_threshold_bytes=0, confirmer=lambda p: gate.decision(p, approved=True, via='cli-flag', bytes_confirmed=p.bytes_cap)) on local repos written with tests/helpers/weights_fixtures, then load_card; a module-scoped fixture caches them"
-    - "test_related: base = FamilySpec(seed=1) vs finetune(base, 0.02, 7) -> one pair model.layers, kind same, mode dp-structure+weights, all ops match with equal indices, weight.median_r >= 0.9, n_with_r == 16, tokenizer.jaccard == 1.0, config_diff.score == 1.0"
-    - "test_related_in_run_null: the same related pair -> weight.offdiag_median_r <= 0.20, diag_top1_frac == 1.0, q10_r >= 0.90, shift_null.n == 15, z_shift > 0, participation_ratio.reference and .subject both in [1, 16]"
-    - "test_unrelated: weights_fixtures.REHEARSAL_BASE vs REHEARSAL_OTHER (28-layer qwen2-style vs 32-layer llama-style, hidden 160) -> kind incompatible, mode reldepth, n_with_r == 32, only_in_reference contains 'model.layers.#.self_attn.q_proj.bias', '...k_proj.bias', '...v_proj.bias'; weight.median_r <= 0.40; z_shift <= 3.0; diag_top1_frac <= 0.40"
+    - "test_related: base = FamilySpec(seed=1) vs finetune(base, 0.02, 7) -> one pair model.layers, kind same, mode dp-structure+weights, all ops match with equal indices, weight.median_r >= 0.9, n_with_r == 14 (16 - 2 edge blocks), layers 0 and 15 have r None, tokenizer.jaccard == 1.0, config_diff.score == 1.0"
+    - "test_related_in_run_null: the same related pair -> weight.offdiag_median_r <= 0.20, diag_top1_frac == 1.0, q10_r >= 0.90, shift_null.n == 13, z_shift > 0, participation_ratio.reference and .subject both in [1, 14]"
+    - "test_unrelated: weights_fixtures.REHEARSAL_BASE vs REHEARSAL_OTHER (28-layer qwen2-style vs 32-layer llama-style, hidden 160) (both carry the shared edge anomaly EDGE_ANOMALY, T103) -> kind incompatible, mode reldepth, n_with_r == 30, subject layers 0 and 31 have r None, only_in_reference contains 'model.layers.#.self_attn.q_proj.bias', '...k_proj.bias', '...v_proj.bias'; weight.median_r <= 0.40; z_shift <= 3.0; diag_top1_frac <= 0.40"
     - "test_sigma_set_from_scan: layercorr.sigma_set on the scanned base Card + table -> 16 indices, roles ['attn.v', 'attn.k'] (moved here from T109, which does not depend on T108)"
     - "test_weight_keys: weight has exactly the keys of plan.md 4.5 (incl. q10_r, offdiag_median_r, diag_top1_frac, shift_null, z_shift, participation_ratio); all null except available/reason/roles/n_layers/n_with_r when weight is unavailable"
     - "test_upscaled: base vs upscale(base,16,12,4) -> kind upscaled, location_resolved True, duplicated_reference == [4..11], the layer at subject_index 12 has reference_index 4 and op jump; r at matched layers >= 0.9 in median"

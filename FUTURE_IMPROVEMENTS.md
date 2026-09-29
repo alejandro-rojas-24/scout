@@ -36,7 +36,11 @@ This file collects non-blocking review findings per phase for a later wave.
 
 ## Phase 2
 
-_pending planning_
+- **Scale retry slack with the plan size**: T106/T108, plan §11.3. The 16 MiB retry slack is a fixed amount, so E3 can fail when the network resets mid-read. Today's remedy is to rerun E3 whole with the same `--confirm-plans` line. Scaling the slack to the plan's size would avoid that. Source: r1-m4.
+- **Selection bias from the alignment step**: T110/T111, plan §11.3. The alignment is chosen using the per-layer correlations and then r is reported on it, which pushes r up for same-architecture pairs. The exit pairs aren't affected. Measure this against Phase 3's hard negatives. Source: r2-m5.
+- **T5-style text encoders**: T107/T108, plan §11.3. Add sampling roles for `SelfAttention.{k,v}`, or at least a skip hint, and measure the null before adding them to the statistic. Source: r2-m6.
+- **Cut or keep `scout suggest`**: T112, plan §11.3. It was kept, with the justification recorded; revisit after real use. Source: r2-m9.
+- **Robust detrend for anomalies that go deeper than the first and last layers**: T109, plan §2.3. When the edge anomaly also covers block 1, the null still leaks (8/200 medians > 0.40 and 9/200 z > 3). A bisquare detrend closed that leak (0/100) but adds tuning constants, and excluding 2 layers per edge widens the L=16 null. Evaluate both in Phase 3. Source: r2 major, residual risk.
 
 ## Phase 3
 

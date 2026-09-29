@@ -1,5 +1,5 @@
 id: T109
-title: Per-layer sigma-curve statistic - top-half log grid, per-layer centring, cubic depth detrend, Pearson matrix, in-run nulls (off-diagonal, cyclic shift, participation ratio)
+title: Per-layer sigma-curve statistic - top-half log grid, per-layer centring, cubic depth detrend fitted on interior blocks (edge blocks excluded), Pearson matrix, in-run nulls (off-diagonal, cyclic shift, participation ratio)
 depends_on: [T102, T103, T107]
 files:
   - scout/layercorr.py
@@ -11,7 +11,8 @@ interface: |
     from scout.sigma import SIGMA_PARAMS, ROLE_ORDER
 
     def grid_curve(sigma: Sequence[float]) -> numpy.ndarray                       # shape (grid_points,)
-    def residuals(Y: numpy.ndarray, degree: int | None = SIGMA_PARAMS["detrend_degree"]) -> numpy.ndarray
+    EDGE: int = SIGMA_PARAMS["edge_blocks_excluded"]                                   # == 1
+    def residuals(Y: numpy.ndarray, degree: int | None = SIGMA_PARAMS["detrend_degree"], edge: int = EDGE) -> numpy.ndarray
     def role_matrix(curves_by_block: dict[int, Sequence[float]], order: list[int]) -> numpy.ndarray   # (L, G)
     def layer_vectors(res_by_role: dict[str, numpy.ndarray], roles: list[str]) -> numpy.ndarray       # (L, G*len(roles))
     def pearson_matrix(VB: numpy.ndarray, VA: numpy.ndarray) -> numpy.ndarray                          # (nB, nA)
@@ -21,32 +22,37 @@ interface: |
         stack_prefix: str; indices: list[int]; curves: dict[str, dict[int, list[float]]]   # role -> block index -> sigma
 
     def sigma_set(card: dict, table: pyarrow.Table) -> SigmaSet | None          # None if the card has no sigma_curves
-    def participation_ratio(V: numpy.ndarray) -> float                                     # V: (L, d) layer vectors
+    def participation_ratio(V: numpy.ndarray) -> float                                     # V: (L, d) layer vectors (caller slices)
 
     @dataclass(frozen=True)
     class Comparison:
         R: numpy.ndarray | None          # (n_subj, n_ref)
         roles: list[str]
         reason: str | None               # set iff R is None
-        pr_reference: float | None       # participation_ratio of the reference layer vectors
+        pr_reference: float | None       # participation_ratio of the reference INTERIOR layer vectors (rows EDGE..L-1-EDGE)
         pr_subject: float | None
 
     def compare(ref: SigmaSet, subj: SigmaSet) -> Comparison
 
-    def in_run_null(R: numpy.ndarray, a: list[int]) -> dict
+    def scored_positions(nB: int, nA: int, a: list[int], edge: int = EDGE) -> list[int]
+        # subject positions i with edge <= i <= nB-1-edge and edge <= a[i] <= nA-1-edge, ascending
+    def in_run_null(R: numpy.ndarray, a: list[int], edge: int = EDGE) -> dict
         # a: displayed alignment, subject position -> reference position (len == R.shape[0])
-        # {"median_r", "q10_r", "offdiag_median_r", "diag_top1_frac",
+        # {"scored": list[int], "median_r", "q10_r", "offdiag_median_r", "diag_top1_frac",
         #  "shift_null": {"n", "mean", "sd", "max"}, "z_shift": float | None}   all floats rounded to 6 decimals
 behavior: |
   1. grid_curve(sigma): s = numpy.asarray(sigma, float64) (descending, K >= 1); floor = SIGMA_PARAMS["log_floor_rel"] * s[0]
      (if s[0] <= 0: return zeros(G)); y = log(maximum(s, floor)); u_k = (arange(K) + 0.5)/K;
      G = SIGMA_PARAMS["grid_points"]; u_g = SIGMA_PARAMS["grid_u_max"] * (arange(G) + 0.5)/G;
      return numpy.interp(u_g, u_k, y) (numpy's constant extrapolation at the ends).
-  2. residuals(Y, degree): Y is (L, G). Z = Y - Y.mean(axis=1, keepdims=True) (per-layer centring).
+  2. residuals(Y, degree, edge): Y is (L, G). L must be >= SIGMA_PARAMS["min_layers"], else ValueError.
+     Z = Y - Y.mean(axis=1, keepdims=True) (per-layer centring).
      If degree is None: return Z (test hook only; production always uses SIGMA_PARAMS["detrend_degree"] = 3).
      t = linspace(-1, 1, L); X = numpy.polynomial.polynomial.polyvander(t, degree) (L x (degree+1));
-     coef = numpy.linalg.lstsq(X, Z, rcond=None)[0]; return Z - X @ coef.
-     L must be >= SIGMA_PARAMS["min_layers"], else ValueError.
+     fit = slice(edge, L - edge); coef = numpy.linalg.lstsq(X[fit], Z[fit], rcond=None)[0]; return Z - X @ coef
+     (the cubic is FITTED on the interior rows only and SUBTRACTED from all L rows; rows 0..edge-1 and L-edge..L-1 therefore
+     cannot lever the fit, and the interior residual rows depend only on the interior rows of Y. Validation r2 major: a
+     shared first/last-block anomaly otherwise spreads through the endpoint leverage into every layer's residual.)
   3. role_matrix: rows in the given block-index order, each grid_curve(curves_by_block[idx]). A missing idx raises KeyError.
   4. layer_vectors: numpy.concatenate([res_by_role[r] for r in roles], axis=1).
   5. pearson_matrix(VB, VA): row-centre each vector; norms; r = (VBc @ VAc.T) / outer(nB, nA). Any pair with a zero norm
@@ -60,33 +66,40 @@ behavior: |
      If no roles -> Comparison(None, [], "no common sampled roles", None, None). If len(ref.indices) or len(subj.indices) <
      min_layers -> Comparison(None, roles, "stack shallower than min_layers", None, None).
      Per side: res[r] = residuals(role_matrix(curves[r], indices)); V = layer_vectors(res, roles).
-     R = pearson_matrix(V_subj, V_ref). Return Comparison(R, roles, None, participation_ratio(V_ref), participation_ratio(V_subj)).
+     R = pearson_matrix(V_subj, V_ref) over ALL layers (T110/T111 may use every entry for the alignment).
+     Return Comparison(R, roles, None, participation_ratio(V_ref[EDGE:len(V_ref)-EDGE]),
+     participation_ratio(V_subj[EDGE:len(V_subj)-EDGE])).
   8. participation_ratio(V): Vc = V - V.mean(axis=1, keepdims=True); lam = numpy.linalg.svd(Vc, compute_uv=False)**2;
      return float(lam.sum()**2 / (lam**2).sum()) if lam.sum() > 0 else 0.0. (The effective number of modes of the residual
      layer vectors; it is REPORTED, never thresholded. plan.md 2.3 uses it to state the implied null SD.)
-  9. in_run_null(R, a) (nB = R.shape[0] >= 3; computed on the unrounded R; outputs rounded to 6 decimals):
-     - diag = [R[i, a[i]] for i in range(nB)]; median_r = numpy.median(diag); q10_r = numpy.quantile(diag, 0.10) (numpy
-       default linear interpolation).
-     - offdiag_median_r = numpy.median of all R[i, j] with j != a[i] (every row, every other column).
-     - diag_top1_frac = mean over i of (int(numpy.argmax(R[i])) == a[i]) (numpy.argmax takes the first maximum on ties).
-     - shift null: for k in 1..nB-1: m_k = numpy.median([R[i, a[(i + k) % nB]] for i in range(nB)]). shift_null = {"n": nB-1,
+  9. in_run_null(R, a, edge) (computed on the unrounded R; outputs rounded to 6 decimals). (nB, nA) = R.shape;
+     S = scored_positions(nB, nA, a, edge); J = list(range(edge, nA - edge)); n = len(S); n < 3 -> ValueError.
+     - "scored": S. diag = [R[i, a[i]] for i in S]; median_r = numpy.median(diag); q10_r = numpy.quantile(diag, 0.10)
+       (numpy default linear interpolation).
+     - offdiag_median_r = numpy.median of all R[i, j] with i in S, j in J, j != a[i].
+     - diag_top1_frac = mean over i in S of (J[int(numpy.argmax(R[i, J]))] == a[i]) (numpy.argmax takes the first maximum on ties).
+     - shift null: for k in 1..n-1: m_k = numpy.median([R[S[x], a[S[(x + k) % n]]] for x in range(n)]). shift_null = {"n": n-1,
        "mean": mean(m), "sd": std(m, ddof=1), "max": max(m)}. z_shift = (median_r - mean)/sd if sd > 0 else None.
+     - No entry of R outside rows S and columns J affects any output (tested).
        Rationale: each m_k is the same median statistic on a deliberately misaligned pairing of the SAME two models, so the
        spread of m_k measures the null with the actual effective dimension of this run (no d_eff assumption).
   10. Pure; no IO; no raw cosine; no thresholds (verdicts are not produced here).
 acceptance:
   tests:
-    - "Math tests build SigmaSets directly from arrays made by tests/helpers/weights_fixtures (family_weights, finetune, permute_hidden, rotate_kv_inputs), taking sigma via scout.sigma.sigma_values of the float32 arrays cast to float64 (no files needed). Families are generated once per module (module-scoped fixture); the null tests generate about 140 families and take about 60 s on one core"
+    - "Math tests build SigmaSets directly from arrays made by tests/helpers/weights_fixtures (family_weights, finetune, permute_hidden, rotate_kv_inputs), taking sigma via scout.sigma.sigma_values of the float32 arrays cast to float64 (no files needed). Families are generated once per module (module-scoped fixture); the null tests generate about 220 families (the edge-anomaly tests reuse the plain families of test_independent_null and test_null_geometry_rehearsal and add 80 anomaly families) and take about 100 s on one core"
     - "test_grid_curve: sigma = [4,2,1,0.5] -> length 128, first value log(4), non-increasing"
-    - "test_residuals_remove_poly: Y whose columns are cubic polynomials in t plus a per-row constant -> residuals ~ 0 (1e-10)"
+    - "test_residuals_remove_poly: Y whose columns are cubic polynomials in t plus a per-row constant -> residuals ~ 0 (1e-10) on ALL rows (edge=1 and edge=0)"
+    - "test_residuals_edge_fit: Y random (16 x 128); Y2 = Y with rows 0 and 15 replaced by arbitrary values (e.g. +50 * arange(128)) -> residuals(Y2)[1:15] == residuals(Y)[1:15] within 1e-12; with edge=0 they differ (proves the edge rows lever the r1 fit)"
     - "test_invariance: family A vs permute_hidden(A) and vs rotate_kv_inputs(A) -> diag(R) all >= 0.999999"
     - "test_finetune: A vs finetune(A, eps=0.02, seed=9) -> median diag r >= 0.95; eps=0.05 -> median >= 0.80"
-    - "test_independent_null: over weights_fixtures.NULL_SEED_PAIRS (the FROZEN 50 pairs (2p+1, 2p+2), p = 0..49, all with trend_seed=0, i.e. a shared linear + U-shaped depth trend; same architecture, so this is a synthetic same-architecture hard negative), identity alignment, L=16: the 95th percentile (numpy default) of the 50 median_r values <= 0.40; abs(mean of the 50 medians) <= 0.10; z_shift <= 3.0 for at least 49 of 50 pairs; diag_top1_frac <= 0.40 for every pair. Measured by the planner in a numpy reimplementation (plan.md 2.3): q95 0.28, mean 0.02, max z 1.89, max top1 0.19. No seed may be changed to make this pass (plan.md 2.1 no hand-tuning); a failure goes to the human"
+    - "test_independent_null: over weights_fixtures.NULL_SEED_PAIRS (the FROZEN 50 pairs (2p+1, 2p+2), p = 0..49, all with trend_seed=0, i.e. a shared linear + U-shaped depth trend; same architecture, so this is a synthetic same-architecture hard negative), identity alignment, L=16, default edge (14 scored layers): the 95th percentile (numpy default) of the 50 median_r values <= 0.40; abs(mean of the 50 medians) <= 0.10; z_shift <= 3.0 for at least 47 of 50 pairs; diag_top1_frac <= 0.40 for every pair. Measured by the planner in a numpy reimplementation (plan.md 2.3, r2): q95 0.281, mean 0.008, z > 3 in 0/50 (4/200 over 200 pairs; 47/50 keeps the chance of failing by construction below 2 %), max top1 0.29. No seed may be changed to make this pass (plan.md 2.1 no hand-tuning); a failure goes to the human"
     - "test_detrend_matters: the first 10 of NULL_SEED_PAIRS with residuals(degree=None) (no depth detrend) -> the mean of the medians >= 0.60 (measured 0.92; proves the generic structure the detrend removes is real in the fixture)"
-    - "test_layer_specific: A = family_weights(FamilySpec(seed=1)) vs finetune(A, 0.02, 7): in_run_null -> median_r >= 0.95, q10_r >= 0.90, offdiag_median_r <= 0.20, median_r - offdiag_median_r >= 0.40, diag_top1_frac == 1.0, z_shift is not None and > 0 (measured over 50 seeds: median >= 0.9999, offdiag in [-0.16, -0.03], top1 1.0, z >= 3.29; the related z is reported, not thresholded, because real neighbouring layers can widen the shift null)"
-    - "test_in_run_null_math: R = 0.9*I + 0.0 elsewhere (16x16), a = identity -> median 0.9, offdiag 0.0, top1 1.0; R with 0.9 on the diagonal and 0.6 elsewhere -> median 0.9, offdiag 0.6, gap 0.30 < 0.40 although top1 is 1.0 (a shared-structure inflation of every entry fails C18); R constant 0.7 -> top1 == 1/16 (argmax takes column 0) and shift sd 0 -> z_shift None; a non-injective reldepth a (20 subject x 16 ref) works and excludes exactly R[i, a[i]] per row from offdiag"
+    - "test_layer_specific: A = family_weights(FamilySpec(seed=1)) vs finetune(A, 0.02, 7): in_run_null -> scored == [1..14], median_r >= 0.95, q10_r >= 0.90, offdiag_median_r <= 0.20, median_r - offdiag_median_r >= 0.40, diag_top1_frac == 1.0, z_shift is not None and > 0 (measured over 50 seeds, r2: median >= 0.9999, offdiag in [-0.24, +0.012], top1 1.0, z >= 2.60; the related z is reported, not thresholded, because real neighbouring layers can widen the shift null)"
+    - "test_in_run_null_math (edge=0 unless stated): R = 0.9*I + 0.0 elsewhere (16x16), a = identity -> median 0.9, offdiag 0.0, top1 1.0, scored == [0..15]; R with 0.9 on the diagonal and 0.6 elsewhere -> median 0.9, offdiag 0.6, gap 0.30 < 0.40 although top1 is 1.0 (a shared-structure inflation of every entry fails C18); R constant 0.7 -> top1 == 1/16 (argmax takes column 0) and shift sd 0 -> z_shift None; a non-injective reldepth a (20 subject x 16 ref) works and excludes exactly R[i, a[i]] per row from offdiag. edge=1: R = 0.9*I (16x16) with rows 0 and 15 and columns 0 and 15 then overwritten by seeded uniform(-1, 1) values -> scored == [1..14], median 0.9, offdiag 0.0, top1 1.0, shift_null.n == 13, and the output is identical for two different overwrite seeds; scored_positions(32, 28, reldepth(32, 28)) == [1..30]; an alignment mapping subject 1 to reference 0 drops position 1 from scored"
     - "test_participation_ratio: V[i] = c_i * v with v = arange(10) and c = arange(1, 9) (rank 1 after row centring) -> 1.0 within 1e-9; V = numpy.eye(8) (row-centred it is I - 1/8, eigenvalues 1 x7 and 0) -> 7.0 within 1e-9; a zero matrix -> 0.0"
-    - "test_null_geometry_rehearsal: over the first 20 of NULL_SEED_PAIRS, reference FamilySpec(seed=a, n_layers=28) vs subject FamilySpec(seed=b, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32), reldepth(32, 28) alignment: the 95th percentile of median_r <= 0.40 and z_shift <= 3.0 for all 20 (measured over 200 pairs: q95 0.16, max 0.32, max z 2.85)"
+    - "test_null_geometry_rehearsal: over the first 20 of NULL_SEED_PAIRS, reference FamilySpec(seed=a, n_layers=28) vs subject FamilySpec(seed=b, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32), reldepth(32, 28) alignment, default edge (30 scored): the 95th percentile of median_r <= 0.40 and z_shift <= 3.0 for at least 19 of 20 (measured, r2: first 20 pairs q95 0.249, max 0.265, max z 2.77; over 200 pairs q95 0.201, max 0.358, z > 3 in 1/200)"
+    - "test_edge_anomaly_invariance: the shared edge-anomaly fixture (weights_fixtures.EDGE_ANOMALY on BOTH sides, i.e. FamilySpec(..., edge_anomaly=EDGE_ANOMALY)). (a) L=16: the first 20 of NULL_SEED_PAIRS, identity alignment; (b) exit geometry as in test_null_geometry_rehearsal, first 20 pairs. For every pair, in_run_null(R_anomaly, a) equals in_run_null(R_plain, a) in every key (floats within 1e-12, scored identical) and participation ratios equal within 1e-12. Hence (b) also meets the geometry thresholds (q95 <= 0.40, z_shift <= 3.0 for >= 19 of 20). This is the null test with depth-localised shared structure (validation r2 major)"
+    - "test_edge_anomaly_sensitivity: the (b) pairs WITH the anomaly, compared with edge=0 in both residuals and in_run_null -> the mean of the 20 median_r values >= 0.20 (measured 0.323; without the anomaly, edge=0 measures -0.005 over 200 pairs). Proves the fixture reproduces the endpoint-leverage mechanism that edge exclusion removes; the test only documents the r1 failure mode and asserts nothing about production thresholds"
     - "test_different_shapes: llama-style family with hidden=160, n_kv_heads=4 (k 128x160) vs a qwen2-style family -> compare works (grid makes the lengths equal); returns R of shape (nB, nA)"
     - "test_shallow_and_missing: 6-layer sets -> R None with a reason; roles missing on one side -> reason 'no common sampled roles'"
     - "test_sigma_set_from_card: a hand-built minimal Card dict {'stats': {'sigma_curves': {... 32 tensor entries for 16 blocks x 2 roles ...}}} (the card.v1 field names of plan.md 4.2 / T102) and a pyarrow table with the P1 columns name (string) and stat_sigma_curve (list<float64>), rows from sigma_values of family arrays -> the SigmaSet has 16 indices and 2 roles; an entry whose row is missing is skipped; a card without sigma_curves -> None. (The end-to-end variant from a real scan lives in T111 test_sigma_set_from_scan; T109 does not depend on T108.)"

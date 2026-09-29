@@ -99,7 +99,9 @@ behavior: |
     1. text = format_plan(plan). log.note("gate", text) (the FULL plan text goes into the live log, so the server's live log,
        the UI and the Card's fetch_log carry it), then, if display is not None, display(text). Both happen BEFORE any decision
        and before the confirmer is called, on every path (below-threshold, no-confirmer, confirmer).
-    2. If plan.bytes_cap <= plan.threshold_bytes -> d = decision(approved=True, via="below-threshold", bytes_confirmed=None).
+    2. prior = log.totals["meta"] + log.totals["header"] (the non-weight bytes this scan already fetched).
+       If prior + plan.bytes_cap <= plan.threshold_bytes -> d = decision(approved=True, via="below-threshold", bytes_confirmed=None)
+       (the scan's total unconfirmed bytes never exceed the gate threshold; plan.md 3.2 step 2, validation r2 minor 2).
        Elif confirmer is None -> d = decision(approved=False, via="no-confirmer", bytes_confirmed=None).
        Else d = confirmer(plan). If d.plan_id != plan.plan_id, or (d.approved and d.bytes_confirmed != plan.bytes_cap),
        then replace d with decision(approved=False, via=d.via, bytes_confirmed=d.bytes_confirmed).
@@ -115,7 +117,8 @@ acceptance:
     - "test_plan_dtype: a family written with dtype that the test forces to 'F8_E4M3' in the header (hand-built TensorInfo) -> role skipped"
     - "test_plan_moe: P1 st_fixtures moe_tensors with hidden=64, head_dim=16, kv_heads=2, n_layers=8 (k/v 32x64, BF16) -> reads only for attention k/v, none for experts"
     - "test_plan_pipeline: two UnitInputs (text_encoder with a family, vae with a P1 vae fixture) -> reads only for text_encoder; vae is in skipped"
-    - "test_run_gate_below_threshold: threshold >= cap -> approved via below-threshold, confirmer NOT called (spy); 2 gate events + 1 decision in log"
+    - "test_run_gate_below_threshold: empty log, threshold >= cap -> approved via below-threshold, confirmer NOT called (spy); 2 gate events + 1 decision in log"
+    - "test_run_gate_counts_nonweight: log with 10 meta bytes recorded (record fetch, class meta); threshold == cap + 9 -> NOT below-threshold (confirmer None -> declined via no-confirmer); threshold == cap + 10 -> approved via below-threshold"
     - "test_run_gate_flag: flag_confirmer(plan_id, cap) approves; flag_confirmer(plan_id, cap-1), flag_confirmer(plan_id, cap+1), flag_confirmer(plan_id, 10**15) (blanket number larger than the cap), flag_confirmer('0'*16, cap) (another plan_id), flag_confirmer(None, None) all decline"
     - "test_run_gate_bad_confirmer: a confirmer returning approved with another plan_id -> declined; approved with bytes_confirmed cap-1 or cap+1 -> declined; one raising -> declined via 'error'"
     - "test_plan_shown_first: display = a list-append spy, confirmer = a spy that records (len(display_calls), the log events so far) when called -> at confirmer time display was called exactly once with format_plan(plan) and the log already has a 'gate' event whose note == format_plan(plan); for the below-threshold and no-confirmer paths display is also called once"

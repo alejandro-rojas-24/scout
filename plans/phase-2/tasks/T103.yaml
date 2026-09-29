@@ -28,6 +28,8 @@ interface: |
         style: str = "qwen2"          # "qwen2" (q/k/v biases) | "llama" (no biases)
         trend_seed: int = 0           # depth-trend parameters shared by families with equal trend_seed
         trend: bool = True
+        edge_anomaly: float = 0.0     # added to every role's alpha at layers 0 and n_layers-1 (shared, lineage-free
+                                      # depth-localised anomaly; plan.md 2.3 / validation r2 major); no extra rng draws
 
     def spectrum(K: int, alpha: float, amp: float, freq: float, phase: float) -> Array
     def structured_matrix(rng: numpy.random.Generator, m: int, n: int, s: Array) -> Array
@@ -44,8 +46,10 @@ interface: |
     NULL_SEED_PAIRS: tuple[tuple[int, int], ...] = tuple((2 * p + 1, 2 * p + 2) for p in range(50))
     FINETUNE_EPS: float = 0.02
     FINETUNE_SEED: int = 7
-    REHEARSAL_BASE = FamilySpec(seed=1, n_layers=28)
-    REHEARSAL_OTHER = FamilySpec(seed=2, style="llama", n_layers=32, hidden=160, n_kv_heads=4, head_dim=32)
+    EDGE_ANOMALY: float = 1.0
+    REHEARSAL_BASE = FamilySpec(seed=1, n_layers=28, edge_anomaly=EDGE_ANOMALY)
+    REHEARSAL_OTHER = FamilySpec(seed=2, style="llama", n_layers=32, hidden=160, n_kv_heads=4, head_dim=32,
+                                 edge_anomaly=EDGE_ANOMALY)
 
     def write_family_repo(root: pathlib.Path, w: dict[str, Array], config: dict, *, n_shards: int = 2,
                           dtype: str = "BF16", vocab: list[str] | None = None,
@@ -68,7 +72,7 @@ behavior: |
      trend_i = base_alpha + lin*t + quad*(t-0.5)**2 if spec.trend else 0.5.
      For each role in the order q, k, v, o, gate, up, down, with shapes q:(q,hidden), k:(kv,hidden), v:(kv,hidden),
      o:(hidden,q), gate:(inter,hidden), up:(inter,hidden), down:(hidden,inter):
-       alpha = trend_i + 0.4*(rng.random() - 0.5); amp = 0.25; freq = 1 + 3*rng.random(); phase = 2*pi*rng.random();
+       alpha = trend_i + 0.4*(rng.random() - 0.5) + (spec.edge_anomaly if i in (0, n_layers - 1) else 0.0); amp = 0.25; freq = 1 + 3*rng.random(); phase = 2*pi*rng.random();
        W = structured_matrix(rng, m, n, spectrum(min(m,n), alpha, amp, freq, phase)).
      Names follow P1 dense_tensors naming (prefix "model"): model.embed_tokens.weight (vocab,hidden) = 0.02*normal;
      per layer: self_attn.q_proj.weight, [q_proj.bias (q,) if qwen2], k_proj.weight, [k_proj.bias (kv,)], v_proj.weight,
@@ -76,6 +80,8 @@ behavior: |
      input_layernorm.weight (hidden,) = 1 + 0.01*normal, post_attention_layernorm.weight (hidden,); biases are 0.01*normal;
      then model.norm.weight (hidden,) and lm_head.weight (vocab,hidden) = 0.02*normal. All arrays are float32.
      "llama" style has no biases. There are no q_norm/k_norm tensors.
+     edge_anomaly never changes the number or order of rng draws, so for layers 1..n_layers-2 (and every non-layer tensor)
+     the arrays are bit-identical to the same spec with edge_anomaly=0.0.
   6. family_config(spec, n_layers): {"model_type": "qwen2" if style=="qwen2" else "llama",
      "architectures": ["Qwen2ForCausalLM"] or ["LlamaForCausalLM"], "hidden_size", "num_hidden_layers": n_layers or
      spec.n_layers, "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
@@ -107,7 +113,8 @@ acceptance:
     - "test_deterministic: the same spec gives identical arrays; a different seed gives different arrays"
     - "test_upscale_prune: upscale(w,16,12,4) has 24 layers and layer 12 == original layer 4; prune(w,16,[5,6,7]) has 13 layers and layer 5 == original layer 8"
     - "test_permute_sigma_equal: singular values of k_proj before and after permute_hidden agree to 1e-4 relative"
-    - "test_frozen_seeds: NULL_SEED_PAIRS == ((1, 2), (3, 4), ..., (99, 100)) (50 pairs, written out as a literal in the test); FINETUNE_EPS == 0.02; FINETUNE_SEED == 7; REHEARSAL_BASE == FamilySpec(seed=1, n_layers=28); REHEARSAL_OTHER == FamilySpec(seed=2, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32)"
+    - "test_frozen_seeds: NULL_SEED_PAIRS == ((1, 2), (3, 4), ..., (99, 100)) (50 pairs, written out as a literal in the test); FINETUNE_EPS == 0.02; FINETUNE_SEED == 7; EDGE_ANOMALY == 1.0; REHEARSAL_BASE == FamilySpec(seed=1, n_layers=28, edge_anomaly=1.0); REHEARSAL_OTHER == FamilySpec(seed=2, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32, edge_anomaly=1.0)"
+    - "test_edge_anomaly_fixture: w0 = family_weights(FamilySpec(seed=3)), w1 = family_weights(FamilySpec(seed=3, edge_anomaly=EDGE_ANOMALY)) -> same keys in the same order; every array of layers 1..14 and every non-layer array is bit-identical (numpy.array_equal); layer 0 and layer 15 k_proj differ; the singular values of w1 layer-0 k_proj decay faster (sigma[-1]/sigma[0] smaller than in w0)"
     - "test_repo_written: write_family_repo(n_shards=2) -> index + 2 shards + config.json + tokenizer.json; the tokenizer parses as JSON with model.type BPE"
   commands:
     - pytest -q tests/test_weights_fixtures.py

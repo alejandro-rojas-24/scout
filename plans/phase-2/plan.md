@@ -1,6 +1,7 @@
 # Phase 2 plan: Diff view + first weight signal
 
-Status: DRAFT (planner revision r1, answering validation round 1), 2026-09-29. This plan builds on the Phase 1 plan
+Status: PLANNED — approved by orchestrator under human directive (review disabled), 2026-09-29.
+(Planner revision r2, answering validation rounds 1 and 2; §11.) This plan builds on the Phase 1 plan
 (`plans/phase-1/plan.md`, tasks T001–T016) and treats it as a contract. Section 9 lists every
 Phase 1 interface that changes, and the task that makes each change.
 
@@ -125,12 +126,12 @@ The per-target checks C1–C10 run for each of the 3 targets.
 | C6 | wire total: Σ body bytes `==` ByteLog `meta+header+weight` | equal |
 | C7 | wire hosts are `huggingface.co` or `*.hf.co`; `card.source.endpoint == "https://huggingface.co"` | true |
 | C8 | Card v1 content: `schema_version == "card.v1"`; `stats.sigma_curves.tensors` has 2L entries; Parquet `stat_sigma_curve` is non-null for exactly those 2L rows, each of length `min(shape)` and non-increasing; `fetch_log.gate` has exactly 1 decision with `approved`, `via == "api-confirm"`, `bytes_confirmed == bytes_cap` (exact) and the plan_id of C2, and that `(plan_id, bytes_cap)` pair is in `--confirm-plans`; `stats.tokenizer_minhash.num_perm == 256` and `source_file == "tokenizer.json"` | true |
-| C9 | purge: a `purge` event with stage `COMPUTE` and note containing `resident=0` precedes the `REPORT` `stage_start` in `fetch_log.events`; the live log has a `purge` event with stage `PURGE` and note `PURGE check: resident=0 names=0`; out dir holds only `*.card.json` / `*.tensors.parquet` | true |
+| C9 | purge: `fetch_log.events` of the Card holds a `purge` event with stage `COMPUTE` and note containing `resident=0`, and its `seq` is smaller than the `seq` of the `REPORT` `stage_start` event **read from the live log** (the live log always has it; whether the Card's `fetch_log` includes that event is not relied on); the live log has a `purge` event with stage `PURGE` and note `PURGE check: resident=0 names=0`; out dir holds only `*.card.json` / `*.tensors.parquet` | true |
 | C10 | frozen params: `scout.sigma.SIGMA_PARAMS == FROZEN_SIGMA_PARAMS` and `scout.align.ALIGN_PARAMS == FROZEN_ALIGN_PARAMS` | equal |
 | C11 | related structure: exactly 1 stack pair `model.layers`↔`model.layers`, `kind == "same"`, 28 layers, each `op == "match"` with `reference_index == subject_index`, `jumps == []` | true |
-| C12 | related weight: `weight.n_with_r == 28`, **`weight.median_r >= 0.80`** and **`weight.q10_r >= 0.50`** | true |
+| C12 | related weight: `weight.n_with_r == 26` (28 − 2 edge blocks, §3.4), **`weight.median_r >= 0.80`** and **`weight.q10_r >= 0.50`** | true |
 | C13 | unrelated structure: `kind == "incompatible"`, `mode == "reldepth"`, and `tensor_diff.only_in_reference ⊇ {model.layers.#.self_attn.{q,k,v}_proj.bias}` | true |
-| C14 | unrelated weight: `weight.n_with_r == 32`, **`weight.median_r <= 0.40`** and **`weight.z_shift <= 3.0`** (not null) | true |
+| C14 | unrelated weight: `weight.n_with_r == 30` (32 − 2 edge blocks; reldepth maps subject 1..30 into reference 1..26), **`weight.median_r <= 0.40`** and **`weight.z_shift <= 3.0`** (not null) | true |
 | C15 | separation: `median_r(related) - median_r(unrelated) >= 0.40` | true |
 | C16 | suggestion for the Instruct Card with pool = the other two Cards in the out dir: top-1 is `Qwen/Qwen2.5-7B@pin`, with `tokenizer_jaccard >= 0.90`, `config_score >= 0.80` and `claimed_base_match == true` | true |
 | C17 | the diffs and suggestions are computed by a separate server whose CountingTransport records 0 requests; both DiffViews and the suggestion result carry `disclaimers == DISCLAIMERS` | true |
@@ -146,64 +147,110 @@ C15 follows from C12 and C14. It is kept as its own row so the evidence line sta
 **Why these thresholds (first principles plus fixture measurements; never fitted to the targets; see §5 D20
 for the statistic and D32 for the in-run null).** For each layer, the statistic is the Pearson r between two
 vectors. Each vector holds the *depth-detrended, per-layer-centred log singular values of the top half of the
-spectrum* of that layer's `v_proj` and `k_proj`.
+spectrum* of that layer's `v_proj` and `k_proj`. The first and last block of each stack are excluded from the
+detrend fit and from every summary (`edge_blocks_excluded = 1`, §3.4; validation r2 major). Only the interior
+("scored") layers enter `median_r`, `q10_r`, the off-diagonal median, top-1, the shift null and the PR.
 
 - **Related pair, median (X = 0.80).** A fine-tune changes W by ΔW. By Weyl, `|Δσ_k| ≤ ‖ΔW‖₂`, so on the top
   half of the spectrum (σ_k ≥ σ_median) each log σ_k moves by at most `‖ΔW‖₂/σ_median`. Write s for the RMS of a
   layer's residual vector (its layer-specific spectral structure) and ε for the RMS of the fine-tune perturbation
-  in the same space. If the perturbation is uncorrelated with the structure, then `r ≈ s²/(s²+ε²)`. X = 0.80
-  tolerates a perturbation up to half of the layer-specific structure (`ε ≤ 0.5 s`).
-- **Related pair, lower tail (q10 ≥ 0.50).** r = 0.50 is `ε = s`: the perturbation is as large as the structure.
-  Requiring the 10th percentile to reach it means at most 10 % of layers (2 of 28) may be dominated by the
-  perturbation, so a broken role or depth band cannot hide behind the median (validation r1, minor 3).
+  in the same space. Only one side is perturbed (base = x, instruct = x + e). If e is uncorrelated with x, then
+  `r ≈ s/√(s²+ε²)` (corrected in r2; the r1 text used `s²/(s²+ε²)`, which holds only when both sides are
+  independent noisy copies). X = 0.80 therefore tolerates a perturbation up to `ε ≤ 0.75 s`.
+- **Related pair, lower tail (q10 ≥ 0.50).** r = 0.50 is `ε = √3·s ≈ 1.73 s`: the perturbation is well above the
+  structure. With numpy's linear quantile over the 26 scored layers, q10 sits at position 2.5, between the 3rd
+  and 4th smallest value, so about 3 of 26 layers may fall below 0.50 before C12 fails. A broken role or depth
+  band longer than that cannot hide behind the median (validation r1, minor 3). Both thresholds are therefore
+  more lenient than the r1 text claimed. They are kept unchanged: Instruct post-training (SFT + RL) can move
+  weights far, the Weyl bound is loose, and C18 (gap and top-1) is the check that separates lineage from shared
+  structure. This decision is made now, before the freeze.
 - **Unrelated pair, absolute (Y = 0.40), with a measured d_eff.** The statistic removes the generic structure
-  (relative-rank grid, per-layer centring, cubic depth detrend), so under independence `E[r] = 0`. The round-0
-  plan then *assumed* `d_eff ≥ 5`. That was wrong: smooth residuals have a low effective dimension. The per-layer
-  null r of a d-dimensional residual has SD ≈ `1/√(d−1)`, and the median of n layers has SD ≈ `1.2533·SD_r/√n`.
-  d_eff is now measured as the participation ratio `PR = (Σλ)²/Σλ²` of the residual layer vectors, reported in
-  every DiffView and in the evidence line (never thresholded). With the fixture's PR (below), the formula gives
-  a median SD of 0.21 at L = 16 and 0.13 at L = 32; the measured SDs are 0.167 and 0.114, so the formula is
-  conservative. At exit depths Y = 0.40 sits 3.2 formula-SD (3.6 measured SD) above the null mean. At L = 16 it
-  sits only 2.0 formula-SD above it, which is why the round-0 test "≤ 0.40 for every seed pair" was on the edge.
-  The offline tests now use a 95th percentile, and the rehearsal uses the exit depths (28 vs 32).
+  (relative-rank grid, per-layer centring, cubic depth detrend fitted on the interior blocks), so under
+  independence `E[r] = 0`. The per-layer null r of a d-dimensional residual has SD ≈ `1/√(d−1)`. The median of n
+  layers has SD ≈ `1.2533·SD_r/√n`. **The √n assumes that the per-layer residuals are independent over depth.**
+  Real residuals are autocorrelated over depth, so the effective n is smaller than the number of scored layers,
+  and this formula-SD is optimistic for real models (validation r2 major, part 3). The in-run shift null (next
+  bullet) is the check that does not rely on it. d_eff is measured as the participation ratio `PR = (Σλ)²/Σλ²`
+  of the interior residual layer vectors. It is reported in every DiffView and in the evidence line, and it is
+  never thresholded. With the fixture's PR (3.76 at exit geometry, 3.14 at L = 16), the formula gives a median
+  SD of 0.138 at exit geometry (n = 30) and 0.229 at L = 16 (n = 14). The measured SDs are 0.125 and 0.197. At
+  exit geometry Y = 0.40 sits 2.9 formula-SD (3.3 measured SD) above the null mean. At L = 16 it sits only 1.7
+  formula-SD above it, which is why the offline L = 16 test uses a 95th percentile and the rehearsal uses the
+  exit depths (28 vs 32).
 - **Unrelated pair, relative (z_shift ≤ 3.0).** Y assumes that real independent models are as independent at
-  matched relative depth as the fixture. That assumption is now tested in the run itself. The cyclic-shift null
-  takes the same median over the n−1 deliberately misaligned pairings `i ↦ a((i+k) mod n)` of the same two
-  models, so its spread reflects the run's actual d_eff. `z_shift = (median_r − mean)/sd` ≤ 3 is one-sided,
-  because the failure mode is a spuriously high r. If real unrelated models have a PR near 2, the absolute Y is
-  only about 1.8 SD from the null. C14 may then FAIL, and the FAIL goes to the human with the PR in the
-  evidence. It is never answered by retuning.
+  matched relative depth as the fixture. That assumption is tested in the run itself. The cyclic-shift null
+  takes the same median over the n−1 deliberately misaligned pairings `i ↦ a((i+k) mod n)` of the scored layers
+  of the same two models. Its spread therefore reflects the run's actual d_eff and depth autocorrelation.
+  `z_shift = (median_r − mean)/sd` ≤ 3 is one-sided, because the failure mode is a spuriously high r. The
+  measured false-FAIL rate on the fixture null at exit geometry is 1/200 (max z 3.04). If real unrelated models
+  have a PR near 2, the absolute Y is only about 1.8 SD from the null. C14 may then FAIL, and the FAIL goes to
+  the human with the PR in the evidence. It is never answered by retuning.
+- **Shared depth-localised anomalies (validation r2 major).** Real decoder LLMs have strongly anomalous first
+  and last blocks, and the anomaly points the same way in every model. That is shared structure with no lineage
+  in it. A least-squares cubic detrend over all L blocks does not remove an endpoint spike. Through the endpoint
+  leverage (h₀₀ ≈ 0.57 for a cubic at L = 28) it spreads the spike into every layer's residual as the same depth
+  pattern in both models, which raises the aligned r and z_shift. The r2 statistic fits the cubic on blocks
+  1..L−2 only, applies it to all blocks, and scores only the interior layers. Interior residuals are then
+  exactly independent of whatever blocks 0 and L−1 contain, so a shared edge anomaly of any size leaves every
+  summary identical to within float rounding (tested to 1e-12, T109). Residual risk: an anomaly that also covers block 1 (or L−2) still leaks
+  (measured below). A robust bisquare detrend closed that leak on the fixture, but it adds tuning constants; it
+  is listed in later.md for P3, where real null pairs exist to measure it on.
 - **Related pair, in-run null (C18: gap ≥ 0.40, top-1 ≥ 0.80).** This closes validation r1 major 1. The
   related pair shares architecture, so a high diagonal r alone cannot separate lineage from structure shared
   by the architecture. Structure common to every layer raises `R[i, j]` for all j, not only `j = a(i)`, so it
   shrinks `median_r − offdiag_median_r`. A gap of 0.40 requires the layer-specific part of r alone to be as
-  large as the whole unrelated bound. `diag_top1_frac ≥ 0.80` requires that 80 % of subject layers find their
-  own aligned partner as the best of all reference layers. The 20 % allowance covers real neighbouring layers
-  that resemble each other. A low-dimensional residual, where many layers correlate at ±1, fails top-1.
+  large as the whole unrelated bound. `diag_top1_frac ≥ 0.80` requires that 80 % of scored subject layers find
+  their own aligned partner as the best of all interior reference layers. The 20 % allowance covers real
+  neighbouring layers that resemble each other. A low-dimensional residual, where many layers correlate at ±1,
+  fails top-1.
 - **Margin.** `X − Y = 0.40` (C15).
 
-**Measured on the fixture design (planner, revision r1).** These values come from an independent numpy
-reimplementation of the T103 generator and the T109 statistic (scratch code under /tmp, not in the repo). The
-rng stream differs slightly from T103's tensor order, so the values are distributional:
+**Measured on the fixture design (planner, revision r2).** These values come from an independent numpy
+reimplementation of the T103 generator and the T109 statistic (scratch code under /tmp/p2r2, not in the repo;
+spectra are generated directly, 7 roles drawn per layer as in T103). The rng stream differs from T103's
+tensor order, so the values are distributional. "e" is `edge_blocks_excluded`; e = 1 is the frozen r2
+statistic, e = 0 is the r1 statistic. "Edge anomaly Δα" adds Δα to the power-law exponent of every role's
+spectrum at the listed blocks, in **both** models of every pair (a shared, lineage-free anomaly; T103
+`edge_anomaly`). Exit geometry = 28-layer qwen2-style (k/v 64×128) vs 32-layer llama-style (hidden 160, k/v
+128×160), reldepth, 200 pairs `(2p+1, 2p+2)`.
 
-| Quantity | Setting | Value |
-|---|---|---|
-| residual PR (d_eff) | L = 16 / 28 / 32 (hidden 160); 20 families each | mean 3.25 / 3.82 / 3.90 (range 2.48–4.86) |
-| null median_r, D20 statistic | 200 same-architecture, same-trend pairs, L = 16 | mean −0.009, SD 0.167, q05/q95 −0.28/+0.25, max 0.41 (1/200 > 0.40) |
-| same, without depth detrend | 50 pairs | mean 0.92 |
-| option (a): D20 + per-layer linear detrend on log-rank | 200 pairs, L = 16 | PR 3.97, SD 0.158, q95 0.28, max 0.53 (4/200 > 0.40): rejected |
-| option (a), quadratic in log-rank | 200 pairs, L = 16 | PR 3.75, SD 0.160, max 0.57 (3/200 > 0.40): rejected |
-| null, exit geometry (28 qwen2-style vs 32 llama-style, hidden 160, reldepth) | 200 pairs | median mean −0.015, SD 0.114, q95 0.16, max 0.32; z_shift SD 1.02, max 2.85 (0/200 > 3); offdiag \|median\| ≤ 0.035; top-1 mean 0.04, max 0.16; q10 mean −0.56 |
-| null, same architecture, L = 16 | 200 pairs | z_shift max 2.38 (0/200 > 3); top-1 max 0.25; first 50 pairs (`NULL_SEED_PAIRS`): q95 0.28, max 0.32 |
-| null, old rehearsal geometry (16 vs 20) | 200 pairs | SD 0.154, max 0.39, z_shift max 2.72 (0/200 > 3) |
-| related, ε = 0.02 / 0.05, L = 16 | 50 seeds each | median ≥ 0.9999 / ≥ 0.9992; q10 ≥ 0.9997 / ≥ 0.9978; offdiag −0.157…−0.029; top-1 = 1.0 in all; z_shift ≥ 3.29 |
-| related, ε = 0.05, L = 28 | 50 seeds | offdiag −0.10…−0.008; top-1 = 1.0; z_shift ≥ 5.03 |
+| Setting | e | median_r: mean / SD / q95 / max / # > 0.40 | z_shift: max / # > 3 | top-1 max | PR mean |
+|---|---|---|---|---|---|
+| exit geometry, no anomaly | 0 | −0.005 / 0.118 / 0.171 / 0.351 / 0 | 2.95 / 0 | 0.12 | 3.81 |
+| exit, blocks 0 and L−1, Δα = 0.6 | 0 | +0.184 / 0.124 / 0.380 / 0.491 / 7 | 4.70 / 16 | 0.22 | 2.62 |
+| exit, blocks 0 and L−1, Δα = 1.0 | 0 | +0.330 / 0.117 / 0.518 / 0.579 / 56 | 4.70 / 25 | 0.22 | 1.78 |
+| exit, blocks 0 and L−1, Δα = 2.0 | 0 | +0.604 / 0.088 / 0.722 / 0.804 / 195 | 3.11 / 5 | 0.28 | 1.21 |
+| exit, block 0 only, Δα = 1.0 | 0 | +0.153 / 0.125 / 0.340 / 0.457 / 4 | 3.88 / 4 | 0.22 | 2.42 |
+| **exit, no anomaly** | **1** | **−0.010 / 0.125 / 0.201 / 0.358 / 0** | **3.04 / 1** | **0.17** | **3.76** |
+| exit, blocks 0 and L−1 (any Δα: 0.6, 1.0, 2.0) or block 0 only | 1 | identical to the row above (to float rounding) | identical | identical | identical |
+| exit, blocks 0, 1 and L−1, Δα = 1.0 (residual risk) | 1 | +0.171 / 0.134 / 0.380 / 0.511 / 8 | 3.67 / 9 | 0.20 | 2.37 |
+| same, e = 0 | 0 | +0.437 / 0.108 / 0.602 / 0.660 / 135 | 4.61 / 38 | 0.25 | 1.72 |
+| exit, first 20 pairs (T109 geometry test), no anomaly | 1 | −0.001 / 0.154 / 0.249 / 0.265 / 0 | 2.77 / 0 | 0.17 | 3.76 |
+| exit, first 20 pairs, blocks 0 and L−1, Δα = 1.0 (T109 sensitivity test) | 0 | +0.323 / 0.119 / 0.457 / 0.561 / 5 | 3.69 / 2 | 0.19 | 1.79 |
+| L = 16 same architecture, 200 pairs, no anomaly | 1 | −0.023 / 0.197 / 0.299 / 0.535 / 6 | 4.00 / 4 | 0.29 | 3.20 |
+| L = 16, first 50 pairs (`NULL_SEED_PAIRS`), no anomaly or edge anomaly | 1 | +0.008 / 0.171 / 0.281 / 0.405 / 1 | 2.58 / 0 | 0.29 | 3.14 |
+| L = 16, first 50 pairs, blocks 0 and L−1, Δα = 1.0 | 0 | +0.566 / 0.102 / 0.721 / 0.754 / 47 | 3.81 / 9 | 0.38 | 1.53 |
+| L = 16, first 10 pairs, no depth detrend (`degree=None`) | 1 | mean 0.916 | – | – | – |
 
-Option (a) was measured and rejected. Removing the log-rank mode does not raise d_eff, because the residual is
-low-dimensional in several directions (slope, sinusoid frequency, phase), not in one. The in-run nulls (option
-b) are adopted instead. The off-diagonal median of a related pair is slightly negative because the depth
-detrend makes each grid column sum to zero over layers. The fixture's fine-tunes are easy (r ≈ 1), so the
-fixture cannot validate X. X rests on the Weyl argument above, and a real-run C12 FAIL goes to the human.
+Related pairs and structural variants, e = 1 (50 seeds each, real SVD of 64×128 float32 matrices):
+
+| Setting | Result |
+|---|---|
+| fine-tune ε = 0.02 / 0.05, L = 16 | median ≥ 0.9999 / ≥ 0.9992; q10 ≥ 0.9997 / ≥ 0.9979; offdiag −0.240…+0.012; gap ≥ 0.988; top-1 = 1.0 in all; z_shift ≥ 2.60 |
+| fine-tune ε = 0.02 / 0.05, L = 28 | median ≥ 0.9999 / ≥ 0.9993; offdiag −0.107…−0.006; gap ≥ 1.006; top-1 = 1.0; z_shift ≥ 4.63 |
+| upscaled `upscale(A,16,12,4)`, true map, 10 seeds | scored-layer median 0.941–0.989 |
+| pruned `prune(A,16,[5,6,7])`, true map, 10 seeds | scored-layer median 0.872–0.993 |
+
+Alternatives measured in r2 and not adopted (100 pairs, exit geometry): a robust layer-weighted bisquare IRLS
+detrend (c = 4.685·MAD, 10 iterations) with e = 1 gives no anomaly: 0/100 > 0.40, z > 3 in 2/100; blocks 0, 1
+and L−1 at Δα = 1.0: 0/100 and 1/100. It closes the 3-block leak, but it adds two tuning constants and an
+iteration, so it goes to later.md for P3. e = 2 gives SD 0.150 (n = 28) and removes the 3-block anomaly; it
+widens the null at L = 16 (n = 12, max 0.553), so it was not adopted either.
+
+Option (a) of r1 (a per-layer log-rank detrend) was measured then and rejected (PR 3.97, max 0.53 at L = 16).
+The off-diagonal median of a related pair is slightly negative because the depth detrend makes each grid
+column sum to about zero over the fitted layers. The fixture's fine-tunes are easy (r ≈ 1), so the fixture
+cannot validate X. X rests on the Weyl argument above, and a real-run C12 FAIL goes to the human.
 
 The product UI shows r on a continuous colour scale. These thresholds exist only in the
 exit check. P2 renders no verdict, because the calibrated verdict belongs to System 1 in P3.
@@ -223,7 +270,7 @@ exit check. P2 renders no verdict, because the calibrated verdict belongs to Sys
    Qwen2.5-7B, and the three disclaimers are shown under the list.
 5. Diff Qwen2.5-7B vs the Instruct model:
    - two strips of 28 cells, with straight alignment lines
-   - the subject cells in the high-r colour
+   - the 26 interior subject cells in the high-r colour; the first and last cell grey hatched ("edge block, not scored")
    - the median shown, with the in-run null line (q10, off-diagonal median, top-1, z_shift, PR)
 6. Diff Qwen2.5-7B vs Llama:
    - the header reads "incompatible (relative-depth pairing)"
@@ -282,8 +329,17 @@ The flow:
    passed to the interface's display (stderr for the CLI and the exit runner). This happens before
    any decision, on every path. The server's live log and `plan` field carry the same plan, and the
    UI renders it (validation r1 blocker, part a).
-2. If `bytes_cap <= gate_threshold_bytes` (default 64 MiB), the plan is auto-approved
-   (`via "below-threshold"`, logged).
+2. If `totals.meta + totals.header + bytes_cap <= gate_threshold_bytes` (default 64 MiB), the plan is
+   auto-approved (`via "below-threshold"`, logged). The non-weight bytes already fetched by this scan count
+   against the same threshold, so a scan fetches at most `gate_threshold_bytes` in total without a human
+   confirmation (validation r2, minor 2). There are two configured limits, and they do different jobs:
+   - the P1 non-weight budget (`--max-read-bytes`, 64 MiB, P1 D5) is **refuse-only**: a non-weight read
+     over it is never confirmable and fails the scan;
+   - the weight gate threshold (`--gate-threshold-bytes`, 64 MiB) decides only whether a weight plan needs
+     confirmation, and it is compared with the scan's **total** (non-weight so far plus the weight cap).
+
+   In r1 the two were independent, so one scan could fetch about 128 MiB unconfirmed. Now the unconfirmed
+   total per scan is at most `gate_threshold_bytes`. That is "the configured threshold" of invariant 2.
 3. Otherwise a `Confirmer` must return an approval with `plan_id == plan.plan_id` and
    `bytes_confirmed == bytes_cap` **exactly**. Anything else is a decline. A blanket number larger
    than the cap declines, so the number can only come from a plan that was displayed (blocker,
@@ -356,20 +412,25 @@ Comparing two Cards on their sampled stack (T109):
    `u_k = (k+0.5)/K`.
 2. **Centre each layer.** Subtract each layer's mean over g. This removes the per-layer
    scale.
-3. **Detrend over depth.** For each role and grid column, remove the least-squares cubic
-   fit in relative depth `t = linspace(-1, 1, L)`. This removes the smooth depth structure
-   common to all LLMs. It requires `L >= 8`.
+3. **Detrend over depth, edge blocks excluded from the fit.** Let e = `edge_blocks_excluded` = 1. For each
+   role and grid column, fit a least-squares cubic in relative depth `t = linspace(-1, 1, L)` **on rows
+   e..L−1−e only**, and subtract it from all L rows. This removes the smooth depth structure common to all
+   LLMs without letting the anomalous first and last blocks lever the fit (validation r2 major; §2.3). It
+   requires `L >= 8` (so at least 6 fitted rows).
 4. **Layer vector.** Concatenate the roles common to both Cards, in role order.
 5. **Correlation matrix.** Compute `R[i, j] = pearson(subject_i, reference_j)`. A
    zero-variance vector gives r = 0.
-6. **Per-layer r.** Per-layer r is `R[i, a(i)]` under the displayed alignment `a` (§3.5).
-   `median_r` is the median over subject layers with an r.
-7. **In-run null (D32, T109 `in_run_null`).** On the same R and the same displayed alignment:
-   `q10_r` (10th percentile of the per-layer r), `offdiag_median_r` (median of `R[i, j]`,
-   `j != a(i)`), `diag_top1_frac` (share of i with `argmax_j R[i, j] == a(i)`), the cyclic-shift
-   null (`m_k = median_i R[i, a((i+k) mod n)]` for k = 1..n−1; mean, SD with ddof 1, max) and
-   `z_shift = (median_r − mean)/SD`, plus the participation ratio of each side's residual layer
-   vectors. None of these is a verdict; only the exit check applies thresholds to them.
+6. **Scored layers and per-layer r.** R is computed for all layers (the alignment of §3.5 may use every
+   entry). The **scored set** is `S = {i : e ≤ i ≤ nB−1−e and e ≤ a(i) ≤ nA−1−e}` (subject positions, in
+   order); the interior reference columns are `J = e..nA−1−e`. Per-layer r is `R[i, a(i)]` for `i ∈ S` and
+   null for every other layer. `median_r` is the median over S.
+7. **In-run null (D32, T109 `in_run_null`).** On the same R, the same displayed alignment and only the
+   scored set S (n = |S|) with the interior columns J: `q10_r` (10th percentile of the per-layer r),
+   `offdiag_median_r` (median of `R[i, j]`, i ∈ S, j ∈ J, `j != a(i)`), `diag_top1_frac` (share of i ∈ S
+   with `argmax_{j∈J} R[i, j] == a(i)`), the cyclic-shift null (`m_k = median_x R[S_x, a(S_{(x+k) mod n})]`
+   for k = 1..n−1; mean, SD with ddof 1, max) and `z_shift = (median_r − mean)/SD`, plus the participation
+   ratio of each side's interior residual layer vectors (rows e..L−1−e). None of these is a verdict; only
+   the exit check applies thresholds to them.
 
 No raw cosine is computed anywhere in P2 (invariant 4).
 
@@ -526,10 +587,10 @@ The columns are unchanged from P1 §4.3.
                 jumps: [{subject_pos, from_reference_pos, to_reference_pos}],
                 duplicated_reference: [int], pruned_reference: [int],      # literal block indices
                 layers: [{subject_index, reference_index, op: "match"|"jump"|"reldepth",
-                          struct_cost: float, r: float|null}]}],
+                          struct_cost: float, r: float|null}]}],   # r null outside the scored set (§3.4 step 6)
  unpaired_stacks: {reference: [str], subject: [str]},
  weight: {available: bool, reason: str|null, roles: [str], pair_index: int|null,
-          n_layers: int, n_with_r: int,
+          n_layers: int, n_with_r: int,                              # n_with_r == |scored set|
           median_r: float|null, q10_r: float|null,                  # over the displayed alignment a
           offdiag_median_r: float|null,                             # median of R[i, j], j != a(i)
           diag_top1_frac: float|null,                               # share of i with argmax_j R[i, j] == a(i)
@@ -548,7 +609,7 @@ SIGMA_PARAMS = {"version": "sigma.v1", "roles": ["attn.v", "attn.k"],
   "dtypes": ["BF16", "F16", "F32"], "min_dim": 16, "min_layers": 8,
   "max_bytes_per_layer": 16777216, "retry_slack_bytes": 16777216, "svd_dtype": "float64",
   "grid_points": 128, "grid_u_max": 0.5, "log_floor_rel": 1e-12, "center": "per-layer-mean",
-  "detrend_degree": 3, "corr": "pearson"}
+  "detrend_degree": 3, "edge_blocks_excluded": 1, "corr": "pearson"}
 ALIGN_PARAMS = {"version": "align.v1", "lambda_jump": 2.0, "end_cost": 2.0,
   "struct_cost": {"equal": 0.0, "same_names": 0.5, "different": 1.0},
   "combine": "(S + (1 - r) / 2) / 2", "incompatible_mapping": "reldepth-round-half-up"}
@@ -587,8 +648,8 @@ Assumptions:
 | D16 | Tokenizer fetch | Opt-in (`--tokenizer` / `"tokenizer": true`). One file of about 7–9 MB, class meta. | This keeps the P1 10 s exit path byte-identical. |
 | D17 | Config score and ranking | 13 keys: `model_type, hidden_size, num_hidden_layers, intermediate_size, num_attention_heads, num_key_value_heads, head_dim, vocab_size, rope_theta, tie_word_embeddings, max_position_embeddings, hidden_act, rms_norm_eps`. Score `0.5·J + 0.5·config`. Claims never score. | A lying `base_model` cannot steer the ranking. Invariant 5 requires stating that tokenizer reuse alone is not proof, so the UI shows both components separately. |
 | D18 | What is sampled | Whole `v_proj` and `k_proj` of every block of the largest stack. One Range read per tensor. | Their σ are exactly permutation- and rotation-invariant, and they are the smallest 2-D matrices per block, 7–16 MiB per layer for 7–8B models. |
-| D19 | Byte budget | 16 MiB per layer; slack 16 MiB per plan; gate threshold 64 MiB (`--gate-threshold-bytes`). On a slack overrun, E3 is rerun whole with the same `--confirm-plans` line. | Llama-3.1-8B fits both roles exactly at 16 MiB. 70B models keep `v_proj` only. Scaling the slack with the largest read is deferred (§11). |
-| D20 | Statistic | As §3.4: top half of the spectrum, 128-point log grid, per-layer centring, cubic depth detrend, Pearson, L ≥ 8. **Unchanged in r1.** An extra per-layer log-rank detrend was measured and rejected (§2.3 table). | See the §2.3 justification. Without the detrend, the fixture's null median is 0.92 (measured). |
+| D19 | Byte budget | 16 MiB per layer; slack 16 MiB per plan; gate threshold 64 MiB (`--gate-threshold-bytes`), compared with `totals.meta + totals.header + bytes_cap` (r2), so a scan's unconfirmed total is ≤ 64 MiB; the P1 non-weight budget stays refuse-only (§3.2). On a slack overrun, E3 is rerun whole with the same `--confirm-plans` line. | Llama-3.1-8B fits both roles exactly at 16 MiB. 70B models keep `v_proj` only. Scaling the slack with the largest read is deferred (§11). |
+| D20 | Statistic | As §3.4: top half of the spectrum, 128-point log grid, per-layer centring, cubic depth detrend **fitted on blocks 1..L−2 only (`edge_blocks_excluded = 1`, r2)**, Pearson, L ≥ 8; only the scored interior layers enter any summary. An extra per-layer log-rank detrend (r1) and a robust bisquare detrend and e = 2 (r2) were measured and not adopted (§2.3). | See the §2.3 justification. Without the detrend, the fixture's null median is 0.92 (measured). With a shared edge anomaly (Δα = 1.0 on blocks 0 and L−1), the r1 statistic gives a null median > 0.40 in 56/200 exit-geometry pairs; the r2 statistic equals the no-anomaly null (0/200). |
 | D21 | Raw cosine | Not computed in P2 | Invariant 4. Nothing needs triage yet. |
 | D22 | Alignment algorithm | Viterbi over reference positions (§3.5), λ = 2, end cost 2; relative-depth mapping for incompatible pairs | The segment-copy model covers SOLAR-style duplication (backward jump) and layer pruning (forward jump or end cost). A jump must be justified by ≥ 2 fully mismatched layers of evidence. An incompatible pair is never weight-optimised, so r cannot be inflated by the choice of alignment. |
 | D23 | Gate confirmation | The plan is always displayed and logged before the decision. Approval needs `plan_id` equal and `bytes_confirmed == bytes_cap` exactly (CLI `--confirm-plan` + `--confirm-bytes`; API confirm; runner `--confirm-plans ID:CAP,...`). There is no interactive prompt. On decline: `GateDeclined` (exit 6), no Card, and the CLI prints the two values to rerun with. The server waits 900 s, then treats it as a decline. | Invariant 2: "confirmation with bytes, disk and reason shown". A number can approve only the plan it was copied from. |
@@ -601,7 +662,7 @@ Assumptions:
 | D30 | Stacks sampled | One per unit (`stacks[0]`) | This keeps bytes minimal. A text encoder's vision tower is not sampled (noted in `scan.notes`). |
 | D31 | `GET /api/cards` | Lists Card keys found in the out dir, for the manual reference picker | This is the minimum needed for "picked manually". |
 | D32 | In-run null (new in r1) | For the weight pair, DiffView reports `offdiag_median_r`, `diag_top1_frac`, a cyclic-shift null of the median (`shift_null`, `z_shift`) and the residual participation ratios. They are computed from the R already built (0 bytes), and they are deterministic (no RNG, no bootstrap). | Validation r1 majors 1 and 2. The shift null measures the run's own d_eff, and the off-diagonal gap separates lineage from shared architecture. A bootstrap SD was the validator's alternative; the shift null was chosen because it needs no RNG and reuses the median statistic exactly. |
-| D33 | Frozen fixture seeds (new in r1) | `NULL_SEED_PAIRS` (50 pairs), `FINETUNE_EPS/SEED`, `REHEARSAL_BASE/OTHER` are constants in `weights_fixtures` (T103), asserted literally by a test, and imported by T109/T111/T116. The rehearsal uses the exit depths (28 vs 32). | Changing seeds to pass a test would be hand-tuning. Exit depths shrink the null SD from 0.167 to 0.114 (measured). |
+| D33 | Frozen fixture seeds (new in r1) | `NULL_SEED_PAIRS` (50 pairs), `FINETUNE_EPS/SEED`, `EDGE_ANOMALY = 1.0` (r2), `REHEARSAL_BASE/OTHER` (r2: both with `edge_anomaly=EDGE_ANOMALY`, so the end-to-end rehearsal carries a shared edge anomaly) are constants in `weights_fixtures` (T103), asserted literally by a test, and imported by T109/T111/T116. The rehearsal uses the exit depths (28 vs 32). | Changing seeds to pass a test would be hand-tuning. Exit depths shrink the null SD from 0.167 to 0.114 (measured). |
 
 ## 6. Architecture (files)
 
@@ -651,8 +712,9 @@ scripts/exit_check_p2.py, scripts/pin_exit.py (P1, extended), exit/pins_p2.json 
 | Retries exceed the confirmed bytes | `recheck` before each retry (T101 `test_recheck_cap`); exit C4 |
 | Unlogged weight bytes | All weight reads go through `Source.read_range`. Exit C6 compares the wire total with the ByteLog. T116 rehearsal includes a CountingTransport. |
 | Weights persisted or kept | `SampleBuffers.resident_bytes == 0` after COMPUTE, and the purge event precedes REPORT (T108). `test_no_extra_files` extends to sampled scans (HOME/TMPDIR empty, out dir holds only Cards). Exit C9. |
-| The statistic correlates everything, like a raw σ-curve would | T109 synthetic tests over the 50 frozen `NULL_SEED_PAIRS` (same architecture and a **shared** depth trend): 95th percentile of median r ≤ 0.40 (measured 0.28), z_shift ≤ 3 for ≥ 49/50 (measured max 1.89), top-1 ≤ 0.40 (measured max 0.19). Without the depth detrend (`residuals(degree=None)`) the mean median is ≥ 0.60 (measured 0.92). Exit C14 (absolute and in-run). |
+| The statistic correlates everything, like a raw σ-curve would | T109 synthetic tests over the 50 frozen `NULL_SEED_PAIRS` (same architecture and a **shared** depth trend): 95th percentile of median r ≤ 0.40 (measured 0.281), z_shift ≤ 3 for ≥ 47/50 (measured 0/50 above 3; 4/200 over 200 pairs, so 47/50 keeps the by-construction failure chance below 2 %), top-1 ≤ 0.40 (measured max 0.29). Without the depth detrend (`residuals(degree=None)`) the mean median is ≥ 0.60 (measured 0.92). Exit C14 (absolute and in-run). |
 | Shared architecture passes as lineage (validation r1 major 1) | C18 in the exit: related gap to the off-diagonal median ≥ 0.40 and top-1 ≥ 0.80, computed in-run at 0 bytes. T109 `test_in_run_null_math` shows that uniformly inflated R fails the gap. The true hard negative (same architecture, independent real training) remains a P3 labelled-set item (later.md). |
+| Shared depth-localised anomalies (first/last block) inflate the unrelated r (validation r2 major) | The detrend is fitted on blocks 1..L−2 and only interior layers are scored (§3.4). T103 `edge_anomaly` fixture; T109 `test_edge_anomaly_invariance` (L = 16 and exit geometry: every in-run-null output with the anomaly equals the no-anomaly output to 1e-12, and the exit-geometry thresholds hold) and `test_edge_anomaly_sensitivity` (the same pairs with `edge=0` have a mean median ≥ 0.20, measured 0.323: the fixture has teeth). The rehearsal families carry the anomaly end to end (T116). Residual risk: an anomaly that also covers block 1 or L−2 (measured 8/200 > 0.40); a C14 FAIL from it goes to the human, and the robust detrend is in later.md for P3. |
 | The null is wider than assumed (validation r1 major 2) | d_eff is measured (participation ratio in every DiffView and the evidence line). The shift null adapts to the run. The derivation in §2.3 uses the measured PR (3.3–3.9 on fixtures, not ≥ 5). |
 | The statistic misses real fine-tunes (RL-heavy Instruct moves weights more) | Top-half grid (Weyl), synthetic fine-tunes at ε = 0.02 / 0.05 give ≥ 0.95 / ≥ 0.80, and permuted and rotated copies give r = 1 ± 1e-9 (T109). A real-run FAIL of C12 goes to the human; no retuning (C10). |
 | Hand-tuning after the first real run | C10 frozen params; the evidence line records git commit + dirty flag; §2.1 rule |
@@ -698,7 +760,7 @@ scripts/exit_check_p2.py, scripts/pin_exit.py (P1, extended), exit/pins_p2.json 
 | T112 | CLI: scan gate flags (`--confirm-plan` + `--confirm-bytes`, plan printed first), `diff`, `suggest` | opus | T012, T108, T111 |
 | T113 | Server: gate wait/confirm/decline, cards/diff/suggest routes | opus | T013, T108, T111 |
 | T114 | Frontend: options, gate panel, diff view (strips + alignment + r colours) | opus | T014, T113 |
-| T115 | P2 exit expectations (C1–C18 pure checks, frozen params, thresholds) | opus | T111 |
+| T115 | P2 exit expectations (C1–C18 pure checks, frozen params, thresholds) | opus | T016, T111 |
 | T116 | P2 exit runner (`--confirm-plans`), pins_p2, `pin_exit --phase 2`, offline rehearsal | opus | T015, T112, T113, T115 |
 
 Parallel waves (no shared files within a wave):
@@ -715,7 +777,9 @@ Most tasks are opus because they touch download gating, Card schema, similarity 
 exit evidence (routing rule). T103 is the only sonnet task, since it is fully specified test
 scaffolding.
 
-## 11. Validation responses — round 1
+## 11. Validation responses
+
+### 11.1 Validation responses — round 1
 
 Validator round 1 (`validation.md`, 2026-09-28): verdict REVISE, with 1 blocker, 3 majors and 8 minors.
 The environment limits (no Hub access in this container, gated Llama) were not findings. They stay
@@ -736,8 +800,31 @@ documented in §2.5.
 | m7 | minor | T110 test depends on T102's in-flight card.py | **Fixed.** T110.depends_on += T102, and T110 moved to wave 3. | T110, §10 |
 | m8 | minor | Simplicity: TTY prompt, `unscanned_claims`, kind `rearranged` | **Fixed in part.** The TTY prompt and `unscanned_claims` were cut. `rearranged` is kept: it is the label for the remaining case `nB == nA` and non-identity, and it has no dedicated test or code path beyond that label. | §3.2, §3.6; T105, T106, T112 |
 
-**Deferred minors**
-- m4: scale `RETRY_SLACK_BYTES` with the plan (for example `max(16 MiB, 4 × largest read)`). Deferred to P4 together with streaming COMPUTE, which changes the read loop anyway. P2 accepts rerunning E3 whole (D19).
+### 11.2 Validation responses — round 2
+
+Validator round 2 (`validation.md`, fresh context, 2026-09-29): verdict REVISE, with 0 blockers, 1 major and 9
+minors. Its clean checks (byte arithmetic, MinHash overflow, null replication, gate and purge against invariants
+1–2, Phase 1 references) were not re-opened. Re-measurement scripts: /tmp/p2r2 (scratch, not in the repo).
+
+| # | Severity | Finding (short) | Response | Where |
+|---|---|---|---|---|
+| M1 | major | Shared first/last-block anomalies lever the cubic detrend and inflate the unrelated median and z_shift; the fixture has none | **Fixed before the freeze.** (1) T103 gains `FamilySpec.edge_anomaly` and the frozen `EDGE_ANOMALY = 1.0` (no extra rng draws, so interior layers are bit-identical); both rehearsal families carry it. T109 adds `test_residuals_edge_fit`, `test_edge_anomaly_invariance` (L = 16 and exit geometry) and `test_edge_anomaly_sensitivity`. (2) The statistic fits the cubic on blocks 1..L−2 only and scores only interior layers (`SIGMA_PARAMS.edge_blocks_excluded = 1`); every summary (median, q10, off-diagonal, top-1, shift null, PR) uses the scored set. (3) Re-measured (§2.3): at exit geometry with Δα = 1.0 on blocks 0 and L−1 the r1 statistic gives 56/200 null medians > 0.40 and 25/200 z > 3; the r2 statistic equals the no-anomaly null (to float rounding): mean −0.010, SD 0.125, q95 0.201, max 0.358, 0/200 > 0.40, z max 3.04 (1/200 > 3). (4) §2.3 states that √n assumes depth-independent residuals and that the shift null is the check that does not. Residual risk (a 3-block anomaly: 8/200) and the robust-detrend alternative are recorded in §2.3 and later.md. No threshold changed; nothing was fitted to the targets. C12/C14 now expect `n_with_r` 26 and 30. | §2.3, §3.4, §4.5, §4.6, D20, D33, §8; T103, T107, T109, T111, T114, T115, T116; later.md |
+| m1 | minor | Weyl formula: one-sided perturbation gives `r = s/√(s²+ε²)` | **Fixed.** Text corrected: X = 0.80 tolerates ε ≤ 0.75 s, q10 = 0.50 tolerates ε ≤ 1.73 s, and q10 over 26 layers lets about 3 layers fall below. X and q10 are kept, with the reason stated (C18 carries the lineage separation). | §2.3 |
+| m2 | minor | Two independent 64 MiB budgets allow ~128 MiB unconfirmed | **Fixed (unified).** Auto-approval now requires `totals.meta + totals.header + bytes_cap <= gate_threshold_bytes`, so the unconfirmed total per scan is ≤ 64 MiB. The P1 non-weight budget stays refuse-only. T106 test `test_run_gate_counts_nonweight`. | §3.2, D19; T106 |
+| m3 | minor | T108 lambda late-binds `r` | **Fixed.** `pool.submit(fetch_one, r)` with `r` passed as an argument. | T108 |
+| m4 | minor | "all 20" z_shift in the geometry test fails by construction too easily | **Fixed.** "≥ 19 of 20". The L = 16 test moves from 49/50 to ≥ 47/50, because with e = 1 the measured rate is 4/200 (P(fail by construction) < 2 %). | T109, §8 |
+| m5 | minor | dp-structure+weights median is selection-biased | **Deferred** (below). | later.md |
+| m6 | minor | T5 encoders match no role and get no skip hint | **Deferred** (below). | later.md |
+| m7 | minor | T115 imports T016 but does not depend on it | **Fixed.** T115.depends_on = [T016, T111]. | T115, §10 |
+| m8 | minor | C9 depends on whether fetch_log includes the REPORT stage_start | **Fixed.** C9 takes the REPORT stage_start seq from the live log; a positive test covers a Card without it. | §2.3 C9; T115 |
+| m9 | minor | `scout suggest` CLI is a third renderer no check needs | **Deferred** (kept as is; below). | T112 |
+
+### 11.3 Deferred minors
+
+- r1 m4: scale `RETRY_SLACK_BYTES` with the plan (e.g. `max(16 MiB, 4 × largest read)`); deferred to P4 with streaming COMPUTE, and P2 accepts rerunning E3 whole (D19).
+- r2 m5: report or calibrate the median on the structure-only alignment for compatible pairs (selection bias of `dp-structure+weights`); P3 hard negatives, later.md; the exit pairs use identity/reldepth and are unaffected.
+- r2 m6: T5 `SelfAttention.{k,v}` role patterns or a "T5 attention" skip hint, with a T5 null measurement; later.md (Unscheduled), because adding roles unmeasured before the freeze would widen the frozen statistic untested.
+- r2 m9: `scout suggest` stays in P2 (about 20 lines over the same `suggest()` result, which carries `disclaimers`; `test_suggest_cmd` asserts all three), because the CLI is the self-use path; revisit in P5 UX polish if the renderers drift.
 
 ## 12. Out of scope for Phase 2
 - CKA, spectral top-k, norm/std tools, JEV, System 2, the labelled set, the base library,

@@ -36,8 +36,9 @@ behavior: |
      If not d.approved: raise GateDeclined(f"weight sample declined ({d.via}); plan {plan.plan_id}, cap {plan.bytes_cap} B",
      plan=plan.to_dict()). This goes through the P1 error path: error note, no Card, re-raise.
      log.grant(plan.plan_id, [(r.path, r.start, r.end_exclusive) for r in plan.reads], plan.bytes_cap).
-     buffers = SampleBuffers(). Use ThreadPoolExecutor(max_workers) and submit, per read,
-     lambda: buffers.put(r.tensor, source.read_range(r.path, r.start, r.end_exclusive - r.start)).
+     buffers = SampleBuffers(). Define def fetch_one(r: PlannedRead) -> None: buffers.put(r.tensor, source.read_range(r.path,
+     r.start, r.end_exclusive - r.start)). Use ThreadPoolExecutor(max_workers) and futures = [pool.submit(fetch_one, r) for r in
+     plan.reads] (r is passed as an argument; never a closure over the loop variable, which would late-bind to the last read).
      On the first exception: cancel the pending futures, wait for the running ones, buffers.clear(), re-raise.
      finally: log.revoke_grant().
   D. log.stage(COMPUTE); sigma, released = compute_all(buffers, [(r.tensor, r.dtype, r.shape) for r in plan.reads]);

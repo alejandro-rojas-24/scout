@@ -90,9 +90,11 @@ behavior: |
   5. Offline rehearsal (tests/test_exit_check_p2_offline.py) calls run_p2 directly with FakeHub
      (inner_transport_factory=hub.transport, endpoint=HUB, allowed_hosts={"hub.test","cdn.test"}, gate_threshold_bytes=0) and
      rehearsal repos written with weights_fixtures:
-       "org/base"      weights_fixtures.REHEARSAL_BASE (seed 1, 28 layers)                  vocab=family_vocab(1)
+       "org/base"      weights_fixtures.REHEARSAL_BASE (seed 1, 28 layers, edge_anomaly)    vocab=family_vocab(1)
        "org/base-ft"   finetune(base, FINETUNE_EPS, FINETUNE_SEED)                            vocab=family_vocab(1), README base_model: [org/base]
-       "org/other"     weights_fixtures.REHEARSAL_OTHER (seed 2, llama, 32 layers, hidden 160) vocab=family_vocab(2, shared=family_vocab(1)[:100])
+       "org/other"     weights_fixtures.REHEARSAL_OTHER (seed 2, llama, 32 layers, hidden 160, edge_anomaly) vocab=family_vocab(2, shared=family_vocab(1)[:100])
+     (both rehearsal families carry the same shared first/last-block anomaly EDGE_ANOMALY, so C12/C14/C18 are rehearsed end to
+     end through scan -> Card -> diff with the edge exclusion of plan.md 3.4 active; validation r2 major)
      (the rehearsal mirrors the exit depths 28 vs 32; the constants are frozen in T103 and may not be changed to make the
      rehearsal pass: a failure goes to the human)
      pairs=(("related","org/base","org/base-ft"), ("unrelated","org/base","org/other")), suggest_subject="org/base-ft",

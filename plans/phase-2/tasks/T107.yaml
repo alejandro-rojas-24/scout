@@ -42,7 +42,7 @@ behavior: |
   5. No IO, no logging (the caller logs the purge event), no raw cosine.
 acceptance:
   tests:
-    - "test_params_literal: SIGMA_PARAMS == the dict literal copied from plan.md 4.6; ROLE_ORDER == ('attn.v','attn.k')"
+    - "test_params_literal: SIGMA_PARAMS == the dict literal copied from plan.md 4.6 (r2: includes \"edge_blocks_excluded\": 1); ROLE_ORDER == ('attn.v','attn.k')"
     - "test_decode_bf16: bytes from weights_fixtures.to_bf16_bytes(x) decode within 2**-8 relative of x; F16 and F32 are exact; a wrong length -> SigmaError; F8_E4M3 -> SigmaError; NaN -> SigmaError"
     - "test_sigma_known: diag(3,2,1) padded into 3x5 -> [3,2,1]"
     - "test_invariance: W (64x128 from weights_fixtures.structured_matrix); P W Q with P a row permutation and Q a random orthogonal 128x128 (plus sign flips) -> sigma equal within 1e-9 relative (float64 inputs)"
