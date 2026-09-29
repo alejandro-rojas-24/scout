@@ -1,11 +1,14 @@
 id: T202
-title: Card v2 schema - tensor_stats/spectral_topk slots filled, anchor_embedding slot, stat_anchor_gram column, options.anchors, v0/v1 loadable
-depends_on: [T102]
+title: Card v2 schema - tensor_stats/spectral_topk slots filled, anchor_embedding slot, stat_anchor_gram column, options.anchors, v0/v1 loadable; P2 C8 accepts card.v1|v2 and the P2 options assertion, in the same change
+depends_on: [T102, T108, T115]     # T108/T115: this task edits their files so the P2 suite stays green (plan.md 10)
 files:
   - scout/card.py
   - tests/test_card.py
   - tests/test_card_v1.py
   - tests/test_card_v2.py
+  - scripts/exit_expectations_p2.py        # P2 C8 only (behavior 6)
+  - tests/test_exit_expectations_p2.py     # one new passing case
+  - tests/test_scan_p2.py                  # test_plain_unchanged options assertion only
 route: opus
 spec_complete: true
 interface: |
@@ -50,6 +53,17 @@ behavior: |
      assertions include the options key "anchors", the stats slot "anchor_embedding" and the parquet column
      "stat_anchor_gram"; test_v1_plain's "every stat_* column is fully null" still holds and must still be asserted.
      All other assertions unchanged.
+  6. P2 contract edits made IN THIS TASK, so no later wave runs against a red P1/P2 suite (validation r2 major 3):
+     a. scripts/exit_expectations_p2.py (P2 T115) C8: `schema_version == "card.v1"` becomes
+        `schema_version in ("card.v1", "card.v2")`; the check name and every other C8 clause are unchanged, and no P2
+        threshold or frozen literal changes.
+     b. tests/test_exit_expectations_p2.py: the existing failing case "card.v0 (C8)" still fails; add one passing case
+        identical to the passing input except schema_version "card.v2".
+     c. tests/test_scan_p2.py::test_plain_unchanged: the options assertion becomes
+        `options == {"sample": False, "tokenizer": False, "anchors": False}` (build_card fills "anchors" from now on).
+        No other P2 test changes.
+     d. Nothing else in scripts/ or in P2 tests is edited. scan.py is not touched here (T207): until T207 lands, scan
+        passes the P2 two-key options and build_card fills anchors False (behavior 1).
 acceptance:
   tests:
     - "tests/test_card.py and tests/test_card_v1.py (updated) pass"
@@ -58,9 +72,11 @@ acceptance:
     - "test_v2_anchor: anchor_embedding with n_present 3 (present [0, 5, 9], token_ids [10, 11, 40]) and a 6-value gram on the embed row -> stat_anchor_gram non-null on that row only, length 6; round trip equal"
     - "test_v2_validation (parametrized): stats names != sigma names; topk increasing; topk value 1.5; fro 0; tensor_stats without stats_by_tensor; anchor_gram without anchor_embedding; gram length 5 for n=3; negative diagonal; present not increasing; token_id >= vocab_rows; options value 'yes' -> ValueError each"
     - "test_load_older: hand-written v0 and v1 Card JSON + parquet (without stat_anchor_gram) load unchanged; 'card.v9' -> ScoutError"
+    - "tests/test_exit_expectations_p2.py (with the new card.v2 passing case), tests/test_scan_p2.py (with the one updated assertion) and the P2 offline rehearsal tests/test_exit_check_p2_offline.py pass unchanged otherwise"
   commands:
     - pytest -q tests/test_card.py tests/test_card_v1.py tests/test_card_v2.py
-    - pytest -q
+    - pytest -q tests/test_exit_expectations_p2.py tests/test_scan_p2.py tests/test_exit_check_p2_offline.py
+    - pytest -q        # full P1 + P2 suite must be green at the end of this task
 out_of_scope:
   - computing stats or Grams (T204, T205, T207)
   - migrating files on disk

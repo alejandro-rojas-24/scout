@@ -28,7 +28,7 @@ interface: |
         repo: str; family: str; kind: str; spec: FamilySpec; params: tuple; base_model: tuple[str, ...]
     SYNTH_REPOS: tuple[SynthRepo, ...]       # table below, in order
     SYNTH_FAMILIES: dict[str, str]           # family -> split
-    SYNTH_PAIRS: tuple[tuple[str, str, str, str, bool], ...]   # (id, reference, subject, label, hard_negative)
+    SYNTH_PAIRS: tuple[tuple[str, str, str, str, bool, bool], ...]   # (id, reference, subject, label, hard_negative, same_shape)
     def synth_weights(r: SynthRepo, cache: dict) -> dict[str, numpy.ndarray]
     def write_synth_set(root: pathlib.Path, hub: FakeHub | None = None) -> dict[str, tuple[pathlib.Path, str]]
         # writes every SYNTH_REPOS repo (in order) to root/<repo with "/" -> "__"> with write_p3_repo; sha =
@@ -83,7 +83,10 @@ behavior: |
        fi/ft     fi  ft    (fi/base, 0.10, 115)                   base_model []
      SYNTH_FAMILIES = {fa: train, fb: train, fc: train, fd: train, fe: calibration, ff: calibration, fg: heldout,
      fh: heldout, fi: heldout}.
-  7. SYNTH_PAIRS (id, reference, subject, label, hard): every not_derived pair here is hard (all hidden 128).
+  7. SYNTH_PAIRS (id, reference, subject, label, hard, same_shape): every not_derived pair here is hard (all hidden 128).
+     same_shape = label not_derived and neither repo has kind "up" (every spec has k/v (64, 128) and 16 layers; an "up"
+     repo has 24 layers): true for S08, S09, S10, S12, S13, S14 (train, 6), S18, S19, S20 (calibration, 3) and every
+     held-out not_derived pair except S32 (9); false for S11, S32 and every derived pair.
        train derived:   S01 fa/base fa/ft; S02 fa/base fa/ft-hard; S03 fb/base fb/ft; S04 fb/base fb/merge;
                         S05 fc/base fc/ft; S06 fc/base fc/up; S07 fd/base fd/ft
        train not:       S08 fa/base fb/base; S09 fa/ft fc/base; S10 fb/merge fd/base; S11 fa/base fc/up;
@@ -102,7 +105,7 @@ behavior: |
      url: "fixture://p3", quote: "synthetic fixture", retrieved: "2026-09-29", verify: false}; families from SYNTH_FAMILIES
      with independence_evidence [FX]; repos from SYNTH_REPOS (verify false); pairs from SYNTH_PAIRS with relation
      (derived: "fine_tune" for ft, "depth_upscale" for up, "merge" for merge, "fine_tune" for siblings; not_derived:
-     "independent"), evidence [FX], verify false, note "". It must pass scout.groundtruth.load_labeled(path,
+     "independent"), hard_negative and same_shape from SYNTH_PAIRS, evidence [FX], verify false, note "". It must pass scout.groundtruth.load_labeled(path,
      allow_synthetic=True).
 acceptance:
   tests:
@@ -111,7 +114,7 @@ acceptance:
     - "test_semantic_rows: rows 0..255 of the embedding differ from weights_fixtures.family_weights(...) and rows 256.. are identical; all other tensors identical (numpy.array_equal)"
     - "test_cka_levels (uses scout.cka): debiased CKA of the anchor Grams: fa/base vs fb/base in [0.30, 0.60]; fa/base vs fa/ft >= 0.99"
     - "test_merge_linear: mismatched keys -> ValueError; merge of identical dicts equals the input"
-    - "test_synth_labeled_valid: synth_labeled_yaml -> load_labeled(allow_synthetic=True) ok; heldout counts (6, 10); hard 10; sweep 20; load_labeled without allow_synthetic raises"
+    - "test_synth_labeled_valid: synth_labeled_yaml -> load_labeled(allow_synthetic=True) ok; heldout counts (6, 10); hard 10; same_shape per split train 6, calibration 3, heldout 9; sweep 20; load_labeled without allow_synthetic raises"
     - "test_write_hub: write_synth_set(tmp, hub=FakeHub()) -> every repo resolves through HubSource at its returned sha (24 distinct shas)"
     - "test_write_local: write_synth_set(tmp) creates 24 dirs, each with config.json (vocab_size 512), tokenizer.json, index + 2 shards; fh/ft README claims fg/base"
   commands:

@@ -1,0 +1,110 @@
+id: T218
+title: Evaluation ledger - hash-chained append-only exit/ledger_p3.jsonl, one-shot held-out gates, full-ledger audit (pure stdlib)
+depends_on: []
+files:
+  - scripts/p3_ledger.py
+  - tests/test_p3_ledger.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/p3_ledger.py (stdlib only: json, hashlib, os, socket, datetime, pathlib; no scout imports):
+    LEDGER_SCHEMA = "p3ledger.v1"
+    GENESIS = "0" * 64
+    KINDS: tuple[str, ...] = ("SCAN", "FREEZE_LABELED", "FREEZE_MODEL", "EVAL_ATTEMPT", "EXIT")
+    ENTRY_KEYS = frozenset({"schema", "seq", "prev", "kind", "ts", "hostname", "payload"})
+    DEFAULT_LEDGER = pathlib.Path("exit/ledger_p3.jsonl")
+
+    class LedgerError(Exception)                       # message lists every problem, one per line
+
+    def canonical(entry: dict) -> bytes
+        # json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+    def verify(path: pathlib.Path) -> list[str]        # problems; [] when intact or the file does not exist; never raises
+    def read_ledger(path: pathlib.Path) -> list[dict]  # verify(); problems -> LedgerError; missing file -> []
+    def append(path: pathlib.Path, kind: str, payload: dict, *, ts: str | None = None,
+               hostname: str | None = None) -> dict    # returns the full entry written
+    def last(entries: list[dict], kind: str, *, after_seq: int = -1) -> dict | None
+    def since(entries: list[dict], kind: str, after_seq: int) -> list[dict]      # entries of kind with seq > after_seq, in order
+
+    def freeze_labeled_gate(entries: list[dict], *, sha256: str, heldout_repos: list[str]) -> tuple[str, str]
+        # ("append" | "exists" | "refuse", message)
+    def freeze_model_gate(entries: list[dict], *, labeled_sha256: str, refreeze_reason: str | None) -> tuple[bool, str]
+    def eval_gate(entries: list[dict], *, stage: str, labeled_sha256: str, model_sha256: str,
+                  heldout_repos: list[str]) -> tuple[bool, str]
+    def audit(entries: list[dict], *, labeled_sha256: str, model_sha256: str | None,
+              heldout_repos: list[str]) -> list[tuple[str, bool, str]]
+        # (row name, ok, actual) rows for C4 (plan.md 2.3); never raises
+behavior: |
+  1. Entry = {"schema": LEDGER_SCHEMA, "seq": i, "prev": GENESIS if i == 0 else sha256(raw bytes of line i-1 without its
+     "\n").hexdigest(), "kind": kind, "ts": ts or UTC now "%Y-%m-%dT%H:%M:%SZ", "hostname": hostname or socket.gethostname(),
+     "payload": payload}. Stored as canonical(entry) + b"\n". Payload fields per kind are plan.md 4.9 (the callers build
+     them; append() only checks that kind is in KINDS and payload is a dict, else ValueError).
+  2. verify(path): missing -> []. data = path.read_bytes(); empty -> []. If data does not end with b"\n" -> problem
+     "truncated last line". For each line i (data[:-1].split(b"\n")): JSON parse error -> "line {i}: not JSON"; the
+     parsed object must be a dict whose keys == ENTRY_KEYS ("line {i}: keys"); canonical(obj) == raw ("line {i}: not
+     canonical"); schema == LEDGER_SCHEMA; seq == i ("line {i}: seq"); prev as in 1 ("line {i}: broken chain"); kind in
+     KINDS; payload is a dict; ts is a string matching ^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$ and >= the previous line's ts
+     ("line {i}: ts goes backwards"). All problems are collected.
+  3. append: problems = verify(path); non-empty -> LedgerError (nothing written). ts must be >= the last entry's ts, else
+     LedgerError. path.parent.mkdir(parents=True, exist_ok=True); open(path, "ab"); write canonical(entry) + b"\n";
+     flush; os.fsync. Returns the entry.
+  4. freeze_labeled_gate(entries, sha256, heldout_repos):
+     a. L = last(entries, "FREEZE_LABELED"); L and L.payload.sha256 == sha256 -> ("exists", f"already frozen at seq {L.seq}").
+     b. consumed = union of payload.heldout_repos over every EVAL_ATTEMPT entry; overlap = sorted(consumed & set(heldout_repos));
+        overlap -> ("refuse", "held-out repos already evaluated: " + ", ".join(overlap) + "; a new labeled version needs a
+        held-out split disjoint from every evaluated one (plan.md 2.1 step 6)").
+     c. ("append", "").
+  5. freeze_model_gate(entries, labeled_sha256, refreeze_reason):
+     a. L = last FREEZE_LABELED; None or L.payload.sha256 != labeled_sha256 -> (False, "the labeled file is not the last
+        FREEZE_LABELED entry; run p3_freeze labeled first").
+     b. since(entries, "EVAL_ATTEMPT", L.seq) non-empty -> (False, f"held-out already evaluated under the labeled freeze at
+        seq {L.seq}; a new model needs a new labeled version with a fresh held-out split").
+     c. since(entries, "FREEZE_MODEL", L.seq) non-empty and not (refreeze_reason or "").strip() -> (False, f"a model is
+        already frozen at seq {M.seq}; re-freezing needs --refreeze-reason \"<human reason>\"").
+     d. (True, "").
+  6. eval_gate(entries, stage, labeled_sha256, model_sha256, heldout_repos): stage not in {"s1", "s2"} -> ValueError.
+     a. L check as 5a (message "labeled file is not the last FREEZE_LABELED entry").
+     b. M = last(entries, "FREEZE_MODEL", after_seq=L.seq); None -> refuse "no FREEZE_MODEL after the labeled freeze";
+        M.payload.sha256 != model_sha256 -> refuse "model is not the last frozen model".
+     c. earlier = EVAL_ATTEMPT entries with seq < L.seq; overlap of their heldout_repos with heldout_repos -> refuse naming them.
+     d. att = since(entries, "EVAL_ATTEMPT", L.seq). Any a with a.payload.model_sha256 != model_sha256 or
+        a.payload.labeled_sha256 != labeled_sha256 -> refuse.
+     e. stage "s1": any a with stage "s1" -> refuse f"held-out already evaluated (S1) at seq {a.seq}; a second evaluation
+        needs a new labeled version with a fresh held-out split (plan.md 2.1 step 6)".
+     f. stage "s2": no s1 attempt in att -> refuse "run the S1 evaluation (E6) first". For each s2 attempt a in att: X =
+        the EXIT entry with payload.attempt_seq == a.seq; allowed only if X exists and X.payload.s2 is a dict with
+        n_available == 0; otherwise refuse f"S2 already evaluated at seq {a.seq}".
+     g. (True, "").
+  7. audit(entries, labeled_sha256, model_sha256, heldout_repos) rows (names exactly):
+     - "ledger labeled": L exists and L.payload.sha256 == labeled_sha256.
+     - "ledger model": Ms = since(FREEZE_MODEL, L.seq) non-empty; Ms[-1].payload.sha256 == model_sha256; every Ms[1:] has
+       a non-empty refreeze_reason; first attempt after L (if any) has seq > Ms[-1].seq. actual lists "seq:sha[:12]:reason".
+     - "ledger code change": for every m in Ms: code_changed_since_labeled is [] or a non-empty code_change_reason is
+       present (None counts as a failure). actual lists the paths and reasons.
+     - "ledger attempts": every attempt after L names model_sha256 and labeled_sha256; at most one stage-s1 attempt; every
+       stage-s2 attempt EXCEPT the most recent one has an EXIT with s2.n_available == 0 (so at most one S2 attempt ever
+       showed LLM answers; the most recent one may have any result). audit is evaluated in the pre-flight, BEFORE the
+       current run appends its own EVAL_ATTEMPT; a run that would be a forbidden repeat therefore passes the audit and is
+       refused by eval_gate (exit 5), not by the pre-flight.
+     - "ledger fresh held-out": no repo of heldout_repos in an EVAL_ATTEMPT with seq < L.seq.
+     - "ledger no rescan": no SCAN entry with payload.mode == "confirm" and seq > Ms[0].seq (skipped as ok when Ms is empty;
+       "ledger model" already fails then).
+     If L is None, every row after the first is (name, False, "no FREEZE_LABELED entry").
+  8. Pure except verify/read_ledger/append (file IO only). No network.
+acceptance:
+  tests:
+    - "test_append_chain: 3 appends to a tmp file -> seq 0,1,2; prev of seq 0 is GENESIS; prev of seq k == sha256 of line k-1; verify == []; each line == canonical(parsed)"
+    - "test_tamper_detected (parametrized): change one payload byte in line 0 (-> broken chain at line 1); delete line 1; swap lines 1 and 2; re-serialize line 1 with indent=1 (not canonical); drop the final newline; ts of line 2 earlier than line 1 -> verify non-empty and append raises LedgerError and writes nothing (file bytes unchanged)"
+    - "test_missing_file: verify == [], read_ledger == [], append creates the file and parent dir"
+    - "test_freeze_labeled_gate: same sha as last -> exists; new sha with no attempts -> append; new sha whose held-out overlaps an EVAL_ATTEMPT -> refuse naming the repo; new sha with disjoint held-out after an attempt -> append"
+    - "test_freeze_model_gate: no FREEZE_LABELED -> False; first model -> True; second without reason -> False; second with reason 'bug in r_gap' -> True; any after an EVAL_ATTEMPT under L (with or without reason) -> False"
+    - "test_eval_gate_s1: first -> True; after one s1 attempt -> False (message contains 'already evaluated (S1)'); after a new FREEZE_LABELED with disjoint held-out + new FREEZE_MODEL -> True; model sha differs from last FREEZE_MODEL -> False; labeled sha differs -> False"
+    - "test_eval_gate_s2: without s1 -> False; after s1 -> True; after an s2 attempt whose EXIT has s2.n_available 0 -> True; with n_available 3 -> False; an s2 attempt without EXIT -> False"
+    - "test_audit_rows: a clean ledger (SCAN plan, FREEZE_LABELED, SCAN confirm, FREEZE_MODEL, EVAL_ATTEMPT s1, EXIT) -> 6 rows all ok; two s2 attempts where the EARLIER one's EXIT has n_available 2 -> ledger attempts FAIL; a single s2 attempt with n_available 2 -> ok; each mutation fails the named row: second FREEZE_MODEL without reason (ledger model); FREEZE_MODEL after the attempt (ledger model); code_changed_since_labeled ['scout/jev.py'] without reason (ledger code change); with reason -> ok; attempt naming another model (ledger attempts); two s1 attempts (ledger attempts); held-out repo in an attempt before L (ledger fresh held-out); SCAN confirm after FREEZE_MODEL (ledger no rescan); no FREEZE_LABELED -> all rows fail, no exception"
+  commands:
+    - pytest -q tests/test_p3_ledger.py
+    - pytest -q
+out_of_scope:
+  - building payloads (T213, T214, T217); C4 wiring (T216)
+  - git operations (the HEAD-prefix check lives in T216 via p3_common.git_code_state)
+invariants_touched: [3]
+decisions: [D54]

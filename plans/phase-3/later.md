@@ -4,7 +4,7 @@
 - **Card store.** A content-addressed Card store with caching. P3's library is a manifest plus Cards in a gitignored
   directory, and the set scanner only skips a repo whose complete v2 Card already exists at its pin.
 - **Retry slack and streaming COMPUTE.** Scale the retry slack with the plan, and add streaming COMPUTE (carried over
-  from P2). The P3 E4 run reads about 11.2 GiB in 46 plans, and a mid-read reset on a 16 MiB layer can exhaust the 16 MiB
+  from P2). The P3 E4 run reads about 13.1 GiB in 51 plans, and a mid-read reset on a 16 MiB layer can exhaust the 16 MiB
   slack. The remedy is still to rerun that repo with the same confirm pair.
 - **FP8 / quantized embeddings.** DeepSeek-V3-Base (library) uses them. If its `embed_tokens` is not BF16, the Card has no
   anchors and no σ (MLA), so only structure, config and tokenizer are available. This needs dtype normalisation first.
@@ -35,8 +35,10 @@
   whole-word tokens (`min_present = 128` currently).
 - **SentencePiece `tokenizer.model` parsing.** Parse it for repos without `tokenizer.json`. The labeled-set criteria
   currently require `tokenizer.json`.
-- **A larger labeled set.** Grow it towards more than 100 pairs, especially more merges (only 1 in the held-out set) and
-  more depth-upscaled models. Tighter calibration needs about 3× the data. The ±0.15 probability caveat stays until then.
+- **A larger labeled set.** Grow it towards more than 100 pairs, especially more merges (only 1 in the held-out set, and
+  none in train or calibration: validation r2 minor 2, deferred) and more depth-upscaled models. Also give the held-out set
+  a second not_derived family per shape group, so that losing one family (dscoder or the mistral7b quote) does not
+  force a plan revision. Tighter calibration needs about 3× the data. The ±0.15 probability caveat stays until then.
 - **Black-box behavioural signal for distillation.** It is invisible to weight forensics (invariant 5); P5 lists it as
   optional.
 - **Environment.** This container's proxy blocks `huggingface.co` and `*.hf.co`, and no `ANTHROPIC_API_KEY` is configured.

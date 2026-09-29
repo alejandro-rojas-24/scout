@@ -47,7 +47,7 @@ behavior: |
   6. format_analysis: exact layout:
      "LINEAGE ANALYSIS: {subject title}"
      one block per pair: "  vs {ref title}: {VERDICT}" where VERDICT is DERIVED / NOT DERIVED / ABSTAIN (reason);
-       then "    p_derived {p:.2f} (coarse; 45-pair calibration)" when p is not None; "    features: " + comma list of
+       then "    p_derived {p:.2f} (coarse; 51-pair calibration)" when p is not None; "    features: " + comma list of
        name=value (3 decimals) or name=missing; "    structure: {kind} ({mode})".
      "  claims:" then one line per claim "    {claimed_base}: {status}" (or "    (none)").
      "  unclaimed detections:" lines or "    (none)".

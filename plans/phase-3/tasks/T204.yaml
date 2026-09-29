@@ -33,7 +33,10 @@ behavior: |
   3. compute_with_stats: identical control flow to compute_all (P2 T107 behavior 4: pop, released += len(raw), decode,
      del raw, svd, ...) except that, while w is still alive, stats[name] = tensor_stat(w, s) is computed, then del w.
      On ANY exception buffers.clear() is called (released adds its return) and the exception re-raised; after the loop,
-     resident_bytes != 0 -> SigmaError("buffers not empty after COMPUTE"). sigma values are identical to compute_all's.
+     resident_bytes != 0 -> buffers.clear() then SigmaError("buffers not empty after COMPUTE"). sigma values are identical
+     to compute_all's. This final guard is KEPT exactly as in P2 compute_all (plan.md D55): the caller must have released
+     every non-sigma buffer (T207 releases the anchor rows first). specs == [] is valid: the loop does nothing and the
+     guard still runs.
   4. No IO, no logging, no raw cosine.
 acceptance:
   tests:
@@ -44,6 +47,8 @@ acceptance:
     - "test_compute_with_stats_matches: 3 buffers from BF16 arrays -> sigma equal to compute_all on a fresh copy of the same buffers (exact); stats keys == names; resident 0; released == total bytes"
     - "test_compute_with_stats_error_clears: wrong shape in spec 2 -> SigmaError and resident_bytes == 0"
     - "test_stats_slots: 32 entries -> n_tensors 32 in both slots, k == 16"
+    - "test_compute_with_stats_empty_specs: empty buffers + specs [] -> ComputeResult(sigma={}, stats={}, released=0)"
+    - "test_compute_with_stats_leftover_raises: buffers holding one spec'd tensor plus one extra entry (e.g. an anchor-like key) -> SigmaError('buffers not empty after COMPUTE') and resident_bytes == 0 afterwards (documents the contract T207 relies on, D55)"
   commands:
     - pytest -q tests/test_tstats.py tests/test_sigma.py
     - pytest -q

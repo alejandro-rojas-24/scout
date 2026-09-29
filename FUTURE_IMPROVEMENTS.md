@@ -44,7 +44,13 @@ This file collects non-blocking review findings per phase for a later wave.
 
 ## Phase 3
 
-_pending planning_
+- **Report-only diagnostics**: T214, plan §11.3. The diagnostics and the EXIT `nulls` field are reported but feed no check. Wire them into a check, or cut them after first real use. Source: r1-m14.
+- **Merge coverage**: T201, plan §5. L30 is the only merge pair, and it is held-out only. Grow the labeled set with merges in train and calibration. Source: r2-m2.
+- **Unequal-depth, identical-structure alignment**: T209. These pairs get an arbitrary tie-break alignment, so their σ features carry little information and they rely on CKA. Source: r2-m4.
+- **Platt pool scale mismatch**: T210. The Platt pool mixes out-of-fold logits with final-model logits. This is accepted as a fail-safe caveat; refit with consistent logits later. Source: r2-m5.
+- **`scout analyze` can score held-out Cards at any time**: plan §2.1. The one-shot ledger covers the exit scripts but not ad-hoc analysis. Consider having analyze refuse held-out repos until EXIT is recorded. Source: planner r2 residual gap.
+- **Single points of failure in the not_derived set**: plan §5. Dropping deepseek-coder-base cuts the C9 sweep from 104 to 74, and the mistral7b independence quote is uncertain. Fallbacks are named, and verification must happen before FREEZE. Source: r2-m1.
+- **D36 human acknowledgement**: plan §4.3. The stored anchor Gram is treated as a statistic, not weights (invariant 1). The orchestrator accepted this provisionally, and the human should confirm it. Source: r1-m15.
 
 ## Phase 4
 

@@ -1,5 +1,5 @@
 id: T201
-title: Labeled ground-truth set - labeled.v1 schema, validator, split/leak rules, draft groundtruth/labeled_v1.yaml
+title: Labeled ground-truth set - labeled.v1 schema (incl. same_shape), validator, split/leak rules, draft groundtruth/labeled_v1.yaml (51 pairs)
 depends_on: [T001]
 files:
   - scout/groundtruth.py
@@ -25,6 +25,7 @@ interface: |
     @dataclass(frozen=True)
     class Pair:
         id: str; reference: str; subject: str; label: str; relation: str; hard_negative: bool
+        same_shape: bool                # not_derived with equal depth and identical k/v shapes (plan.md 3.3; C2 re-computes it from Cards)
         evidence: tuple[str, ...]; verify: bool; note: str
         split: str                      # derived from the families (not stored in YAML)
     @dataclass(frozen=True)
@@ -58,6 +59,7 @@ behavior: |
      f. repos: family exists; repo matches ^[A-Za-z0-9][\w.-]*/[\w.-]+$ (P1 REPO_RE).
      g. pairs: reference and subject are listed repos and differ; label in LABELS; relation in RELATIONS;
         relation == "independent" iff label == "not_derived"; hard_negative implies label == "not_derived";
+        same_shape implies hard_negative;
         evidence ids exist and at least one has kind in STRONG_KINDS (a base_model claim alone is never evidence);
         label derived -> family_of(reference) == family_of(subject); label not_derived -> families differ;
         split(reference family) == split(subject family) (else "pair crosses splits"); the unordered pair
@@ -70,28 +72,36 @@ behavior: |
      - synthetic: false.
      - evidence: one entry per citation used in section 5. Use ids E_<short> (e.g. E_QWEN25_TR, E_R1, E_QM, E_QC, E_Z, E_S,
        E_G2, E_G3, E_Q3, E_L3, E_L32 (kind org_blog, url https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/),
+       E_Q15 (kind org_blog, url https://qwenlm.github.io/blog/qwen1.5/), E_SL3_MC (kind model_card_text, url
+       https://huggingface.co/stabilityai/stablelm-3b-4e1t), E_PHI2 (kind org_blog, url
+       https://www.microsoft.com/en-us/research/blog/phi-2-the-surprising-power-of-small-language-models/),
        E_MK_L30, E_TL11_MC (TinyLlama_v1.1 model-card text, kind model_card_text), E_MC_<pair id> for model-card text of a
        pair's subject). url: the arXiv abs URL (https://arxiv.org/abs/<id>) or https://huggingface.co/<subject repo> for
        model-card text. quote: null, retrieved: null, verify: true for EVERY evidence entry (this container cannot
        retrieve them; they are filled at E2).
-     - families: the 11 families with their splits and independence evidence as in the section 5 table (tinyllama11 is
-       a separate train family with independence_evidence [E_TL11_MC]; its note repeats the L10 init-evidence rule).
-     - repos: the 40 repos with family; verify true exactly for the entries marked V in section 5 (this includes
-       teknium/OpenHermes-2.5-Mistral-7B and stabilityai/stablelm-2-1_6b).
-     - pairs: L01..L45 with reference/subject full repo ids, label, relation (not_derived -> "independent"),
-       hard_negative exactly as the "hard" column (L10, L11, L12, L16, L18, L23, L24, L25, L37, L38, L39, L40, L41, L42,
-       L44 are true), evidence = [family independence evidence of both families] for not_derived pairs and the listed
-       citation(s) for derived pairs (e.g. L06 -> [E_G2, E_MC_L06]; L33 -> [E_L32, E_MC_L33]), verify true for the entries
-       marked V, note = the section 5 note (or "").
-     The file must pass validate() (with verify flags present) and its counts must be: 45 pairs; train 9/9 (hard 5),
-     calibration 4/4 (hard 3), heldout 10/9 (hard 7); 11 families; sweep_pairs("heldout") has 104 entries.
+     - families: the 14 families with their splits and independence evidence as in the section 5 table (tinyllama11 is
+       a separate train family with independence_evidence [E_TL11_MC]; its note repeats the L10 init-evidence rule;
+       qwen15 (train) -> [E_Q15]; stablelm3b (calibration) -> [E_SL3_MC]; phi2 (calibration) -> [E_PHI2]).
+     - repos: the 45 repos with family; verify true exactly for the entries marked V in section 5 (this includes
+       teknium/OpenHermes-2.5-Mistral-7B, stabilityai/stablelm-2-1_6b and all 5 round-2 repos: Qwen/Qwen1.5-1.8B,
+       Qwen/Qwen1.5-1.8B-Chat, stabilityai/stablelm-3b-4e1t, stabilityai/stablelm-zephyr-3b, microsoft/phi-2).
+     - pairs: L01..L51 in id order, with reference/subject full repo ids, label, relation (not_derived -> "independent"),
+       hard_negative exactly as the "hard" column (L10, L11, L12, L16, L18, L47, L48, L23, L24, L25, L50, L51, L37, L38,
+       L39, L40, L41, L42, L44 are true), same_shape exactly as the "same-shape" column (L10, L47, L48, L50, L51, L37,
+       L38, L39, L40, L41 are true; every derived pair false), evidence = [family independence evidence of both
+       families] for not_derived pairs and the listed citation(s) for derived pairs (e.g. L06 -> [E_G2, E_MC_L06];
+       L33 -> [E_L32, E_MC_L33]; L46 -> [E_Q15, E_MC_L46]; L49 -> [E_MC_L49]), verify true for the entries marked V
+       (including L46-L51), note = the section 5 note (or "").
+     The file must pass validate() (with verify flags present) and its counts must be: 51 pairs; train 10/11 (hard 7,
+     same_shape 3), calibration 5/6 (hard 5, same_shape 2), heldout 10/9 (hard 7, same_shape 5); 14 families; 45 repos;
+     sweep_pairs("heldout") has 104 entries.
   6. No network, no scout imports beyond stdlib + yaml.
 acceptance:
   tests:
-    - "test_draft_file_valid: load_labeled('groundtruth/labeled_v1.yaml') succeeds; synthetic False; 45 pairs; per split (derived, not_derived) == train (9,9), calibration (4,4), heldout (10,9); hard_negative count per split train 5, calibration 3, heldout 7 (so >= half of every split's negatives); len(sweep_pairs('heldout')) == 104; 11 families; 40 repos; family_of('TinyLlama/TinyLlama_v1.1') == 'tinyllama11' and pair L10 is not_derived across families"
-    - "test_draft_oof_feasible: for each train pair e, the train pairs whose families are disjoint from e's have >= 2 of each label, except exactly {L15, L17}; the same holds after removing L10 and TinyLlama_v1.1 (the plan's fallback)"
-    - "test_draft_unresolved: unresolved() is non-empty and contains every evidence id (all quotes are pending) and pair:L10, pair:L30, repo:allenai/OLMo-2-0425-1B, repo:TinyLlama/TinyLlama_v1.1, repo:teknium/OpenHermes-2.5-Mistral-7B"
-    - "test_rules (parametrized, each on a minimal valid dict built in the test, one mutation at a time, asserting the violation text names the id): duplicate pair id; unknown evidence id; derived pair across families; not_derived pair within one family; pair crossing splits; hard_negative on a derived pair; relation independent with label derived; evidence only hub_metadata; fixture kind with synthetic False; synthetic True without allow_synthetic; verify False with null quote; quote of 401 chars; bad retrieved date; extra key in a pair; missing key in a family; repo without pairs; family without repos; the same unordered pair twice (reversed)"
+    - "test_draft_file_valid: load_labeled('groundtruth/labeled_v1.yaml') succeeds; synthetic False; 51 pairs; per split (derived, not_derived) == train (10,11), calibration (5,6), heldout (10,9); hard_negative count per split train 7, calibration 5, heldout 7 (so >= half of every split's negatives); same_shape count per split train 3, calibration 2, heldout 5 (train >= 2 and calibration >= 1, plan.md D53); len(sweep_pairs('heldout')) == 104; 14 families; 45 repos; family_of('TinyLlama/TinyLlama_v1.1') == 'tinyllama11' and pair L10 is not_derived across families"
+    - "test_draft_oof_feasible: for EVERY train pair e (no exceptions since round 2), the train pairs whose families are disjoint from e's have >= 2 of each label; the same holds after removing L10 and TinyLlama_v1.1 (the plan's fallback); the pool (all train pairs + calibration pairs) has >= 3 per class and >= 4 same_shape negatives"
+    - "test_draft_unresolved: unresolved() is non-empty and contains every evidence id (all quotes are pending) and pair:L10, pair:L30, pair:L47, pair:L50, repo:allenai/OLMo-2-0425-1B, repo:TinyLlama/TinyLlama_v1.1, repo:teknium/OpenHermes-2.5-Mistral-7B, repo:Qwen/Qwen1.5-1.8B, repo:microsoft/phi-2"
+    - "test_rules (parametrized, each on a minimal valid dict built in the test, one mutation at a time, asserting the violation text names the id): duplicate pair id; unknown evidence id; derived pair across families; not_derived pair within one family; pair crossing splits; hard_negative on a derived pair; same_shape true with hard_negative false; relation independent with label derived; evidence only hub_metadata; fixture kind with synthetic False; synthetic True without allow_synthetic; verify False with null quote; quote of 401 chars; bad retrieved date; extra key in a pair; missing key in a family; repo without pairs; family without repos; the same unordered pair twice (reversed)"
     - "test_all_violations_reported: a dict with 3 independent violations -> one LabeledSetError whose message has 3 lines"
     - "test_sweep_pairs: 2 heldout families with 2 and 3 repos -> 6 pairs, each (min, max), sorted"
     - "test_file_sha256: equals hashlib.sha256(path.read_bytes()).hexdigest()"
@@ -102,4 +112,4 @@ out_of_scope:
   - retrieving evidence quotes (human, at E2 on a Hub host)
   - freezing (T214) and pins (T213)
 invariants_touched: [5]
-decisions: [D34, D45]
+decisions: [D34, D45, D53]

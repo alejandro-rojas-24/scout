@@ -4,7 +4,7 @@ depends_on: [T108, T202, T204, T205, T206]
 files:
   - scout/scan.py
   - tests/test_scan_p3.py
-  - tests/test_scan_p2.py
+  # tests/test_scan_p2.py is NOT edited here: T202 already updated its one options assertion (plan.md 10)
 route: opus
 spec_complete: true
 interface: |
@@ -27,13 +27,17 @@ behavior: |
       "sigma: ..." as in P2 (the reason text already starts with "anchors: "). If plan.reads is empty, skip C-E as in P2.
   C'. SAMPLED_READ is unchanged (the anchor reads are in plan.reads, so they are displayed, confirmed and granted with the
       sigma reads; fetch_one stores each read under r.tensor).
-  D'. COMPUTE: sigma_specs = [(r.tensor, r.dtype, r.shape) for r in plan.reads if r.role != ANCHOR_ROLE];
-      cr = compute_with_stats(buffers, sigma_specs). Then for each AnchorPlan ap (in order): rows = [];
-      for r in ap.reads: raw = buffers.pop(r.tensor); released += len(raw); rows.append(decode_tensor(raw, r.dtype, r.shape));
-      del raw. X = numpy.concatenate(rows) (rows in ascending token-id order); reorder X to the ap.present order
-      (row for token id ap.token_ids[j] is at its position in the sorted-id order); gram = anchor_gram(X); del X, rows.
+  D'. COMPUTE, ANCHORS FIRST (plan.md D55; resolves validation r2 major 2). Inside one try:
+      1. For each AnchorPlan ap (in order): rows = []; for r in ap.reads: raw = buffers.pop(r.tensor); released_anchor +=
+         len(raw); rows.append(decode_tensor(raw, r.dtype, r.shape)); del raw. X = numpy.concatenate(rows) (rows in
+         ascending token-id order); reorder X to the ap.present order (row for token id ap.token_ids[j] is at its position
+         in the sorted-id order); gram[ap] = anchor_gram(X); del X, rows.
+      2. Only now, with every anchor buffer released: sigma_specs = [(r.tensor, r.dtype, r.shape) for r in plan.reads if
+         r.role != ANCHOR_ROLE]; cr = compute_with_stats(buffers, sigma_specs). Its unchanged P2 final guard
+         (resident_bytes != 0 -> SigmaError) therefore covers anchor and sigma buffers together. For an anchor-only plan
+         sigma_specs == [] and cr.sigma == {}; the guard still runs.
       Any exception: buffers.clear() and re-raise. Then the single purge note as in P2:
-      f"released {released} weight bytes; resident={buffers.resident_bytes}" (released includes sigma and anchor bytes).
+      f"released {released_anchor + cr.released} weight bytes; resident={buffers.resident_bytes}".
   E'. Per unit: stats_by_tensor_u = {name: cr.stats[name] for the unit's sigma reads}; (tensor_stats_u, spectral_topk_u) =
       stats_slots(stats_by_tensor_u) when non-empty else (None, None). anchor_embedding_u = {"version": "anchor.v1",
       "anchor_set": ANCHOR_SET, "anchor_sha256": ANCHOR_SHA256, "tensor": ap.tensor, "file": ap.file, "dtype": ap.dtype,
@@ -44,8 +48,8 @@ behavior: |
   F'. build_card(..., options={"sample": sample, "tokenizer": tokenizer, "anchors": anchors}, tensor_stats=...,
       spectral_topk=..., stats_by_tensor=..., anchor_embedding=..., anchor_gram=...).
   G'. PURGE check unchanged (it covers anchor buffers too).
-  H'. Update tests/test_scan_p2.py::test_plain_unchanged: options == {"sample": False, "tokenizer": False, "anchors": False};
-      no other P2 test changes.
+  H'. No P2 test file is edited by this task (T202 owns tests/test_scan_p2.py). With anchors=False the network reads and
+      plan_id are identical to P2; the Card additionally carries tensor stats on sample scans (plan.md 2.1).
 acceptance:
   tests:
     - "fixtures: tests/helpers/p3_fixtures (T208 is NOT a dependency; this test file builds its own minimal repo: weights_fixtures.write_family_repo(FamilySpec(seed=1, vocab=512)) plus a tokenizer.json written in the test with pre_tokenizer {'type':'ByteLevel'} and vocab {'Ġ'+w: i for i, w in enumerate(anchor_words())} + filler tokens up to 512); FakeHub and LocalSource as in T108"
@@ -58,7 +62,9 @@ acceptance:
     - "test_purge_covers_anchors: monkeypatch anchor_gram to raise -> exception propagates, resident 0, out_dir empty"
     - "test_plain_scan_v2: default flags -> all 6 stats slots None, all stat_* columns null (P1 C7 still holds)"
     - "test_anchors_multicomponent (invariant 6; the headline Qwen-text-encoder case): a diffusers-style local repo with model_index.json listing text_encoder and unet; text_encoder/ holds the FamilySpec(seed=1, vocab=512) safetensors (Qwen-style name model.embed_tokens.weight) and tokenizer/tokenizer.json holds the ByteLevel anchor tokenizer; unet/ holds one small non-LM tensor. scan(sample=True, tokenizer=True, anchors=True, gate_threshold_bytes=0, confirmer=approve_exact) -> the text_encoder Card has anchor_embedding with tokenizer_file 'tokenizer/tokenizer.json' (the P2 T104 text_encoder -> tokenizer mapping), n_present 256, and a Gram equal to the directly decoded rows (1e-12); the unet Card has anchor_embedding None and the note 'anchors: no tokenizer for unet'"
-    - "P2 tests/test_scan_p2.py (with the one updated assertion) and P1 tests/test_scan.py pass"
+    - "test_anchor_only_plan (validation r2 major 2): weights_fixtures.write_family_repo of FamilySpec(seed=1, vocab=512, n_layers=4) (too shallow for sigma roles, as in P2 T106 test_plan_shallow) plus the ByteLevel anchor tokenizer of this file -> the plan has only embed.anchor reads; scan(sample=True, tokenizer=True, anchors=True, gate_threshold_bytes=0, confirmer=approve_exact) succeeds (no SigmaError); anchor_embedding.n_present == 256; stats.sigma_curves None; tensor_stats None; purge note contains 'resident=0'; totals.weight == plan.bytes_planned"
+    - "test_compute_order: spy on compute_with_stats recording buffers.resident_bytes at entry -> equals the sum of the sigma reads' bytes (every anchor buffer already popped) in test_anchors_approved_hub's setup; and for the anchor-only plan it is 0"
+    - "P2 tests/test_scan_p2.py (as left by T202, not edited here) and P1 tests/test_scan.py pass"
   commands:
     - pytest -q tests/test_scan_p3.py tests/test_scan_p2.py tests/test_scan.py
     - pytest -q
@@ -66,4 +72,4 @@ out_of_scope:
   - CLI/HTTP flags (T215; the server is unchanged in P3)
   - comparing Cards (T209)
 invariants_touched: [1, 2, 4, 6]
-decisions: [D35, D36, D48]
+decisions: [D35, D36, D48, D55]
