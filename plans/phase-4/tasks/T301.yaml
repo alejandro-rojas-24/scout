@@ -1,0 +1,112 @@
+id: T301
+title: ByteLog P4 - GGUF header class (monotone bound), grant stage (FULL_DOWNLOAD), per-model LogView, remote ingest with origin, disk accounting, job records; new error types
+depends_on: [T101]
+files:
+  - scout/bytelog.py
+  - scout/errors.py
+  - tests/test_bytelog_p4.py
+route: opus
+spec_complete: true
+interface: |
+  scout/errors.py (additions; every P1/P2 class unchanged):
+    class JobError(ScoutError)            # exit_code 7; a batch job failed (message names job_id and host when known)
+    class PlanMismatch(JobError)          # exit_code 7; worker plan_id/bytes_cap differ from the job spec
+    class BackendError(JobError)          # exit_code 7; transport failure (ssh/subprocess exit, idle timeout, malformed message)
+    class PurgeError(ScoutError)          # exit_code 8; weights may remain; message names the scratch dir and says
+                                          # "run `scout jobs sweep` on <host>"
+    class DiskSpaceError(ScoutError)      # exit_code 9; __init__(self, message, *, needed: int, free: int, root: str)
+    class StoreError(ScoutError)          # exit_code 1
+    class QuantError(ScoutError)          # exit_code 1; undecodable or malformed quantised tensor
+
+  scout/bytelog.py (additions; everything of P1 T002 and P2 T101 stays):
+    GGUF_PROLOGUE: int = 24
+    NOTE_EVENTS: frozenset[str]            # P2 set + {"job"}
+    INGEST_EVENTS: frozenset[str] = frozenset({"stage_start", "fetch", "retry", "refused", "error", "card_written",
+                                                "gate", "purge", "job"})
+
+    @dataclass(frozen=True)
+    class LogEvent:                        # P1 fields unchanged, plus (last, defaulted):
+        origin: str | None = None
+        def to_dict(self) -> dict          # P1 dict; key "origin" added ONLY when origin is not None
+
+    def classify_range(path, start, end_exclusive, header_len) -> dict[str, int]
+        # ".gguf" (case-insensitive) now follows the safetensors rule: bound = 8 + header_len when registered,
+        # else GGUF_PROLOGUE; bytes < bound -> header, >= bound -> weight. Every other extension unchanged.
+
+    class ByteLog:
+        def set_header_len(self, path: str, header_len: int) -> None
+            # ".gguf": may be called again with a value >= the registered one (smaller -> ValueError); other paths: P1 behaviour
+        def grant(self, plan_id: str, ranges: Iterable[tuple[str, int, int]], cap_bytes: int, *,
+                  stage: Stage = Stage.SAMPLED_READ) -> None      # stage not in {SAMPLED_READ, FULL_DOWNLOAD} -> ValueError
+        @property grant_stage -> Stage | None
+        def view(self, prefix: str) -> "LogView"
+        def ingest(self, event: dict, *, origin: str) -> LogEvent
+        def totals_by_origin(self) -> dict[str, dict[str, int]]       # {"local": {...}, <origin>: {...}}; sums == totals
+        def disk_add(self, n: int) -> None
+        def disk_release(self, n: int) -> None
+        @property disk_resident -> int
+        @property disk_peak -> int
+        def add_job_record(self, record: dict) -> None
+        @property job_records -> list[dict]                            # deep copies
+        # to_card_dict() is UNCHANGED (card.py composes the v3 "disk" and "jobs" keys; T306)
+
+    class LogView:
+        # Proxy used by one model's Source inside a multi-model log. Every method that takes a path prefixes it with
+        # `prefix` and delegates to the parent ByteLog; everything else delegates unchanged.
+        prefix: str; parent: ByteLog
+        def preflight(self, path, start, end_exclusive) -> int
+        def release(self, reservation) -> None
+        def recheck(self, reservation) -> None
+        def record(self, *, event, source, path, url, start, nbytes, status, attempt=1, elapsed_ms=0.0, note=None,
+                   release=None) -> LogEvent                           # path None stays None
+        def note(self, event, note, path=None) -> LogEvent
+        def set_header_len(self, path, header_len) -> None
+        def header_len(self, path) -> int | None
+        def __getattr__(self, name)                                    # totals, current_stage, threshold_bytes, stage(),
+                                                                       # grant_active, events, ... -> parent
+behavior: |
+  1. classify_range: extend the P1 function. For a path whose lower-cased name ends with ".gguf", compute
+     bound = 8 + header_len if header_len is not None else GGUF_PROLOGUE, and classify exactly like the safetensors
+     branch (header below bound, weight at or above). The P1 rule "any byte of a weight extension other than
+     .safetensors is weight" no longer applies to .gguf; it still applies to .bin/.pt/... unchanged.
+  2. set_header_len: for ".gguf" paths store max-monotone: new < old -> ValueError("header bound of <path> may only
+     grow"); equal or larger -> store. For other paths keep the P1 behaviour exactly (same exceptions, same messages).
+  3. grant(stage=...): store the stage with the grant. preflight() allows a weight range only if a grant is active AND
+     current_stage == grant_stage AND the P2 conditions hold (pure weight, inside one granted range, cap incl. retries).
+     The P2 refusal texts are unchanged; a stage mismatch uses the same text P2 uses for "wrong stage".
+     stage(new) revokes an active grant when new != grant_stage (P2 revoked when leaving SAMPLED_READ; with the
+     default stage this is identical).
+  4. view(prefix): return LogView(self, prefix). Views share the parent's lock, totals, reservations, grant and events.
+     Grant ranges are always given with the prefixed path (the caller builds them).
+  5. ingest(event, origin): origin non-empty str else ValueError. Validate: event["event"] in INGEST_EVENTS;
+     bytes int >= 0; bytes_by_class has exactly meta/header/weight ints >= 0 summing to bytes; stage is a Stage name.
+     Under the lock: append LogEvent(seq=<next local seq>, ts=float(event["ts"]), stage=event["stage"],
+     event=event["event"], source=event.get("source"), path=event.get("path"), url=event.get("url"),
+     range=tuple(event["range"]) if event.get("range") else None, status=event.get("status"),
+     bytes=..., bytes_by_class=..., attempt=int(event.get("attempt", 1)), elapsed_ms=float(event.get("elapsed_ms", 0.0)),
+     note=event.get("note"), totals=<client totals after adding bytes_by_class>, origin=origin); add to the per-origin
+     totals; call on_event. Never calls stage(); never touches grants or reservations.
+  6. totals_by_origin: "local" = bytes recorded through record(); one key per ingest origin. Always includes "local".
+  7. disk_add(n): n >= 0 else ValueError; resident += n; peak = max(peak, resident). disk_release(n): n > resident ->
+     ValueError; resident -= n. Thread-safe (the ByteLog lock).
+  8. add_job_record: append a deep copy; job_records returns deep copies.
+  9. No behaviour of P1/P2 changes when none of the new features is used: the P1/P2 test files are not edited and pass.
+acceptance:
+  tests:
+    - "test_gguf_classify: classify_range('m.gguf', 0, 24, None) -> header 24; (0, 25, None) -> header 24, weight 1; after set_header_len('m.gguf', 992) -> [0, 1000) header, [1000, 1001) weight; '.GGUF' upper case same; '.bin' unchanged (all weight)"
+    - "test_gguf_bound_monotone: set_header_len('m.gguf', 100) then 200 ok, then 150 -> ValueError; safetensors path keeps P1 behaviour (P1 test expectation reproduced here)"
+    - "test_grant_full_download: grant(..., stage=FULL_DOWNLOAD) in stage FULL_DOWNLOAD allows a granted weight range; the same grant with current stage SAMPLED_READ refuses; stage(COMPUTE) revokes it; grant(stage=COMPUTE) -> ValueError; default grant stage is SAMPLED_READ (P2 semantics)"
+    - "test_view_prefix: two views 'm0:' and 'm1:' each set_header_len('model.safetensors', N0 / N1) -> parent.header_len('m0:model.safetensors') == N0 and 'm1:...' == N1; a record through view m1 logs path 'm1:model.safetensors'; totals shared"
+    - "test_view_grant: grant ranges [('m1:a.safetensors', s, e)] -> view('m1:').preflight('a.safetensors', s, e) allowed; view('m0:').preflight('a.safetensors', s, e) refused"
+    - "test_ingest: ingest 3 worker event dicts (stage_start, fetch weight 100, purge) with origin 'spark' -> client seqs continue, totals.weight += 100, totals_by_origin()['spark']['weight'] == 100 and 'local' unchanged, to_dict of ingested events has origin 'spark', local events have no 'origin' key; current_stage unchanged"
+    - "test_ingest_rejects: unknown event type, negative bytes, classes not summing, unknown stage, empty origin -> ValueError and nothing appended"
+    - "test_disk_accounting: disk_add 10, 20, release 25 -> resident 5, peak 30; release 6 -> ValueError; 8 threads x 1000 disk_add(1) -> resident 8000"
+    - "test_job_records: add_job_record(d); mutate d; job_records[0] unchanged"
+    - "test_errors: exit codes JobError 7, PlanMismatch 7 (subclass of JobError), BackendError 7, PurgeError 8, DiskSpaceError 9 with needed/free/root attrs, StoreError 1, QuantError 1"
+  commands:
+    - pytest -q tests/test_bytelog_p4.py
+    - pytest -q
+out_of_scope:
+  - GGUF parsing (T304), scratch files (T311), the job protocol (T315)
+invariants_touched: [1, 2]
+decisions: [D57, D59, D61, D66]

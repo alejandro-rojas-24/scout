@@ -1,0 +1,95 @@
+id: T306
+title: Card v3 schema (format, quant, content_digest, lfs_sha256, gguf file block, source_name column, fetch_log disk/jobs, attribution slot), with_attribution, object_id, validate_attribution; P2 C8 and P3 C3 accept card.v3 in the same change
+depends_on: [T202, T216, T301]
+files:
+  - scout/card.py
+  - tests/test_card.py
+  - tests/test_card_v1.py
+  - tests/test_card_v2.py
+  - tests/test_card_v3.py
+  - scripts/exit_expectations_p2.py
+  - tests/test_exit_expectations_p2.py
+  - scripts/exit_expectations_p3.py
+  - tests/test_exit_expectations_p3.py
+route: opus
+spec_complete: true
+interface: |
+  scout/card.py (changes relative to P3 T202; must NOT import scout.attrib, scout.fullplan, scout.gate, scout.scan,
+  scout.hub or scout.sources - P3 C10 walks card.py's imports from scout.analysis):
+    SCHEMA_VERSION = "card.v3"
+    SUPPORTED_SCHEMA_VERSIONS = ("card.v0", "card.v1", "card.v2", "card.v3")
+    PARQUET_SCHEMA: the P3 columns in order, then ("source_name", string, nullable) appended LAST
+    ATTRIBUTION_VERSION = "attribution.v1"
+
+    def component_slug(component: str | None) -> str
+        # None -> "_model"; else re.sub(r"[^A-Za-z0-9._-]", "_", component) (P1 component names unchanged)
+    def build_card(*, <all P3 T202 kwargs unchanged>,
+                   weights_format: str = "safetensors",               # "safetensors" | "gguf"
+                   quant: dict | None = None,                          # plan.md 4.1 quant.v1 (T305 detect_quant)
+                   content_digest: str | None = None,
+                   gguf_files: dict[str, dict] | None = None,          # path -> files[].gguf block (plan.md 4.1)
+                   source_names: dict[str, str] | None = None) -> BuiltCard   # canonical tensor name -> original name
+    def content_digest(lfs_hashes: Sequence[str | None]) -> str | None
+    def object_id(json_bytes: bytes, parquet_bytes: bytes) -> str
+    def validate_attribution(att: dict) -> list[str]                  # [] when att is a valid attribution.v1
+    def with_attribution(card: dict, table: pyarrow.Table, attribution: dict, extra_log: dict,
+                         out_dir: pathlib.Path) -> BuiltCard
+        # extra_log = {"counting", "threshold_bytes", "totals", "events", "gate", "disk": {...}, "jobs": [...]}
+    def upgrade_to_v3(card: dict, table: pyarrow.Table) -> tuple[dict, pyarrow.Table]   # v0-v2 -> v3 defaults
+    def load_card(json_path) -> tuple[dict, pyarrow.Table]            # accepts v0..v3 (returned as stored)
+
+  scripts/exit_expectations_p2.py: C8 condition `schema_version in ("card.v1", "card.v2")` becomes
+    `schema_version in ("card.v1", "card.v2", "card.v3")`; nothing else changes.
+  scripts/exit_expectations_p3.py: C3 condition `schema_version == "card.v2"` becomes
+    `schema_version in ("card.v2", "card.v3")`; nothing else changes (every threshold stays frozen).
+behavior: |
+  1. build_card fills (plan.md 4.1): schema_version "card.v3"; weights.format = weights_format; weights.quant = quant;
+     weights.content_digest = content_digest; each files[] entry gains "format" (weights_format), "lfs_sha256" (from
+     source.files(): the RepoFile of that path, else None) and "gguf" (gguf_files.get(path)); stats gains nothing new
+     (attribution slot already exists, null); fetch_log = log.to_card_dict() plus "disk": {"peak_bytes": log.disk_peak,
+     "resident_bytes": log.disk_resident} and "jobs": log.job_records. Parquet rows gain source_name =
+     source_names.get(name) (None when absent). Parquet metadata schema_version "card.v3".
+  2. content_digest(hashes): any None or empty list -> None; else "sha256:" + sha256("\n".join(sorted(hashes)).encode()).hexdigest().
+  3. object_id(j, p) = sha256(b"scout.card-object.v1\n" + sha256(j).hexdigest().encode() + b"\n" + sha256(p).hexdigest().encode()).hexdigest().
+  4. validate_attribution(att): checks, collecting one message per problem:
+     keys exactly {version, method, params, subject_stack, other_stacks, alpha, n_tests, z_crit, references, blocks,
+     caveat, job, computed_at}; version == "attribution.v1"; subject_stack has prefix/depth/indices with
+     len(indices) == depth; len(blocks) == depth and blocks[i].index == indices[i]; each block status in
+     {"attributed", "not_attributed", "untestable"}; attributed <=> some test attributed; primary is None unless
+     attributed, and then indexes an attributed test's reference; every test.reference < len(references); each reference
+     status in {"tested", "abstain", "untestable"}; n_attributed == number of blocks whose tests include that reference
+     attributed; abstain/untestable references attribute nothing; 0 < alpha < 1; z_crit a float.
+     (It checks literals only; it imports nothing from scout.attrib.)
+  5. with_attribution: problems = validate_attribution(attribution) -> non-empty raises ValueError listing them.
+     (card2, table2) = upgrade_to_v3(card, table); card2 = deep copy with stats.attribution = attribution;
+     scan.notes += [f"attribution: {n_attr} of {depth} blocks attributed; references: {', '.join(titles)}"];
+     fetch_log.events = old events + extra events with seq renumbered to continue after the last old seq;
+     totals = element-wise sum; gate = old + extra; disk = extra["disk"]; jobs = old jobs + extra["jobs"].
+     paths = card_paths(out_dir, repo, revision_sha, component). Returns BuiltCard (not written; write_card writes).
+  6. upgrade_to_v3: missing v3 keys get defaults (format "safetensors", quant None, content_digest None, files[].format
+     "safetensors", lfs_sha256 None, gguf None, fetch_log.disk {0, 0}, jobs [], v1/v2 missing slots null); the table
+     gains a null source_name column (and stat_anchor_gram if missing); metadata v3. A v3 input is returned unchanged.
+  7. write_card is unchanged (atomic mkstemp + os.replace).
+  8. The P1/P2/P3 card tests that assert "card.v2" or exact key sets are updated to v3 and the new keys; no assertion
+     about P1-P3 behaviour is weakened otherwise.
+  9. P2 C8 / P3 C3 edits as in the interface, with tests: a card.v3 Card passes C8 and C3 where the same card.v2 passed;
+     card.v0 still fails C8 exactly as before.
+acceptance:
+  tests:
+    - "test_v3_plain: a plain scan Card built with the P1 fixture has schema card.v3, weights.format 'safetensors', quant None, content_digest None, files[].format/lfs_sha256/gguf present, fetch_log.disk {0,0}, jobs [], every stat null (P1 C7 still holds), Parquet source_name all null, metadata card.v3"
+    - "test_v3_gguf_fields: build_card with weights_format 'gguf', a quant dict, gguf_files and source_names -> fields and the source_name column as given"
+    - "test_component_slug: None -> '_model'; 'text_encoder' unchanged; 'gguf:sub/M-Q4_K_M.gguf' -> 'gguf_sub_M-Q4_K_M.gguf'"
+    - "test_content_digest: order-independent; any None -> None; [] -> None"
+    - "test_object_id: equals the formula; changes if one byte of either file changes"
+    - "test_validate_attribution: a hand-built valid attribution.v1 (3 blocks, 2 references) -> []; each of 8 targeted corruptions (wrong version, len(blocks) != depth, attributed without attributed test, primary pointing to a non-attributed test, n_attributed mismatch, abstain reference with attributed test, unknown status, missing key) yields a problem"
+    - "test_with_attribution: v2 Card + table + valid attribution + extra log (2 events, 1 gate, 1 job) -> v3 Card with stats.attribution set, events seq contiguous, totals summed, gate/jobs appended, disk from extra; table has source_name; write_card + load_card round-trip; invalid attribution -> ValueError"
+    - "test_load_all_versions: v0, v1, v2 and v3 Cards load; upgrade_to_v3 of each gives v3 defaults"
+    - "test_p2_c8_accepts_v3 and test_p3_c3_accepts_v3 (in the P2/P3 expectation test files): v3 passes; v0 still fails C8"
+    - "test_card_imports: importing scout.card does not import scout.attrib, scout.fullplan, scout.gate, scout.scan, scout.hub, scout.sources (sys.modules check in a subprocess)"
+  commands:
+    - pytest -q tests/test_card.py tests/test_card_v1.py tests/test_card_v2.py tests/test_card_v3.py tests/test_exit_expectations_p2.py tests/test_exit_expectations_p3.py
+    - pytest -q
+out_of_scope:
+  - filling the new fields from a scan (T307); computing attributions (T314); the store (T309)
+invariants_touched: [1, 2, 5]
+decisions: [D62, D63]

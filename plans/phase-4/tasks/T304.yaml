@@ -1,0 +1,123 @@
+id: T304
+title: GGUF header-only reader - provably safe lookahead (never past the tensor infos), GGUF_PARAMS, canonical HF names, SafetensorsHeader adapter, synthesized config, vocab and MinHash from header tokens, GGUF file selection
+depends_on: [T203, T301, T303, T305]
+files:
+  - scout/gguf.py
+  - tests/test_gguf.py
+route: opus
+spec_complete: true
+interface: |
+  scout/gguf.py (imports: struct, hashlib, re, scout.dequant (GGML_TYPES, tensor_nbytes), scout.safetensors_header
+  (SafetensorsHeader, TensorInfo), scout.anchors (VocabIds, normalize_token), scout.tokenizer (minhash, signature_hex,
+  NUM_PERM, MINHASH_VERSION, ELEMENT_SCHEME, HASH_DESC), scout.errors, scout.sources (RepoFile)):
+    GGUF_PARAMS: dict              # EXACTLY the plan.md 4.9 literal
+    GGUF_MAGIC = b"GGUF"
+    SPLIT_RE = re.compile(r"^(?P<stem>.+)-(?P<no>\d{5})-of-(?P<count>\d{5})\.gguf$", re.IGNORECASE)
+
+    class NeedMore(Exception):
+        def __init__(self, bound: int) -> None     # attribute bound: a PROVABLE lower bound on infos_end
+
+    @dataclass(frozen=True)
+    class GgufTensor:
+        name: str; canonical: str; type_id: int; dtype: str; dims: tuple[int, ...]; shape: tuple[int, ...]
+        offset: int; nbytes: int
+
+    @dataclass(frozen=True)
+    class GgufFile:
+        path: str; version: int; alignment: int; kv: dict[str, object]; tensors: tuple[GgufTensor, ...]
+        infos_end: int; data_offset: int; size: int | None
+        @property architecture -> str | None                      # kv["general.architecture"]
+        def info_block(self) -> dict                               # plan.md 4.1 files[].gguf block
+
+    def parse_gguf(buf: bytes, *, path: str = "", size: int | None = None) -> GgufFile   # NeedMore | HeaderError
+    def read_gguf(source: Source, path: str, file_size: int | None) -> GgufFile
+    def canonical_name(name: str, arch: str | None) -> str
+    def to_header(g: GgufFile) -> SafetensorsHeader                # adapter (plan.md 3.6)
+    def source_names(g: GgufFile) -> dict[str, str]                # canonical -> original, only where they differ
+    def gguf_config(files: list[GgufFile]) -> dict                 # synthesized config.raw
+    def gguf_vocab(g: GgufFile) -> VocabIds | None
+    def gguf_tokenizer_stat(g: GgufFile) -> dict | None            # P2 TokenizerMinHash dict
+    def select_gguf(files: list[RepoFile], subdir: str, selector: str | None) -> list[str]
+behavior: |
+  1. parse_gguf walks buf with a cursor. A helper need(k) raises NeedMore(pos + k + rest) when pos + k > len(buf), where
+     rest = the minimum encoded size of everything not yet started: the remaining fields of the item being parsed at
+     their minimum sizes (string 8, u32 4, u64 8, scalar value >= 1), every later array element at its element minimum
+     (string 8, scalar its size), every later KV at GGUF_PARAMS["min_kv_bytes"] (13), and every tensor info not started
+     at GGUF_PARAMS["min_tensor_info_bytes"] (24). Every NeedMore bound is therefore <= infos_end of a well-formed file.
+  2. Prologue (24 B): magic == b"GGUF" else HeaderError("not a GGUF file"); version u32 in GGUF_PARAMS["versions"],
+     else HeaderError (a value >= 0x10000 -> "big-endian GGUF is not supported"; 1 -> "GGUF v1 is not supported");
+     n_tensors u64 <= 1_000_000 and n_kv u64 <= 1_000_000 else HeaderError.
+  3. KV: key string (u64 len + utf-8; len <= 65536), value type u32 in 0..12, value; ARRAY: elem type u32 (not ARRAY:
+     nested arrays -> HeaderError), count u64 (<= 50_000_000), elements. Strings longer than 100_000_000 -> HeaderError.
+     Values decoded: ints/floats/bool as Python values, strings as str (utf-8, errors="replace"), arrays as lists.
+  4. alignment = kv.get("general.alignment", GGUF_PARAMS["default_alignment"]); must be a power of two in [1, 2**20]
+     else HeaderError.
+  5. Tensor info: name string; n_dims u32 in 1..4; dims u64 each >= 1; type u32 in dequant.GGML_TYPES else
+     HeaderError(f"unknown ggml type id {t}"); offset u64 % alignment == 0 else HeaderError. dtype = GGML_TYPES[t][0];
+     shape = tuple(reversed(dims)); numel = prod(dims); nbytes = tensor_nbytes(dtype, numel) (QuantError -> HeaderError).
+  6. infos_end = cursor after the last info; data_offset = align_up(infos_end, alignment). Sorted by offset, each
+     offset + nbytes <= next offset (overlap -> HeaderError); if size is given, data_offset + max(offset + nbytes) <=
+     size (else HeaderError("truncated")). Canonical names via canonical_name(name, arch); duplicate canonical names ->
+     DuplicateTensorError.
+  7. read_gguf(source, path, size): have = b""; bound = GGUF_PARAMS["prologue_bytes"]; for round in
+     range(GGUF_PARAMS["max_rounds"]): source.log.set_header_len(path, bound - 8) (registered BEFORE the read, so every
+     byte of [0, bound) classifies as header; T301 monotone rule); if size is not None and bound > size ->
+     HeaderError("truncated"); data = source.read_range(path, len(have), bound - len(have)); have += data; try:
+     g = parse_gguf(have, path=path, size=size); source.log.set_header_len(path, g.data_offset - 8); return g;
+     except NeedMore as e: if e.bound <= len(have): HeaderError("no progress"); bound = e.bound.
+     Exhausted rounds -> HeaderError(f"GGUF header needs more than {max_rounds} reads"). The P1 non-weight threshold
+     applies through the Source's preflight as for any header.
+  8. canonical_name(name, arch): arch not in GGUF_PARAMS["canonical_archs"] -> name unchanged. Otherwise match
+     name_map keys, where "{i}" matches \d+ and is substituted into the value; no match -> unchanged.
+  9. to_header(g): SafetensorsHeader(path=g.path, header_len=g.data_offset - 8,
+     metadata={k: (v if isinstance(v, str) else json.dumps(v))[:1024] for scalar (non-list) kv}, tensors=tuple(TensorInfo(
+     name=t.canonical, dtype=t.dtype, shape=t.shape, numel=prod(shape), nbytes=t.nbytes, file=g.path, data_begin=t.offset,
+     data_end=t.offset + t.nbytes) sorted by offset), data_bytes=(g.size - g.data_offset) if g.size is not None else
+     max(offset + nbytes)).
+  10. info_block: {"version", "alignment", "n_kv": len(kv), "infos_end", "data_offset", "architecture", "file_type":
+      kv.get("general.file_type"), "split_no": kv.get("split.no"), "split_count": kv.get("split.count")}.
+  11. gguf_config(files): kv of files[0]; a = architecture; raw = {"model_type": a, "architectures": [],
+      "hidden_size": kv[f"{a}.embedding_length"], "num_hidden_layers": kv[f"{a}.block_count"],
+      "intermediate_size": kv.get(f"{a}.feed_forward_length"), "num_attention_heads": kv.get(f"{a}.attention.head_count"),
+      "num_key_value_heads": kv.get(f"{a}.attention.head_count_kv"), "head_dim": kv.get(f"{a}.attention.key_length"),
+      "rms_norm_eps": kv.get(f"{a}.attention.layer_norm_rms_epsilon"), "rope_theta": kv.get(f"{a}.rope.freq_base"),
+      "max_position_embeddings": kv.get(f"{a}.context_length"), "vocab_size": len(kv["tokenizer.ggml.tokens"]) if present,
+      "gguf_file_type": kv.get("general.file_type"), "gguf_kv": {scalar kvs, strings truncated to 1024 chars}};
+      keys whose value is None are omitted. Missing embedding_length/block_count -> HeaderError.
+  12. gguf_vocab(g): tokens = kv.get("tokenizer.ggml.tokens") (None -> None); types = kv.get("tokenizer.ggml.token_type")
+      or [1] * len(tokens); model = kv.get("tokenizer.ggml.model"); normalization = "byte-level" if model == "gpt2" else
+      "metaspace" if model == "llama" else "plain"; ids = {} ; for id, (tok, ty) in enumerate(zip(tokens, types)): if ty
+      == 1: n = normalize_token(tok, normalization); if n is not None and n not in ids: ids[n] = id. Return VocabIds(normalization, ids).
+  13. gguf_tokenizer_stat(g): tokens None -> None; elements = sorted(set(("a:" if ty in (3, 4) else "v:") + tok for tok, ty
+      in zip(tokens, types))); returns {"version": MINHASH_VERSION, "source_file": g.path + "#tokenizer.ggml.tokens",
+      "source_bytes": g.infos_end, "source_sha256": sha256("\n".join(tokens).encode()).hexdigest(),
+      "tokenizer_type": "BPE" if model == "gpt2" else "Unigram" if model == "llama" else "BPE", "n_vocab": count of type
+      != 3/4, "n_added": count of types 3/4, "n_elements": len(elements), "num_perm": NUM_PERM, "element_scheme":
+      ELEMENT_SCHEME, "hash": HASH_DESC, "signature": signature_hex(minhash(elements))}.
+  14. select_gguf(files, subdir, selector): candidates = files directly in subdir ("" = repo root) whose name ends with
+      ".gguf" (case-insensitive) and does not contain "mmproj". Group split parts by stem and count. selector given:
+      p = subdir-joined selector; p not in files -> AmbiguousWeightsError(f"{selector} not found; GGUF files: ...");
+      if SPLIT_RE matches: all parts 1..count must exist (else HeaderError("incomplete split set")) and are returned in
+      order; else [p]. No selector: exactly one group -> its paths; zero -> []; more -> AmbiguousWeightsError listing the
+      groups and "select one with TARGET#<file>".
+acceptance:
+  tests:
+    - "fixtures: gguf_fixtures.write_gguf + llama_kv (T303), with 1..3 array KVs (tokens of 50..3000 strings of length 1..30, merges) and 2..200 tensors of types Q4_K/Q6_K/Q8_0/F16/F32/BF16"
+    - "test_parse_full: parse_gguf(whole file) reproduces infos_end, data_offset, offsets, dtypes, PyTorch shapes and nbytes of write_gguf's return value"
+    - "test_needmore_bounds_provable: for every prefix length n in a sampled set (0, 1, 23, 24, ..., infos_end-1; at least 200 lengths per fixture) parse_gguf(buf[:n]) raises NeedMore with n < bound <= infos_end"
+    - "test_safe_lookahead_never_past_infos: read_gguf over LocalSource on 5 fixtures (incl. one with 3000 tokens) -> every read range recorded by a spy Source ends <= infos_end; ByteLog totals.weight == 0 and totals.header == infos_end; rounds <= 64"
+    - "test_hub_gguf: the same through HubSource + FakeHub (relative307 meta redirects, CDN redirect for .gguf) -> 0 weight bytes; every CDN range end <= infos_end"
+    - "test_malformed: bad magic, version 1, big-endian version, unknown type id 99, misaligned offset, overlapping tensors, truncated (size smaller than data) -> HeaderError; nested array -> HeaderError"
+    - "test_rounds_exhausted: monkeypatch GGUF_PARAMS['max_rounds'] = 2 on a 3000-token fixture -> HeaderError"
+    - "test_canonical: llama arch -> blk.0.ffn_gate.weight becomes model.layers.0.mlp.gate_proj.weight, token_embd.weight -> model.embed_tokens.weight; arch 'gemma2' -> unchanged; rope_freqs.weight unchanged"
+    - "test_adapter: to_header(g): header_len == data_offset - 8; 8 + header_len + data_begin == absolute offset; P1 structure.analyze over the adapted tensors finds stack model.layers with the fixture depth; source_names maps canonical -> blk names"
+    - "test_config_vocab: gguf_config gives hidden_size/num_hidden_layers/intermediate_size/heads/vocab_size from kv; gguf_vocab normalises 'Ġthe' to ' the' (byte-level) and skips type-3 tokens; anchors.anchor_ids works on it"
+    - "test_tokenizer_stat: signature equals scout.tokenizer.minhash over the same elements; type 3/4 tokens become 'a:' elements"
+    - "test_select_gguf: one file -> it; two quant files -> AmbiguousWeightsError naming both; selector picks one; split set of 3 via its first part -> 3 paths; missing part -> HeaderError; mmproj file ignored"
+  commands:
+    - pytest -q tests/test_gguf.py
+    - pytest -q
+out_of_scope:
+  - scan integration and Card fill (T307); tensor data decoding (T305)
+invariants_touched: [2, 6]
+decisions: [D64, D66]

@@ -1,0 +1,64 @@
+id: T318
+title: View + server + frontend - depth-strip cells coloured by block attribution, view.attribution legend with caveat, stored Cards listed and opened from the Card store
+depends_on: [T011, T013, T014, T113, T114, T306, T309]
+files:
+  - scout/view.py
+  - scout/server.py
+  - scout/web/index.html
+  - scout/web/app.js
+  - tests/test_view_p4.py
+  - tests/test_server_p4.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/view.py (P1 T011; DISCLAIMERS unchanged; must not import scout.attrib):
+    ATTRIBUTION_CAVEAT: str        # the plan.md 4.2 text, verbatim (equal to scout.attrib.ATTRIBUTION_CAVEAT; tested)
+    def build_view(card: dict, table: pyarrow.Table) -> dict
+        # P1 view plus (plan.md 4.8):
+        #   depth_strips[].cells[].attribution: null | {"status", "primary_title", "z_adj", "p"}
+        #   view["attribution"]: null | {"stack_prefix", "references": [{"title", "status", "n_tested", "n_attributed"}],
+        #                                "caveat": ATTRIBUTION_CAVEAT}
+  scout/server.py (P1 T013 / P2 T113):
+    def make_server(..., store: CardStore | None = None) -> ScoutServer          # new keyword, default None
+    GET /api/cards   with a store: {"cards": [{"card_key", "title", "object", "has": {...}, "created_at"}]} from
+                     store.list_all() (newest first); without a store: the P2 response unchanged
+    GET /api/view?repo=&revision_sha=&component=[&object=]  -> 200 build_view(card, table) | 400 (missing/invalid sha:
+                     SHA_KEY_RE) | 404; with a store: the entry with that object, else store.find(repo, sha, component)
+                     (newest); without a store: the P1 path under out_dir
+    serve(..., store_dir: pathlib.Path | None = None)                            # new keyword
+  scout/web/index.html: adds #stored (section), #stored-list (list), #stored-refresh (button); P1/P2 ids kept.
+  scout/web/app.js: on load and on #stored-refresh: GET /api/cards and render one item per Card
+    "{title} [{flags}]" where flags lists has keys that are true; clicking an item GETs /api/view and renders the view
+    with the existing P1 section renderer (same code path as scan results).
+behavior: |
+  1. build_view: when card.stats.attribution (att) is non-null, for the depth strip whose prefix == att.subject_stack.prefix,
+     cell i (cells are in block index order) gets attribution = {"status": blocks[i].status, "primary_title":
+     att.references[blocks[i].primary].title if primary is not None else None, "z_adj": the primary test's z_adj (or,
+     for not_attributed, the max z_adj over tests; None if none), "p": that test's p}. Cells of other strips get
+     attribution None. view["attribution"] = {"stack_prefix", "references": [{"title", "status", "n_tested",
+     "n_attributed"}], "caveat": ATTRIBUTION_CAVEAT}. Without att: every cell attribution None and view.attribution None.
+     disclaimers unchanged. Works for card.v0-v3.
+  2. Colours (app.js): attributed cells use a fixed palette by reference index: ["#2e7d32", "#1565c0", "#6a1b9a",
+     "#ef6c00", "#00838f"] (index modulo 5); not_attributed "#9e9e9e"; untestable: white with a diagonal hatch (SVG
+     pattern id "hatch-untestable"); each cell's SVG <title> tooltip is
+     "block {index}: {status}{' - ' + primary_title if any}{', z_adj ' + z_adj.toFixed(1) if not null}".
+     Under the strip: a legend with one swatch per reference "{title}: {n_attributed}/{n_tested} ({status})", then the
+     caveat text, then the three disclaimers (already rendered by P1 code for every view).
+  3. Server: the store is optional; nothing in P1/P2 routes changes when store is None. /api/view never reads weights
+     and never fetches over the network.
+  4. No new dependency; app.js stays an IIFE with no external URLs (P1 rule).
+acceptance:
+  tests:
+    - "test_view_attribution: a hand-built v3 Card (P1 cards helper + card.with_attribution with a valid 16-block attribution: 14 attributed to ref 0, 1 not_attributed, 1 untestable) -> the model.layers strip cells carry the statuses, primary_title of ref 0, z_adj/p; view.attribution references and caveat; other strips None"
+    - "test_view_no_attribution: a v2 Card -> every cell attribution None, view.attribution None; P1 view fields unchanged (the P1 view test expectations on the same Card still hold)"
+    - "test_caveat_equal: scout.view.ATTRIBUTION_CAVEAT == scout.attrib.ATTRIBUTION_CAVEAT; importing scout.view does not import scout.attrib (subprocess sys.modules check)"
+    - "test_server_store_routes: make_server(store=tmp store with 2 entries) -> GET /api/cards lists both with has flags; GET /api/view by key returns the newest entry's view; by object returns that entry; bad sha -> 400; unknown -> 404"
+    - "test_server_without_store: GET /api/cards response keys unchanged from P2; GET /api/view reads out_dir P1 layout"
+    - "test_web_static: index.html contains the new ids; app.js contains 'hatch-untestable', '/api/view' and no 'http://' or 'https://' URL"
+  commands:
+    - pytest -q tests/test_view_p4.py tests/test_server_p4.py
+    - pytest -q
+out_of_scope:
+  - starting attributions from the UI (P5 UX); analysis/System 2 panels (P5)
+invariants_touched: [5]
+decisions: [D62, D69]

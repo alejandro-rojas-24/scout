@@ -1,0 +1,118 @@
+id: T313
+title: Attribution fixtures - GLU model families with shared semantic structure, derivations (fine-tune, neuron permutation, hidden rotation + norm folding, re-initialised or shifted blocks), GGUF/FP8/safetensors/diffusers-TE writers (test-only)
+depends_on: [T103, T208, T303]
+files:
+  - tests/helpers/attrib_fixtures.py
+  - tests/test_attrib_fixtures.py
+route: sonnet
+spec_complete: true
+interface: |
+  tests/helpers/attrib_fixtures.py (test-only; numpy; imports weights_fixtures (P2 T103), p3_fixtures.p3_tokenizer_json_bytes
+  (P3 T208) and gguf_fixtures (T303); NO scout imports):
+    # FROZEN constants (changing them to make a test pass is hand-tuning; test_frozen asserts the literals)
+    N_SHARED_TOKENS: int = 1024
+    N_OWN_TOKENS: int = 64
+    SEM_SEED: int = 4242
+    SEM_RANK: int = 16
+
+    def attrib_vocab(seed: int) -> list[str]
+        # ["Ġw" + str(i) for i in range(N_SHARED_TOKENS)] + [f"Ġx{seed}_{j}" for j in range(N_OWN_TOKENS)]
+
+    @dataclass(frozen=True)
+    class GluSpec:
+        seed: int
+        n_layers: int = 16
+        hidden: int = 256         # multiples of 256 so every 2-D tensor row is whole Q4_K/Q5_K/Q6_K blocks
+        inter: int = 512
+        n_heads: int = 4
+        n_kv_heads: int = 2
+        head_dim: int = 64
+        s: float = 0.3            # embedding semantic weight
+        a: float = 0.3            # neuron semantic weight
+        gamma: float = 0.3        # within-neuron gate/up correlation
+
+    def glu_weights(spec: GluSpec, vocab: list[str]) -> dict[str, numpy.ndarray]     # float32, llama-style HF names
+    def derive(w: dict, *, eps: float, seed: int, permute_neurons: bool = True, rotate_hidden: bool = False,
+               reinit_blocks: Sequence[int] = (), reinit_spec: GluSpec | None = None, shift_blocks: int = 0) -> dict
+    def glu_config(spec: GluSpec, vocab_size: int, model_type: str = "llama") -> dict
+    def write_st_repo(root: pathlib.Path, w: dict, spec: GluSpec, vocab: list[str], *, dtype: str = "BF16",
+                      model_type: str = "llama", readme: str | None = None) -> dict
+    def write_gguf_repo(root: pathlib.Path, w: dict, spec: GluSpec, vocab: list[str], *, gtype: str = "Q4_K",
+                        filename: str = "model-Q4_K.gguf") -> dict
+    def write_fp8_repo(root: pathlib.Path, w: dict, spec: GluSpec, vocab: list[str], *, block: tuple[int, int] = (64, 64)) -> dict
+    def write_te_pipeline(root: pathlib.Path, w_text: dict, spec: GluSpec, vocab: list[str], *, vision_layers: int = 8,
+                          vision_hidden: int = 64, vision_inter: int = 96, prefix: str = "model.language_model") -> dict
+    def fp8_encode_e4m3(x: numpy.ndarray) -> numpy.ndarray       # uint8 codes, round to nearest (ties -> even code)
+
+    # Frozen families (plan.md 2.1 no-hand-tuning rule)
+    BASE = GluSpec(seed=1)
+    CONTROL = GluSpec(seed=2, inter=768)
+    TE_BASE = GluSpec(seed=3, n_layers=12)
+    INFLATED = (1.0, 2.0, 0.9)                 # (s, a, gamma) of the inflated-null families
+    NULL_PAIRS: tuple[tuple[int, int], ...] = tuple((100 + 2 * p, 101 + 2 * p) for p in range(6))
+    DERIVE_EPS: float = 0.05
+    DERIVE_SEED: int = 8
+behavior: |
+  1. glu_weights(spec, vocab): rng = numpy.random.default_rng(spec.seed); V = len(vocab); H = spec.hidden; I = spec.inter; r = SEM_RANK.
+     Z = semantic coordinates per token STRING, shared across families: for token t, Z[t] = numpy.random.default_rng(
+     SEM_SEED + int.from_bytes(hashlib.sha256(t.encode()).digest()[:4], 'little')).standard_normal(r).
+     B = rng.standard_normal((r, H)) (model-specific basis).
+     E = spec.s * Z @ B + rng.standard_normal((V, H)); model.embed_tokens.weight = (0.02 * E).astype(float32).
+     For each layer l: c = rng.standard_normal((I, r)); g = spec.a * c @ B / sqrt(r) + rng.standard_normal((I, H));
+       c2 = spec.gamma * c + sqrt(1 - gamma^2) * rng.standard_normal((I, r));
+       u = spec.a * c2 @ B / sqrt(r) + spec.gamma * (g - spec.a * c @ B / sqrt(r)) + sqrt(1 - gamma^2) * rng.standard_normal((I, H));
+       mlp.gate_proj.weight = g / sqrt(H); mlp.up_proj.weight = u / sqrt(H); mlp.down_proj.weight = rng.standard_normal((H, I)) / sqrt(I);
+       post_attention_layernorm.weight = 1 + 0.1 * rng.standard_normal(H); input_layernorm.weight = ones(H);
+       self_attn.{q,k,v,o}_proj.weight = rng.standard_normal(shape) / sqrt(fan_in) with q (n_heads*head_dim, H),
+       k/v (n_kv_heads*head_dim, H), o (H, n_heads*head_dim).
+     model.norm.weight = ones(H); lm_head.weight = 0.02 * rng.standard_normal((V, H)). All float32, insertion order =
+     embed, layers in order (input_layernorm, q, k, v, o, post_attention_layernorm, gate, up, down), norm, lm_head.
+     (This is the planner's measured generator, plan.md 3.8; the rng stream is part of the fixture.)
+  2. derive(w, eps, seed, ...): rng = default_rng(seed). Every tensor X gets X + eps * X.std() * rng.standard_normal(X.shape)
+     (float32), in insertion order. permute_neurons: per layer P = rng.permutation(I): gate/up rows and down columns
+     permuted by P. rotate_hidden: Q = orthogonal from numpy.linalg.qr(rng.standard_normal((H, H)))[0]; fold each norm
+     weight into the following weights (gate/up columns scaled by post_attention_layernorm, q/k/v by input_layernorm,
+     lm_head by model.norm) and set those norms to ones; then E -> E Q, every weight reading the residual stream
+     (q/k/v/gate/up/lm_head) W -> W Q, every weight writing it (o, down) W -> Q^T W. reinit_blocks: those layers'
+     tensors are replaced by the same-named tensors of glu_weights(reinit_spec or GluSpec(seed=seed + 1000, ...same
+     dims)). shift_blocks = k > 0: layer l's MLP tensors (gate, up, down, post_attention_layernorm) are taken from layer
+     (l + k) mod n_layers of the input (a subject whose blocks copy the reference's next blocks).
+  3. glu_config: {"model_type", "architectures": ["LlamaForCausalLM"], "hidden_size", "intermediate_size",
+     "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size", "rms_norm_eps": 1e-5,
+     "rope_theta": 10000.0, "tie_word_embeddings": false, "max_position_embeddings": 4096, "hidden_act": "silu"}.
+  4. write_st_repo: weights_fixtures.write_family_repo-compatible layout: model.safetensors (single file) in dtype,
+     config.json, tokenizer.json = p3_tokenizer_json_bytes(vocab), README.md (readme or a minimal card); returns
+     {"root", "files", "n_tensors"}.
+  5. write_gguf_repo: names via gguf_fixtures.hf_to_gguf_names; 2-D projections and the embedding in gtype, norms F32;
+     kv = gguf_fixtures.llama_kv(n_layers, hidden, inter, n_heads, n_kv_heads, tokens=vocab); one file `filename`, plus
+     README.md; no config.json.
+  6. write_fp8_repo: every 2-D projection (q/k/v/o/gate/up/down) stored as F8_E4M3 codes of W / S, with
+     `<name>_scale_inv` F32 block scales S[i, j] = max|W block| / 448 (block `block`, ragged edges included), the
+     embedding and norms BF16; config gains "quantization_config": {"quant_method": "fp8", "fmt": "e4m3",
+     "weight_block_size": list(block)}.
+  7. write_te_pipeline: diffusers layout: model_index.json {"_class_name": "QwenImagePipeline", "text_encoder":
+     ["transformers", "Qwen2_5_VLForConditionalGeneration"], "tokenizer": ["transformers", "Qwen2Tokenizer"],
+     "transformer": ["diffusers", "QwenImageTransformer2DModel"]}; text_encoder/model.safetensors = w_text renamed from
+     "model." to prefix + "." (embed and layers; lm_head kept), plus a vision tower `model.visual.blocks.{i}.mlp.
+     {gate_proj,up_proj,down_proj}.weight` (vision_inter x vision_hidden etc., rng from spec.seed + 7) and
+     `model.visual.blocks.{i}.norm2.weight`; text_encoder/config.json {"architectures": ["Qwen2_5_VLForConditionalGeneration"],
+     "model_type": "qwen2_5_vl", "text_config": glu_config(...), "vision_config": {"depth": vision_layers, "hidden_size":
+     vision_hidden}}; tokenizer/tokenizer.json; transformer/diffusion_pytorch_model.safetensors with 2 tiny tensors.
+  8. fp8_encode_e4m3: decode table built here independently (s, 4-bit exponent bias 7, 3-bit mantissa; 0x7F/0xFF NaN
+     excluded from candidates); nearest finite code by absolute difference, ties to the even code; clip to +-448.
+acceptance:
+  tests:
+    - "test_frozen: the constants, BASE/CONTROL/TE_BASE, INFLATED, NULL_PAIRS, DERIVE_EPS, DERIVE_SEED equal the literals"
+    - "test_glu_shapes: glu_weights(BASE, attrib_vocab(1)) has 1 + 16*9 + 2 tensors with the stated shapes; deterministic across calls; two families share Z for shared tokens (same row of Z) but not B"
+    - "test_derive_permute: derive(..., eps=0, permute_neurons=True) -> each layer's gate rows are a permutation of the input's (sorted row norms equal) and down columns permuted consistently"
+    - "test_derive_rotation_function: with eps=0, rotate_hidden=True: for a random probe row x from E, (rmsnorm-free) x_derived @ gate_derived.T equals x @ (gate * post_norm).T within 1e-4 relative"
+    - "test_derive_reinit_shift: reinit_blocks=[3] replaces exactly layer 3's tensors; shift_blocks=1 makes layer l's gate equal input layer (l+1) mod L's gate"
+    - "test_writers: write_st_repo/write_gguf_repo/write_fp8_repo/write_te_pipeline produce readable files (safetensors headers parse with json; GGUF layout checked with gguf_fixtures' walk from its test); the TE pipeline has model_index.json with the 3 components and tokenizer/tokenizer.json"
+    - "test_fp8_encode: fp8_encode_e4m3 of [1.0, -2.0, 448.0, 500.0, 0.0] -> [0x38, 0xC0, 0x7E, 0x7E, 0x00]"
+  commands:
+    - pytest -q tests/test_attrib_fixtures.py
+    - pytest -q
+out_of_scope:
+  - the statistic (T314); any scout import
+invariants_touched: []
+decisions: [D68]

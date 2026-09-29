@@ -1,0 +1,121 @@
+id: T314
+title: Block attribution statistic (Zhu et al. matching test, weights-only) - ATTRIB_PARAMS, probe selection, embedding-probe responses, rectangular LAP matching, Spearman of gate/up matchings, in-run shift null, Bonferroni, attribution.v1; scipy dependency
+depends_on: [T203, T205, T209, T305, T310, T313]
+files:
+  - scout/attrib.py
+  - pyproject.toml
+  - tests/test_attrib.py
+route: opus
+spec_complete: true
+interface: |
+  pyproject.toml: dependencies += "scipy>=1.11" (nothing else changes)
+  scout/attrib.py (numpy + scipy.optimize.linear_sum_assignment + statistics.NormalDist + math; imports scout.features
+  (structure_alignment), scout.anchors (VocabIds), scout.dequant; FullPlan/LoadedModel only under TYPE_CHECKING;
+  never imports scout.view, see behavior 12):
+    ATTRIB_PARAMS: dict       # EXACTLY the plan.md 4.9 literal; ATTRIB_PARAMS["roles"] == scout.fullplan.ATTRIB_ROLES
+    ATTRIBUTION_CAVEAT: str   # the plan.md 4.2 text, verbatim
+
+    class TensorProvider(Protocol):
+        def tensor(self, model: int, name: str) -> numpy.ndarray          # float32, decoded and scaled; (out, in) or (n,)
+        def rows(self, model: int, name: str, rows: Sequence[int]) -> numpy.ndarray   # float32 (len(rows), in)
+
+    @dataclass(frozen=True)
+    class ProbeSet:
+        subject_ids: list[int]; reference_ids: list[int]; n_common: int; sha256: str
+
+    def select_probe(subj: VocabIds, ref: VocabIds, subj_rows: int, ref_rows: int) -> tuple[ProbeSet | None, int]
+    def probe_inputs(X: numpy.ndarray, norm_w: numpy.ndarray, offset: bool) -> numpy.ndarray
+    def standardize_columns(H: numpy.ndarray) -> numpy.ndarray
+    def test_rows(n_s: int, m: int) -> numpy.ndarray
+    def match(A: numpy.ndarray, B: numpy.ndarray) -> numpy.ndarray
+    def spearman_indices(pg: numpy.ndarray, pu: numpy.ndarray) -> float
+    def z_critical(n_tests: int, alpha: float = ATTRIB_PARAMS["alpha"]) -> float
+    def null_summary(zs: Sequence[float]) -> dict        # {"n", "mean", "sd", "max", "mu0", "s0"}
+    def attribute(plan: "FullPlan", models: dict[int, "LoadedModel"], vocabs: dict[int, VocabIds | None],
+                  provider: TensorProvider, *, computed_at: str | None = None) -> dict   # attribution.v1, "job": None
+behavior: |
+  1. select_probe(subj, ref, subj_rows, ref_rows): common = sorted texts t in subj.ids and ref.ids with
+     subj.ids[t] < subj_rows and ref.ids[t] < ref_rows, ordered by hashlib.sha256(t.encode("utf-8")).hexdigest() (ties
+     impossible); n_common = len(common); keep the first ATTRIB_PARAMS["n_probe"]; fewer than min_probe -> (None,
+     n_common). sha256 = sha256("\n".join(kept texts)).hexdigest(). Token texts are the VocabIds normalised keys (P3
+     T203, T304 for GGUF); only NORMAL tokens are present there by construction.
+  2. probe_inputs(X, g, offset): Xf = X.astype(float32); rms = sqrt(mean(Xf**2, axis=1, keepdims=True) + rms_eps);
+     w = (1 + g) if offset else g; return (Xf / rms) * w[None, :] (float32). offset = model_type in
+     ATTRIB_PARAMS["norm_offset_model_types"] (model_type from the Card config).
+  3. standardize_columns(H): Hc = H - H.mean(axis=0); n = norm of each column; columns with n <= 1e-12 * max(n.max(), 1e-30)
+     become all zeros; others Hc / n (float32).
+  4. test_rows(n_s, m) = numpy.array([k * n_s // m for k in range(m)]).
+  5. match(A, B): C = (A.T @ B).astype(float64) (m x n_r); rows, cols = scipy.optimize.linear_sum_assignment(C,
+     maximize=True); return cols[numpy.argsort(rows)] (the matched reference column per test row, in row order).
+  6. spearman_indices(pg, pu): ranks via argsort(argsort(.)); Pearson of the two rank vectors (float64); zero variance -> 0.0.
+  7. z_critical(n, alpha) = statistics.NormalDist().inv_cdf(1 - alpha / n) (n >= 1).
+  8. null_summary(zs): n = len; mean; sd = stdev (ddof 1; n < 2 -> 0.0); max; mu0 = max(0.0, mean); s0 = max(1.0, sd).
+  9. attribute(plan, models, vocabs, provider):
+     a. s = plan.models[0] (subject; must be "planned"). For each reference r (plan.models[1:]):
+        - untestable plan model -> reference status "untestable" with its reason.
+        - vocab missing on either side -> "untestable", "no tokenizer vocabulary"; probe None -> "untestable",
+          f"only {n_common} common tokens (< {min_probe})".
+        - alignment: (a, mode, summary) = scout.features.structure_alignment(ref.card, ref.table, subj.card, subj.table,
+          r.stack_prefix, s.stack_prefix) (P3 T209; positions are indices into each stack's `indices` list). Reference
+          dict alignment = {"mode": mode, "kind": summary["kind"], "structure_informative": summary.get("structure_informative")}.
+        - tested positions T = [i for i in subject positions if s.indices[i] in s.blocks and ref.indices[a[i]] in r.blocks];
+          len(T) < min_blocks -> "untestable", f"only {len(T)} aligned testable blocks".
+     b. For a tested reference: X_s = provider.rows(0, s.embed, probe.subject_ids); X_r = provider.rows(r, r.embed,
+        probe.reference_ids). m = min(m_test, n_s, n_r) where n_s, n_r are the gate row counts; rows = test_rows(n_s, m).
+        Subject side for a block b: xs = probe_inputs(X_s, provider.tensor(0, norm_b), offset_s);
+        A_g = standardize_columns(xs @ provider.tensor(0, gate_b)[rows].T), A_u likewise (cache per (probe.sha256, b, m)).
+        Reference side for a block j: xr = probe_inputs(X_r, norm_j, offset_r); B_g = standardize_columns(xr @ W_gate_j.T),
+        B_u likewise. Compute every reference block needed exactly once (loop over reference blocks in ascending order;
+        for each, evaluate all (t, k) pairs whose partner is that block), releasing its matrices before the next.
+        Test (t, k): subject block of T[t], reference block of a[T[(t + k) % n]]; k = 0 is the main test, k in
+        ATTRIB_PARAMS["shifts"] the in-run null. pg = match(A_g, B_g); pu = match(A_u, B_u); rho = spearman_indices(pg, pu);
+        z = rho * sqrt(m - 1); agree = mean(pg == pu).
+     c. After all references: n_tests = total number of k = 0 tests over references with status "tested";
+        z_crit = z_critical(n_tests). Per reference: null = null_summary(null z's); z_adj = (z - mu0) / s0;
+        p = 0.5 * math.erfc(z_adj / sqrt(2)); null_ok = (null.max - mu0) / s0 < z_crit; attributed = null_ok and z_adj >= z_crit;
+        not null_ok -> status "abstain", reason "in-run null exceeds the critical value", nothing attributed.
+        n_tested = len(T); n_attributed; median_z_adj (None if no tests).
+     d. Blocks: one entry per subject stack position i (index = s.indices[i], position = i) with one test per reference
+        (tested: reference_block = ref.indices[a[i]], m, rho, z, z_adj, p, agree_frac, attributed, reason None; otherwise
+        the numeric fields None, attributed False, reason = why: reference status reason, "block not testable in
+        subject", or "aligned reference block not testable"). status "attributed" if any test attributed (primary = the
+        reference with the largest z_adj, ties -> lower index); "not_attributed" if any test was computed; else
+        "untestable" with the first reason.
+     e. other_stacks = s.other_stacks; subject_stack = {prefix, depth, indices}; params = ATTRIB_PARAMS; alpha;
+        caveat = ATTRIBUTION_CAVEAT; job None; computed_at = computed_at or UTC now ISO "Z". Floats rounded to 6
+        decimals. The result passes scout.card.validate_attribution (T306).
+  10. Memory: never materialise all reference blocks at once; at most one reference block's float32 gate/up plus the
+      subject caches (behavior 9b).
+  11. Invariant 4: the correlation matrix C is only an assignment cost; no verdict uses a correlation value; no raw
+      cosine between weight rows is computed anywhere.
+  12. Import rule (P3 C10): scout.attrib is not imported by scout.analysis/features/jev/system2 and must not be imported
+      by scout.card or scout.view. ATTRIBUTION_CAVEAT is defined HERE; T318 re-exports it from scout.view by value
+      (view.py defines the same string; T318's test asserts equality), so view.py never imports attrib.
+acceptance:
+  tests:
+    - "provider: an in-memory TensorProvider over T313 weight dicts (float32; rows() slices); VocabIds built with scout.anchors.vocab_ids from p3_tokenizer_json_bytes(attrib_vocab(seed)); plans from T310 plan_attribution over Cards of write_st_repo fixtures (as in T310 tests)"
+    - "test_params_literal: ATTRIB_PARAMS == plan.md 4.9 literal; roles == scout.fullplan.ATTRIB_ROLES; ATTRIBUTION_CAVEAT == plan.md 4.2 text"
+    - "test_select_probe: common tokens ordered by sha256; 1088 common -> 1088 kept; n_probe monkeypatched 100 -> 100 kept; 300 common -> (None, 300); sha256 deterministic; ids above rows excluded"
+    - "test_match_identity_and_permutation: B = A[:, P] for a permutation P -> match returns P's inverse mapping exactly; rectangular (m < n) works"
+    - "test_spearman: identical -> 1.0; reversed -> -1.0; constant -> 0.0"
+    - "test_derived_all_attributed: subject = derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED) vs references [BASE, CONTROL] -> BASE: status tested, null_ok, 16/16 attributed, median z_adj >= 15 (plan.md 3.8: 22.6 measured), primary BASE in 16 blocks; CONTROL: 0 attributed"
+    - "test_invariances: subjects derive(BASE, eps=0.0, seed=9, permute_neurons=True) and derive(BASE, eps=0.0, seed=9, rotate_hidden=True) -> every block z == sqrt(m-1) within 1e-6 (rho == 1)"
+    - "test_heavy_derivation: eps=1.0 -> 16/16 attributed (measured min z_adj 18.8)"
+    - "test_partial_reinit: derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED, reinit_blocks=[3, 7]) -> blocks 3 and 7 not_attributed, the other 14 attributed"
+    - "test_null_family: for each (p, q) in NULL_PAIRS: GluSpec(seed=p) vs GluSpec(seed=q) -> total attributed blocks over the 6 pairs <= 1 (measured 0; by-construction failure chance < 1 %)"
+    - "test_inflated_null_adjusted: INFLATED (s=1.0, a=2.0, gamma=0.9) families for NULL_PAIRS: raw parametric z (z >= z_crit without adjustment, computed from the returned z values) attributes in >= 4 of 6 pairs (measured 6 of 6); the returned attributions total <= 1 (measured 0)"
+    - "test_shifted_copy_abstains: subject = derive(BASE, eps=0.0, seed=9, shift_blocks=1, permute_neurons=False) vs BASE -> null_ok False, status abstain, 0 attributed, reason text as specified"
+    - "test_quantised_subject: subject weights = T303 encode/dequant round trip of derive(BASE) in Q4_K for gate/up/embedding (provider returns the dequantised arrays) -> 16/16 attributed, z within 0.5 of the unquantised run"
+    - "test_untestable_paths: reference with no vocab -> untestable; reference with only 300 common tokens -> untestable with the count; model untestable in the plan -> untestable; block statuses and reasons as specified; validate_attribution(result) == []"
+    - "test_other_stacks_te: TE pipeline subject vs TE_BASE-derived reference (write_te_pipeline with derive(TE_BASE)) -> 12/12 attributed, other_stacks has the vision stack"
+    - "test_bonferroni: n_tests equals the number of k=0 tests of tested references; z_crit == NormalDist().inv_cdf(1 - 0.01/n_tests); a block with z_adj just below z_crit (monkeypatched provider scaling) is not attributed"
+    - "test_no_forbidden_imports: importing scout.view and scout.card in a subprocess does not load scout.attrib"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_attrib.py
+    - pytest -q
+out_of_scope:
+  - reading bytes, scratch and jobs (T312, T316); window search over reference blocks and MoE experts (later.md)
+  - the paper's forward-pass activations (later.md)
+invariants_touched: [4, 5]
+decisions: [D68, D69, D70, D75]

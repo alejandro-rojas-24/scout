@@ -1,0 +1,144 @@
+id: T310
+title: Full-download plan for block attribution (tested-stack selection, whole-tensor reads incl. embedding and FP8 scales, scaled retry slack, disk/memory) + full gate (display first, exact (plan_id, cap), job-spec confirmer)
+depends_on: [T106, T205, T305, T306, T311, T313]
+files:
+  - scout/fullplan.py
+  - tests/test_fullplan.py
+route: opus
+spec_complete: true
+interface: |
+  scout/fullplan.py:
+    from scout.gate import GateDecision, Confirmer, flag_confirmer          # P2 T106
+    ROLE_ORDER = ("gate", "up", "norm")
+    ATTRIB_ROLES: dict = {"gate": ["mlp.gate_proj.weight"], "up": ["mlp.up_proj.weight"],
+                          "norm": ["pre_feedforward_layernorm.weight", "post_attention_layernorm.weight"]}
+        # == ATTRIB_PARAMS["roles"] (T314 asserts equality; defined here so the plan does not import scipy)
+    MIN_BLOCKS = 8                                                            # == ATTRIB_PARAMS["min_blocks"]
+
+    @dataclass(frozen=True)
+    class LoadedModel:                    # what the planner needs; built from a stored or in-memory Card
+        card: dict; table: pyarrow.Table; target: str
+        @property key -> dict             # card["key"]
+        @property title -> str            # f"{repo}@{sha[:12]}" + (f"/{component}" if component else "")
+
+    @dataclass(frozen=True)
+    class FullRead:
+        model: int; component: str | None; path: str; tensor: str; role: str; block_index: int
+        start: int; end_exclusive: int; dtype: str; shape: tuple[int, ...]
+        def to_dict(self) -> dict
+
+    @dataclass(frozen=True)
+    class ModelPlan:
+        index: int; role: str; card_key: dict; target: str; title: str; stack_prefix: str | None; blocks: list[int]
+        roles_by_block: dict[int, dict[str, str]]      # block -> {"gate": name, "up": name, "norm": name, ["gate_scale", "up_scale"]}
+        embed: str | None; hidden: int | None; model_type: str | None
+        status: str                                    # "planned" | "untestable"
+        reason: str | None; reads: list[FullRead]; other_stacks: list[dict]
+        @property bytes -> int
+        def to_dict(self) -> dict
+
+    @dataclass(frozen=True)
+    class FullPlan:
+        plan_id: str; models: list[ModelPlan]; bytes_planned: int; bytes_cap: int; slack_bytes: int; disk_bytes: int
+        memory_peak_bytes: int; threshold_bytes: int; reason: str
+        host: str | None = None; scratch_root: str | None = None; disk_free_bytes: int | None = None
+        def reads(self) -> list[FullRead]
+        def per_file(self) -> list[dict]               # [{"model", "path", "n_reads", "bytes"}] sorted by (model, path)
+        def grant_ranges(self) -> list[tuple[str, int, int]]   # (f"m{model}:{path}", start, end_exclusive)
+        def to_dict(self) -> dict                      # plan.md 4.3
+
+    def select_stack(m: LoadedModel) -> tuple[str | None, list[int], dict[int, dict[str, str]], list[dict], str | None]
+        # (stack_prefix, tested blocks, roles_by_block, other_stacks, reason if untestable)
+    def slack_bytes(bytes_planned: int, largest_read: int, chunk_bytes: int) -> int
+    def plan_attribution(subject: LoadedModel, references: list[LoadedModel], *,
+                         threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES, host: str | None = None,
+                         scratch_root: str | None = None, disk_free_bytes: int | None = None,
+                         chunk_bytes: int = JOB_PARAMS["chunk_bytes"], workers: int = JOB_PARAMS["download_workers"],
+                         n_probe: int = 2048, m_test: int = 2048) -> FullPlan
+    def format_full_plan(plan: FullPlan) -> str
+    def format_full_plan_dict(d: dict) -> str          # same text from FullPlan.to_dict()
+    def full_decision(plan: FullPlan, *, approved: bool, via: str, bytes_confirmed: int | None) -> GateDecision
+    def run_full_gate(plan: FullPlan, log: ByteLog, confirmer: Confirmer | None, *,
+                      display: Callable[[str], None] | None = None) -> GateDecision
+    def spec_confirmer(confirmation: dict) -> Confirmer                # worker side, via "job-spec"
+behavior: |
+  1. Parquet rows of the model's table give (name, dtype, shape, file, data_begin, data_end, stack_prefix, block_index);
+     card["weights"]["files"] gives header_len per file. Absolute range of a row = [8 + header_len + data_begin,
+     8 + header_len + data_end) (GGUF adapter convention holds, T304).
+  2. Embedding: scout.cka.find_embedding over (name, shape, dtype) of all rows (T308 accepts GGUF quant dtypes);
+     None -> model untestable "no input embedding (probe basis)". hidden = its shape[1]. An F8 embedding is not
+     accepted by find_embedding -> untestable "embedding dtype not decodable for probes".
+  3. select_stack(m): for each stack in card.structure.stacks (P1 order), for each block index idx: rel names = rows with
+     stack_prefix == prefix and block_index == idx, rel = name[len(prefix) + len(str(idx)) + 2:]. roles: first pattern
+     per role (ROLE_ORDER) present. A block is eligible iff: gate, up and norm present; gate/up 2-D with equal shape; norm
+     1-D with length == gate.shape[1]; gate.shape[1] == hidden; dtype of gate/up in scout.dequant decodable
+     (FLOAT_DTYPES | gguf_decodable, or an FP8 dtype whose scale companion_scale_name(...) exists among the rows ->
+     roles_by_block gains "gate_scale"/"up_scale"); norm dtype in FLOAT_DTYPES; block_moe False (P1 structure);
+     no rel ending "gate_up_proj.weight". A stack with >= 1 block having gate and up is a GLU stack. The tested stack is
+     the GLU stack with the most eligible blocks (ties: larger depth, then prefix order); it is used only if it has
+     >= MIN_BLOCKS eligible blocks. other_stacks = every other GLU stack: {prefix, depth, reason}, reason =
+     f"no probe basis (width {w} != embedding {hidden})" when its gate input width w != hidden, else "not selected".
+     Untestable reasons, in this priority: weights.quant with dequantizable false -> quant.reason; no GLU stack ->
+     "no GLU MLP (gate_proj/up_proj) stack" (+ " (fused gate_up_proj)" when seen); fewer than MIN_BLOCKS eligible ->
+     f"only {n} testable blocks (< {MIN_BLOCKS})".
+  4. Subject untestable -> plan_attribution raises JobError(f"subject not attributable: {reason}") (no plan, 0 bytes).
+     An untestable reference is kept with status "untestable", no reads, bytes 0.
+  5. Reads per planned model, in order: embed (role "embed", block_index -1), then for each tested block ascending:
+     gate, gate_scale (if any, role "scale"), up, up_scale, norm. Duplicate ranges within a model are impossible
+     (distinct tensors). component = key.component.
+  6. bytes_planned = sum(end - start); largest = max read size; slack = slack_bytes(bytes_planned, largest, chunk_bytes)
+     = max(16 * 2**20, 4 * min(chunk_bytes, largest), ceil(bytes_planned / 256)); bytes_cap = bytes_planned + slack
+     (0 reads -> JobError "nothing to read"); disk_bytes = bytes_planned.
+     memory_peak_bytes = 4 * (4 * G + 4 * P * I + 2 * L_s * m * m * S) + workers * chunk_bytes with G = max gate numel
+     over planned models, P = n_probe, I = max gate rows, L_s = len(subject blocks), m = min(m_test, subject gate rows),
+     S = number of planned references (one probe set each, conservatively).
+  7. plan_id = sha256(json.dumps(["attrib.v1", [[k["repo"], k["revision_sha"], k["component"], [[r.path, r.start,
+     r.end_exclusive] for r in m.reads]] for m in models]], separators=(",", ":")).encode()).hexdigest()[:16].
+     host, scratch_root and disk_free_bytes are display-only (not in plan_id).
+  8. reason = "; ".join(f"block attribution (Zhu et al. matching test): gate/up/norm x {len(blocks)} blocks of {prefix} +
+     embedding {embed} of {title} [{role}]" for planned models).
+  9. format_full_plan exact lines:
+     "FULL DOWNLOAD GATE: block attribution of {subject title}"
+     "  reason: {reason}"
+     "  models: {n} ({n_planned} planned, {n_untestable} untestable)"
+     "  reads: {n_reads} tensors in {n_files} files"
+     "  bytes planned: {bytes_planned:,} B ({gib:.1f} GiB)   hard cap incl. retries: {bytes_cap:,} B (slack {slack:,} B)"
+     "  disk: {disk_bytes:,} B on {host or 'worker'}:{scratch_root or '<scratch root>'} (free {free:,} B | free unknown); deleted after COMPUTE"
+     "  memory peak <= {memory_peak_bytes:,} B"
+     "  threshold: {threshold_bytes:,} B"
+     "  plan_id: {plan_id}"
+     then per model "  model {i} [{role}] {title}: {prefix} x {n} blocks, {bytes:,} B" or
+     "  model {i} [{role}] {title}: untestable: {reason}", each planned model followed by its files
+     "    {path}  {n_reads} reads  {bytes:,} B", then "  other stack: {title}: {prefix} ({reason})" lines.
+     format_full_plan_dict(plan.to_dict()) == format_full_plan(plan).
+  10. full_decision: GateDecision(plan_id, approved, via, bytes_planned, bytes_cap, bytes_confirmed, threshold_bytes,
+      disk_bytes=plan.disk_bytes, memory_peak_bytes, n_reads=len(reads), reason, decided_at=UTC now ISO "Z").
+  11. run_full_gate: the P2 run_gate algorithm (T106 behavior run_gate 1-4) with format_full_plan and full_decision:
+      log.note("gate", text) and display(text) BEFORE any decision on every path; below-threshold iff
+      log.totals["meta"] + log.totals["header"] + bytes_cap <= threshold_bytes; else confirmer None -> declined
+      "no-confirmer"; confirmer result with another plan_id or approved with bytes_confirmed != bytes_cap -> declined;
+      confirmer exception -> declined "error"; add_gate_decision + a decision note. Never grants, never reads.
+  12. spec_confirmer(conf): returns a Confirmer that approves (via "job-spec", bytes_confirmed = conf["bytes_confirmed"])
+      iff conf["approved"] is True, conf["plan_id"] == plan.plan_id and conf["bytes_confirmed"] == plan.bytes_cap;
+      otherwise declines via "job-spec". (A client below-threshold decision carries bytes_confirmed None: the worker's
+      own run_full_gate may still auto-approve below its threshold; otherwise it declines.)
+acceptance:
+  tests:
+    - "fixtures: T313 write_st_repo(BASE), write_st_repo(CONTROL), write_st_repo(derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED)), write_fp8_repo(BASE), write_te_pipeline(TE_BASE); Cards from the P1-P3 scan() over the local folders into a tmp out dir, then load_card. GGUF Cards need T307 (a later wave): the planner sees GGUF only through the T304 adapter, so its GGUF plans are covered by T307/T316/T321 tests"
+    - "test_plan_basic: subject (derived BF16) + base + control -> 3 planned models, blocks 0..15 each, reads per model = 1 + 16*3, every read range equals the Parquet row's absolute range, bytes_planned == sum of Parquet nbytes of those rows; plan_id stable across calls, changes when one reference changes"
+    - "test_slack: slack_bytes(179000967168, 939524096, 2**26) == 699222528; slack_bytes(25956065280, 271581184, 2**26) == 268435456; slack_bytes(10**6, 10**5, 2**26) == 16777216"
+    - "test_plan_fp8_companions: FP8 subject -> reads include role 'scale' for every gate/up with the _scale_inv tensor range"
+    - "test_plan_text_encoder: TE pipeline Card (component text_encoder) -> stack model.language_model.layers tested (12 blocks); other_stacks lists model.visual.blocks with reason 'no probe basis (width 64 != embedding 256)'"
+    - "test_plan_untestable_reference: a reference whose config says quant_method gptq (Card with weights.quant dequantizable false) -> status untestable, reason from quant, 0 reads; subject untestable -> JobError, no plan"
+    - "test_plan_moe_and_fused: blocks with block_moe true are not eligible; a stack with gate_up_proj only -> reason mentions fused gate_up_proj"
+    - "test_format_full_plan: text contains 'FULL DOWNLOAD GATE', exact bytes with thousands separators, 'deleted after COMPUTE', the plan_id, one line per model and per file; dict variant identical"
+    - "test_run_full_gate: below-threshold approves without calling the confirmer; flag_confirmer(plan_id, cap) approves via cli-flag; cap-1, cap+1, 10**15, another plan_id -> declined; display and the gate note happen before the confirmer (spy); decision has disk_bytes == bytes_planned"
+    - "test_spec_confirmer: exact pair approves via job-spec; approved False / wrong id / wrong cap / bytes_confirmed None above threshold -> declined"
+    - "test_grant_ranges: prefixed paths m0:/m1:/m2: and the ranges of reads()"
+  commands:
+    - pytest -q tests/test_fullplan.py
+    - pytest -q
+out_of_scope:
+  - reading bytes (T312), running jobs (T316), the statistic (T314)
+invariants_touched: [1, 2]
+decisions: [D57, D58, D60, D69, D70]

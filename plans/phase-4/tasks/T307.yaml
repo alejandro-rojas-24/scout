@@ -1,0 +1,76 @@
+id: T307
+title: Scan P4 - TARGET#selector (component or GGUF file), GGUF intake (header-only, adapter, synthesized config, header tokenizer/anchors), Card v3 fill (format, quant, content digest, source names), inspect_all for multi-model jobs
+depends_on: [T207, T302, T304, T305, T306, T308]
+files:
+  - scout/scan.py
+  - tests/test_scan_p4.py
+route: opus
+spec_complete: true
+interface: |
+  scout/scan.py (changes to P3 T207; parse_target and make_source signatures unchanged):
+    def split_selector(target: str) -> tuple[str, str | None]
+        # "a/b@rev#text_encoder" -> ("a/b@rev", "text_encoder"); no "#" -> (target, None); empty selector or more than
+        # one "#" -> ValueError
+    def is_file_selector(selector: str | None) -> bool          # selector ends with ".gguf" (case-insensitive)
+    def scan(target, out_dir, log, *, client=None, endpoint=None, token=None, max_workers=8, tokenizer=False,
+             sample=False, confirmer=None, gate_threshold_bytes=DEFAULT_GATE_THRESHOLD_BYTES, gate_display=None,
+             anchors=False) -> ScanResult                         # target may carry "#selector"
+
+    @dataclass(frozen=True)
+    class Inspection:
+        target: str; source: Source; built: list[BuiltCard]      # in-memory Cards (never written)
+        vocab: dict[str | None, VocabIds | None]                 # component -> probe vocabulary (tokenizer.json or GGUF header)
+        tokenizer_file: dict[str | None, str | None]             # component -> file used (or "<gguf>#tokenizer.ggml.tokens")
+    def inspect_all(targets: list[str], log: ByteLog, *, client: httpx.Client | None = None,
+                    endpoint: str | None = None, token: str | None = None, max_workers: int = 8) -> list[Inspection]
+behavior: |
+  1. Selector: scan() calls split_selector first; the base part goes through the unchanged parse_target/make_source.
+     - component selector (not a file selector): the repo must have model_index.json and the component must be listed
+       with weights, else ScoutError(f"component {sel!r} not found (components: ...)"), exit 1, 0 weight bytes; only
+       that unit is scanned (headers, META and Cards of that component only; pipeline info still from model_index).
+     - file selector: exactly the GGUF file(s) chosen by scout.gguf.select_gguf(files, "", selector) form one unit;
+       component = "gguf:" + first part path.
+  2. Weight selection per unit (P1 D10 extended): safetensors per P1 D10 first (GGUF files are ignored when safetensors
+     exist, unless a file selector names a GGUF); else select_gguf(files, subdir, None): one group -> a GGUF unit with
+     component "gguf:" + first part path (or the pipeline component name for a pipeline unit); several ->
+     AmbiguousWeightsError; none -> NoSafetensorsError (message now "no safetensors or GGUF weights").
+  3. GGUF unit, HEADERS stage: g_i = scout.gguf.read_gguf(source, part, size) for each part (sequential; each is
+     already a multi-round safe read); headers = [to_header(g) for g]; source_names merged; structure =
+     scout.structure.analyze(all adapted tensors). META stage: config = ConfigInfo(present=True, path=first part,
+     model_type=raw["model_type"], architectures=[], class_name=None, raw=gguf_config(gs), parse_error=None) (a
+     config.json in the same directory, if present, is NOT read for a GGUF unit); README as P1.
+     tokenizer=True -> stats.tokenizer_minhash = gguf_tokenizer_stat(g_0) (0 extra bytes). anchors=True -> the P3 anchor
+     path with VocabIds = gguf_vocab(g_0) instead of reading tokenizer.json (tokenizer_file = first part + "#tokenizer.ggml.tokens").
+  4. Card v3 fill for every unit: weights_format ("gguf" | "safetensors"); quant = dequant.detect_quant(config.raw,
+     {dtype: n_tensors}, weights_format) (dtype counts from the unit's tensors); content_digest =
+     card.content_digest([f.lfs_sha256 for the unit's weight files]); gguf_files = {path: g.info_block()};
+     source_names (GGUF only). Safetensors units behave as in P3 apart from these fields.
+  5. σ-sample and anchors on GGUF units use the unchanged P2/P3 plan code (T308 makes quant dtypes eligible); the
+     adapter's header_len makes every planned range absolute.
+  6. inspect_all(targets, log): parse every target (split_selector, make_source with log.view(f"m{i}:") as the
+     Source's log), then log.stage(RESOLVE) and resolve all sources; log.stage(HEADERS) and read all headers (safetensors
+     P1 reader or read_gguf); log.stage(META) and read README/config/tokenizer for all units (tokenizer.json bytes via
+     the P2 tokenizer resolution; GGUF from the header). Cards are built in memory with build_card(..., out_dir=<a path
+     that is never written>) and returned as BuiltCard; nothing is written, no SAMPLED_READ, no grant. vocab per unit:
+     anchors.vocab_ids(path, raw) or gguf_vocab. A target that needs a selector (pipeline with several weighted
+     components) -> ScoutError("add #component to <target>").
+  7. The P1/P2/P3 scan tests pass unchanged except for the Card version (already updated by T306).
+acceptance:
+  tests:
+    - "fixtures: T313 write_gguf_repo(derive(BASE)) (Q4_K), a second GGUF file in the same dir (Q8_0) for ambiguity, a split set written by calling write_gguf 3 times with split.no/split.count kvs, write_te_pipeline(TE_BASE), write_st_repo(BASE); FakeHub repos with lfs_sha256=True"
+    - "test_scan_gguf_local: one GGUF file -> 1 Card: key.component 'gguf:model-Q4_K.gguf', weights.format 'gguf', quant.method 'gguf' with types {'Q4_K': n, 'F32': k}, dequantizable True, files[0].gguf.infos_end/data_offset, stack model.layers depth 16, Parquet name canonical and source_name blk.*, totals.weight == 0 and totals.header == infos_end"
+    - "test_scan_gguf_hub: the same repo through FakeHub (relative307 meta redirects) -> 0 weight bytes; every wire range of the .gguf is inside [0, infos_end); content_digest == 'sha256:' + sha256(lfs hash)"
+    - "test_gguf_selector: two GGUF files without selector -> AmbiguousWeightsError naming both, 0 weight bytes; '#model-Q8_0.gguf' scans that one; split set via its first part -> one Card with 3 files"
+    - "test_gguf_tokenizer_and_sample: scan(..., tokenizer=True, sample=True, anchors=True, gate_threshold_bytes large) of the GGUF -> tokenizer_minhash from the header (source_file endswith '#tokenizer.ggml.tokens'), sigma_curves for 32 k/v tensors, anchor_embedding present with normalization 'byte-level'"
+    - "test_component_selector: write_te_pipeline + '#text_encoder' -> exactly 1 Card (component text_encoder); '#nope' -> ScoutError, out dir empty, 0 weight bytes; header bytes only for text_encoder files"
+    - "test_v3_fields_safetensors: write_st_repo via FakeHub with lfs -> content_digest set, files[].lfs_sha256 set, quant None; local -> content_digest None"
+    - "test_fp8_quant_block: write_fp8_repo -> quant.method 'fp8', dequantizable True, block_size [64, 64]"
+    - "test_inspect_all: inspect_all([gguf_dir, st_dir, te_dir + '#text_encoder'], log) -> 3 Inspections with 1 Card each, stage events RESOLVE, HEADERS, META once each in order, header registrations under m0:/m1:/m2:, totals.weight == 0, no file written (tmp dir listing unchanged), vocab present for all three"
+    - "test_inspect_all_needs_selector: a pipeline target without selector -> ScoutError"
+  commands:
+    - pytest -q tests/test_scan_p4.py
+    - pytest -q
+out_of_scope:
+  - the store (T309), plans and jobs (T310-T316)
+invariants_touched: [1, 2, 6]
+decisions: [D63, D64, D66]

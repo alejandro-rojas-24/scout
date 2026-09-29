@@ -1,0 +1,98 @@
+id: T321
+title: P4 exit runner (preflight / plan / run) with script-written ledger, exit/pins_p4.json, pin_exit --phase 4, p3_ledger kinds argument, offline rehearsal with real worker subprocesses (GGUF, FP8, text encoder, crash then sweep)
+depends_on: [T213, T218, T313, T317, T318, T319, T320]
+files:
+  - scripts/exit_check_p4.py
+  - exit/pins_p4.json
+  - scripts/pin_exit.py
+  - scripts/p3_ledger.py
+  - .gitignore
+  - tests/test_exit_check_p4_offline.py
+  - tests/test_pin_exit_p4.py
+  - tests/test_p3_ledger_kinds.py
+  - tests/test_exit_p4_network.py
+  - tests/helpers/crash_worker.py
+route: opus
+spec_complete: true
+interface: |
+  exit/pins_p4.json (committed as): {"Qwen/Qwen-Image": "UNPINNED", "Qwen/Qwen2.5-72B": "UNPINNED",
+    "Qwen/Qwen2.5-VL-7B-Instruct": "UNPINNED", "bartowski/DeepSeek-R1-Distill-Llama-70B-GGUF": "UNPINNED",
+    "meta-llama/Llama-3.1-8B": "UNPINNED", "meta-llama/Llama-3.3-70B-Instruct": "UNPINNED"}     (keys sorted)
+  .gitignore: += "cards/p4-store/"
+  scripts/p3_ledger.py (P3 T218): verify(path, *, kinds: tuple[str, ...] = KINDS), read_ledger(path, *, kinds=KINDS),
+    append(path, kind, payload, *, ts=None, hostname=None, kinds=KINDS); P3 behaviour and P3 tests unchanged.
+  scripts/pin_exit.py: --phase {1,2,3,4}; phase 4 targets = sorted(exit_expectations_p4.P4_REPOS), default pins
+    exit/pins_p4.json, HF_TOKEN required (exit 3 when unset), git auth header via GIT_CONFIG_* env (as phase 2/3).
+  scripts/exit_check_p4.py:
+    P4_KINDS = ("P4_PREFLIGHT", "P4_PLAN", "P4_ATTEMPT", "P4_EXIT")
+    DEFAULT_LEDGER = Path("exit/ledger_p4.jsonl"); DEFAULT_STORE = Path("cards/p4-store")
+    def main(argv: list[str] | None = None, *, backend_factory: Callable[[str], Backend] | None = None,
+             targets: tuple[dict, ...] | None = None, env: Env | None = None,
+             client_factory: Callable[[], httpx.Client] | None = None, endpoint: str | None = None,
+             git_state: Callable[..., dict] | None = None, allow_local_targets: bool = False) -> int
+      # subcommands: preflight | plan | run ; flags: --pins (exit/pins_p4.json) --backend (required: "ssh:HOST"; tests
+      # use backend_factory) --store (cards/p4-store) --ledger (exit/ledger_p4.jsonl); run requires --confirm-plans
+      # ID:CAP,... (P2 parse_confirm_plans; invalid -> argparse exit 2). Keyword arguments are for the offline rehearsal
+      # only; there are no CLI flags for targets, thresholds, env or endpoint.
+  tests/helpers/crash_worker.py: `python -m tests.helpers.crash_worker [worker args]` runs scout.jobs.worker.main with
+    scout.jobs.download.download_plan wrapped so that the process calls os._exit(137) after the first chunk write.
+  tests/test_exit_p4_network.py: @pytest.mark.network; skipped unless SCOUT_P4_CONFIRM_PLANS and SCOUT_SPARK_HOST are set;
+    runs main(["run", "--backend", "ssh:" + host, "--confirm-plans", value]) == 0
+behavior: |
+  1. Common start (all subcommands): foreign HF_ENDPOINT -> exit 1 (P1 message); HF_TOKEN unset -> exit 3 (unless
+     allow_local_targets); pins = json; C0 = check_target_set(pins) (targets override -> the override's repo set) ->
+     FAIL: print table, exit 1, append nothing. ledger problems (p3_ledger.verify(ledger, kinds=P4_KINDS)) -> "LEDGER
+     BROKEN", exit 1. backend = backend_factory(text) or parse_backend(text).
+  2. preflight: hello = worker_hello(backend); audit = worker_audit(backend); client git = git_state(repo_root);
+     rows C1 (disk_needed = 0 at preflight: C1 disk row uses the largest plan disk_bytes of the last P4_PLAN entry if
+     any, else 0), C2 (no code_state), C7a (audit files == 0). Print the table, the hello JSON line; append P4_PREFLIGHT;
+     exit 0 iff all rows ok.
+  3. plan: preflight rows first (not appended separately); for each target row: subject_target = f"{subject}@{pin}#{selector}",
+     refs = [f"{base}@{pin}", f"{control}@{pin}"] (local rehearsal: the override's paths); result = attribute(...,
+     plan_only=True, store=CardStore(store), backend=backend, hello=hello, client=client_factory() if given) -> plan.
+     The CountingTransport of the client (scripts.exit_check.CountingTransport around the client's transport) records
+     the wire; plan-time client totals.weight must be 0 (C4a). Rows C3 per target (models loaded from the store) and
+     C4a. Print each plan (format_full_plan_dict) to stderr, then "CONFIRM WITH: --confirm-plans ID70:CAP,IDTE:CAP"
+     (P4_TARGETS order) and "TOTAL CAP: <sum> B". Append P4_PLAN {plans: {label: {plan_id, bytes_planned, bytes_cap,
+     disk_bytes}}, git_commit, code_dirty}. Exit 0 iff all rows ok.
+  4. run: steps of plan (same plan ids required: they must equal the last P4_PLAN entry's ids, else FAIL "plan changed
+     since P4_PLAN" and exit 1 before any job) -> C2 with code_state = git diff over CODE_PATHS since the P4_PLAN
+     commit. audit_before = worker_audit. Append P4_ATTEMPT {plans, confirm_plans, git_commit, code_dirty,
+     prior_attempts = count of earlier P4_ATTEMPT entries with the same plan ids} BEFORE the first job.
+     For each target in P4_TARGETS order: attribute(..., confirm_plan=id, confirm_bytes=cap from --confirm-plans only
+     when that exact pair is listed (else the call declines: C4 FAIL, continue to the next target), wire_audit=True,
+     display=stderr) -> AttributeResult; audit_after = worker_audit(backend); second = attribute(same args, a fresh
+     client whose CountingTransport counts requests) for C13. Collect the evidence and evaluate C3-C16 with T320's
+     functions (C5 uses JobOutcome.worker_seqs and the client log's totals_by_origin, C6 the result wire and the
+     Cards' header bounds, C7 the live client log events (ingested worker events), C12 the store, C14/C15 by kind).
+     Any exception inside a target -> rows of that target FAIL with the error text; the other target still runs.
+     Append P4_EXIT (plan.md 4.10 payload; always, also after an exception) and print the table, "EXIT CHECK (P4):
+     PASS|FAIL" and {"step": "EXIT", "phase": 4, "ledger_seq": seq, ...payload}. Exit 0 iff every row ok.
+  5. Stdin is never read (C8); every confirmation comes from --confirm-plans.
+  6. Offline rehearsal (tests/test_exit_check_p4_offline.py), targets override = two rows built from T313 fixtures as
+     LOCAL folders ("70b": subject GGUF Q4_K of derive(BASE) with selector "model-Q4_K.gguf", base BASE, control
+     CONTROL, kind gguf; "te": subject write_te_pipeline(derive(TE_BASE)) with selector "text_encoder", base TE_BASE st
+     repo, control CONTROL, kind text_encoder), pins = the local stat-hash keys, backend_factory -> LocalBackend(tmp
+     scratch) (real worker subprocesses), env = Env(machine=platform.machine(), system=platform.system(),
+     min_mem_total_bytes=0, require_clean=False), allow_local_targets=True, git_state = the real git_code_state (so the
+     client and worker commits match), gate threshold: the rehearsal
+     sets attribute's gate_threshold_bytes=0 through the targets override field "gate_threshold_bytes" so exact
+     confirmation is exercised (the real exit uses the default threshold; its plans are far above it anyway).
+acceptance:
+  tests:
+    - "test_rehearsal_pass: preflight -> 0; plan -> 0 and prints CONFIRM WITH; run with the printed pairs -> 0; table C0-C16 all PASS; ledger has P4_PREFLIGHT, P4_PLAN, P4_ATTEMPT, P4_EXIT in order and verifies; store holds the attributed Cards; scratch audit 0 files"
+    - "test_rehearsal_missing_pair: run with only the 70b pair -> te C4 FAIL (declined, no job), 70b rows PASS, exit 1, P4_EXIT passed false"
+    - "test_rehearsal_plan_changed: modify the control fixture after plan (new file) -> run exits 1 'plan changed since P4_PLAN', no P4_ATTEMPT appended"
+    - "test_rehearsal_crash_then_sweep: backend argv_prefix = [sys.executable, '-m', 'tests.helpers.crash_worker'] for the first run -> the job fails, JobOutcome.sweep_after_failure reports 1 orphan removed (the crashed job's dir), C8 FAIL; a second run with the normal worker -> PASS and prior_attempts == 1 in its P4_ATTEMPT"
+    - "test_rehearsal_target_set: pins missing one repo -> exit 1 with C0 FAIL and nothing appended"
+    - "test_rehearsal_ledger_tampered: flip one byte in the ledger -> LEDGER BROKEN exit 1"
+    - "test_p3_ledger_kinds: P3 ledger tests unchanged; verify/append with kinds=P4_KINDS accept P4 entries and reject a P3 kind; default kinds reject P4 kinds"
+    - "test_pin_exit_p4: phase 4 with fake run_cmd (scout resolve and git ls-remote agree) writes 6 pins; disagreement -> non-zero and nothing written; HF_TOKEN unset -> exit 3"
+    - "test_pins_file: exit/pins_p4.json has exactly the 6 repos with 'UNPINNED'"
+  commands:
+    - pytest -q tests/test_exit_check_p4_offline.py tests/test_pin_exit_p4.py tests/test_p3_ledger_kinds.py
+    - pytest -q
+out_of_scope:
+  - running E1-E4 on real hosts (environment; documented in plan.md 2.5)
+invariants_touched: [1, 2, 5]
+decisions: [D71, D72, D73]
