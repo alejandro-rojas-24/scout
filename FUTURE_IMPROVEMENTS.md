@@ -54,7 +54,16 @@ This file collects non-blocking review findings per phase for a later wave.
 
 ## Phase 4
 
-_pending planning_
+- **C11 false FAIL under a depth-spiked null** (T314, plan §2.4/§11.2). The paired margin keeps family-wise error at or below 5e-5. The cost: when one real block is spiked, a correct build still fails C11 with probability 0.24–0.75 at μ=4–5, and at least 0.87 at μ≥6. These failures are abstentions, not false attributions. If the real run hits one, try a per-block control veto or a depth-local null model. Source: r2 major 1, residual.
+- **Shift guard can veto the base falsely** (T314). It was never measured at 80 blocks with neurons shared across layers. Consider a relative or per-block guard. Source: r2-m1.
+- **Per-block control veto** (T314). Replace the global veto. This changes nothing for the exit while C11 requires 0 hits. Source: planner r2 deferral.
+- **C9 throughput margin** (plan §2.5). The implied minimum is about 9.5 MB/s. Measure it at E2. Source: r2-m6.
+- **Download only aligned reference blocks** (T310/T312). This would save about 1.7 GB of reads, including the te control's 32 vs 28 blocks. Source: r1/r2.
+- **Heartbeat BrokenPipe does not abort COMPUTE** (T316). The stated bound is about 45 minutes. Source: r1 deferral.
+- **Sweep cron not verified by C1** (T311). Source: r1 deferral.
+- **No partially re-initialised subject in the rehearsal** (T321). The live exit likely uses a byte-identical text encoder, so block localisation is never tested live. Source: r1 deferral.
+- **Store surface** (T309/T318). The by-weights index, `reindex` and the stored-Card UI list are kept as accepted scope. Revisit if unused. Source: r1/r2.
+- **Assumption A9 and the P3 hard negatives** (later.md). Measure the null on real P3 hard negatives to support the depth-matched null assumption. Source: planner r1.
 
 ## Phase 5
 

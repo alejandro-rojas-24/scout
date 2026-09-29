@@ -41,10 +41,15 @@ interface: |
                      env: dict[str, str] | None = None) -> None
         # argv = (argv_prefix or [sys.executable, "-m", "scout.jobs.worker"]) + args + (["--scratch-root", str(root)] if root)
     class SshBackend:
-        def __init__(self, host: str, *, remote_cmd: list[str] | None = None, ssh: str = "ssh",
+        DEFAULT_REMOTE_CMD = "python3 -m scout.jobs.worker"
+        def __init__(self, host: str, *, remote_cmd: str | None = None, ssh: str = "ssh",
                      popen: Callable[..., subprocess.Popen] = subprocess.Popen) -> None
+        # prefix = remote_cmd if remote_cmd is not None else os.environ.get("SCOUT_SPARK_CMD") or DEFAULT_REMOTE_CMD
+        #   (a SHELL FRAGMENT used verbatim, e.g. "cd /srv/scout && /srv/venv/bin/python -m scout.jobs.worker";
+        #    validation r2 minor: the remote entry is the worker module, the same one LocalBackend and the offline
+        #    rehearsal run, so no CLI argument forwarding is involved)
         # argv = [ssh, "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4", host,
-        #         shlex.join((remote_cmd or shlex.split(os.environ.get("SCOUT_SPARK_CMD", "scout jobs worker"))) + args)]
+        #         prefix + ("" if not args else " " + shlex.join(args))]
     class InProcessBackend:
         def __init__(self, scratch_root: pathlib.Path, *, client_factory: Callable[[], httpx.Client] | None = None,
                      endpoint: str | None = None, token: str | None = None) -> None
@@ -122,7 +127,7 @@ acceptance:
     - "test_idle_timeout: scenario 'silent' with idle_timeout_s=0.5 -> failed 'idle timeout', process killed, worker_sweep called (fake records the call)"
     - "test_no_bye_and_malformed: scenarios -> failed with BackendError text; sweep_after_failure present"
     - "test_digest_mismatch: fake hello with another params_digest -> failed 'worker code differs', no event ingested"
-    - "test_ssh_argv: SshBackend('spark', popen=spy).open(['hello'], None) -> argv == ['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4', 'spark', 'scout jobs worker hello']; SCOUT_SPARK_CMD='/opt/venv/bin/python -m scout.jobs.worker' changes the remote command"
+    - "test_ssh_argv: SCOUT_SPARK_CMD unset: SshBackend('spark', popen=spy).open(['hello'], None) -> argv == ['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4', 'spark', 'python3 -m scout.jobs.worker hello']; open([], stdin) -> last element 'python3 -m scout.jobs.worker'; open(['sweep', '--json']) -> '... sweep --json'; SCOUT_SPARK_CMD='cd /srv/my scout && /srv/venv/bin/python -m scout.jobs.worker' with open(['audit', '--json']) -> last element == 'cd /srv/my scout && /srv/venv/bin/python -m scout.jobs.worker audit --json' (prefix verbatim); an arg with a space, open(['--scratch-root', '/a b']) -> suffix \"--scratch-root '/a b'\" (shlex.join)"
     - "test_parse_backend: 'local' -> LocalBackend; 'ssh:spark' -> SshBackend host spark; 'ftp:x' -> ValueError"
   commands:
     - pytest -q tests/test_jobs_transport.py

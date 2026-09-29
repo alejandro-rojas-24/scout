@@ -1,5 +1,5 @@
 id: T314
-title: Block attribution statistic (Zhu et al. matching test, weights-only) - ATTRIB_PARAMS, probe selection, embedding-probe responses, rectangular LAP matching, Spearman of gate/up matchings, control-calibrated depth-matched null (Student-t prediction, control leave-one-out, shift guard), Bonferroni, attribution.v1; scipy dependency
+title: Block attribution statistic (Zhu et al. matching test, weights-only) - ATTRIB_PARAMS, probe selection, embedding-probe responses, rectangular LAP matching, Spearman of gate/up matchings, control-calibrated depth-matched null (Student-t prediction, per-depth paired control margin, control leave-one-out, shift guard), Bonferroni, attribution.v1; scipy dependency
 depends_on: [T203, T205, T209, T305, T310, T313]
 files:
   - scout/attrib.py
@@ -35,6 +35,18 @@ interface: |
         # plan.md 3.8 step 6: {"n_shift", "shift_mean", "shift_sd", "shift_max", "n_control", "control_mean",
         #  "control_sd", "mu0", "s0", "kappa", "df", "guard"}; control_zs has >= 3 values
     def adjusted(z: float, null: dict) -> tuple[float, float]      # (z_adj, p) = ((z - mu0) / kappa, t.sf(z_adj, df))
+    def paired_margin(z: float, z_control: float, null: dict) -> float
+        # r2 (validation r2 major 1): (z - z_control) / (null["s0"] * sqrt(2))
+    def decide(cand_z: Sequence[Sequence[float | None]], cand_shift: Sequence[Sequence[float]],
+               ctrl_z: Sequence[Sequence[float | None]], ctrl_shift: Sequence[Sequence[float]], n_tests: int) -> dict
+        # the whole decision of behavior 9c as a pure function of z values (no weights, no plan):
+        # cand_z[r][i] / ctrl_z[c][i] = k = 0 z of candidate r / control c at subject position i (None = not tested there);
+        # cand_shift[r] / ctrl_shift[c] = that reference's shift z values. Returns
+        # {"control_ok": bool, "pooled": [float],
+        #  "candidates": [{"null": dict, "crit": float, "null_ok": bool,
+        #                  "tests": [None | {"z_adj", "p", "z_pair", "pooled_hit", "attributed_raw", "attributed"}]}],
+        #  "controls": [{"null": dict, "crit": float, "tests": [None | {"z_adj", "p", "fired"}]}],
+        #  "fired": [(c, i)]}
     def attribute(plan: "FullPlan", models: dict[int, "LoadedModel"], vocabs: dict[int, VocabIds | None],
                   provider: TensorProvider, *, computed_at: str | None = None) -> dict   # attribution.v1, "job": None
 behavior: |
@@ -59,6 +71,19 @@ behavior: |
      guard = (shift_max - max(0.0, control_mean)) / (max(1.0, control_sd) * sqrt(1 + 1 / n_control)) (the shift
      maximum measured against the CONTROL null alone, so a copy at another depth cannot hide by inflating the shift sd).
      adjusted(z, null) = (z_adj, p) with z_adj = (z - mu0) / kappa and p = scipy.stats.t.sf(z_adj, df).
+     paired_margin(z, zc, null) = (z - zc) / (null["s0"] * sqrt(2)).
+  8b. decide(cand_z, cand_shift, ctrl_z, ctrl_shift, n_tests) (plan.md 3.8 steps 6-7, r2):
+     - C = every non-None ctrl_z[c][i], in (c, i) order; len(C) < 3 -> ValueError (attribute() handles "no tested
+       control" before calling decide, behavior 9c).
+     - Control c, position i with ctrl_z[c][i] not None: null_i = null_summary(ctrl_shift[c], C without that one value);
+       crit_c = t_critical(n_tests, len(C) - 2); (z_adj, p) = adjusted(z, null_i); fired = z_adj >= crit_c. The
+       control's "null" is null_summary(ctrl_shift[c], C). control_ok = no fired test; "fired" lists (c, i).
+     - Candidate r: null = null_summary(cand_shift[r], C); crit = t_critical(n_tests, null["df"]); null_ok =
+       null["guard"] < crit. For each position i with z = cand_z[r][i] not None: zc = max(ctrl_z[c][i] for controls
+       with a value at i), or max(C) when no control has one; (z_adj, p) = adjusted(z, null); z_pair =
+       paired_margin(z, zc, null); pooled_hit = z_adj >= crit; attributed_raw = pooled_hit and z_pair >= crit;
+       attributed = attributed_raw and control_ok and null_ok.
+     - Pure: no randomness, no I/O; floats are returned unrounded (attribute() rounds).
   9. attribute(plan, models, vocabs, provider):
      a. s = plan.models[0] (subject; must be "planned"). plan.models[1:] are candidates (role "reference") and controls
         (role "control"; T310). Every model in plan.models[1:] is processed alike in this step. For each such model r:
@@ -87,25 +112,24 @@ behavior: |
           are "untestable" and contribute nothing). |C| < min_blocks (no tested control) -> every candidate and control
           gets status "abstain", reason "no tested independent control: the null is not calibrated"; nothing is
           attributed (the p/z_adj fields stay None). Stop here.
-        - Candidate r: null = null_summary(r's shift z's, C); crit = t_critical(n_tests, null.df).
-        - Control c, block position i: null_i = null_summary(c's shift z's, C without (c, i)) (leave-one-out,
-          df = |C| - 2); crit_i = t_critical(n_tests, |C| - 2). The control's reference-level `null` records the
-          full-pool summary; its tests use their own leave-one-out values.
-        - Per test: (z_adj, p) = adjusted(z, null); attributed_raw = z_adj >= crit.
-        - control_ok = no control test is attributed_raw. Not control_ok -> every candidate and every control gets
+        - d = decide(cand_z, cand_shift, ctrl_z, ctrl_shift, n_tests) over the tested candidates and controls (z
+          values indexed by subject stack position; None where that reference has no test). Every number below comes
+          from d: candidate null/crit/null_ok and per-test z_adj, p, z_pair, attributed; control null (full pool),
+          crit (df |C| - 2) and per-test leave-one-out z_adj, p.
+        - control_ok = d["control_ok"]. Not control_ok -> every candidate and every control gets
           status "abstain", reason f"independent control {title} attributed at block {index}: the in-run null is not
           homogeneous"; nothing is attributed.
         - Candidate null_ok = null.guard < crit; not null_ok -> that candidate "abstain", reason "shift null exceeds
           the control-calibrated critical value (a block matches a reference block at another depth)"; nothing of it
           is attributed.
-        - Otherwise attributed = attributed_raw (candidates only; a control is never a block's primary and its tests
-          report attributed False with z_adj/p filled, so C11 reads n_attributed of the control as the count of
-          attributed_raw control tests, which is 0 whenever control_ok).
+        - Otherwise attributed = d's attributed (candidates only: z_adj >= crit AND z_pair >= crit; r2). A control is
+          never a block's primary; its tests report attributed False with z_adj/p filled and z_pair None, so C11 reads
+          n_attributed of the control as the count of fired control tests, which is 0 whenever control_ok.
         - Per reference: status "tested" | "abstain" | "untestable"; role; n_tested = len(T); n_attributed;
           median_z_adj (None if no tests); crit; df.
         - Top level: null_model = "control-calibrated", control_ok, alpha, n_tests.
      d. Blocks: one entry per subject stack position i (index = s.indices[i], position = i) with one test per reference
-        (tested: reference_block = ref.indices[a[i]], m, rho, z, z_adj, p, crit, agree_frac, attributed, reason None; otherwise
+        (tested: reference_block = ref.indices[a[i]], m, rho, z, z_adj, p, crit, agree_frac, z_pair (None for a control), attributed, reason None; otherwise
         the numeric fields None, attributed False, reason = why: reference status reason, "block not testable in
         subject", or "aligned reference block not testable"). status "attributed" if any candidate test attributed (primary = the candidate
         reference with the largest z_adj, ties -> lower index); "not_attributed" if any test was computed; else
@@ -136,11 +160,15 @@ acceptance:
     - "test_inflated_null_adjusted: INFLATED (s=1.0, a=2.0, gamma=0.9) families for NULL_TRIPLES: the paper's parametric rule (z >= NormalDist().inv_cdf(1 - 0.01/n_tests), computed from the returned raw z values) attributes in >= 4 of 6 triples (measured 6 of 6); the returned attributions total <= 1 (measured 0, max z_adj 2.43 vs crit 4.305)"
     - "test_depth_local_null (validation r1 major 1; m = 1024): for each (p, q, c) in DEPTH_LOCAL_TRIPLES: GluSpec(seed=x, depth_dict=DEPTH_LOCAL, **DEPTH_LOCAL_DIMS) for subject p, reference q, control c (12 blocks, inter 1024, so m = 1024) -> total attributed candidate blocks over the 4 triples <= 1 and control tests with z_adj >= crit <= 1 (planner measurement with the validator's generator at the same dimensions: 0 and 0 over 48 + 48 blocks, max z_adj 1.96 vs crit 4.548; the r0 shift-only rule gave max 2.95 here and 1 false attribution in 24 blocks at m = 2048, plan.md 3.8). Also, for the first triple only: subject = derive of its reference with eps=1.0 -> 12/12 attributed (measured median z_adj 20.6-27.7 over 4 triples). No skip or slow marker: it runs in the default `pytest -q` (planner estimate 3-5 min on 4 cores; the null that guards the exit must not be skippable)"
     - "test_no_control_abstains: the only control is write_st_repo(CONTROL) with config quantization_config {quant_method: gptq} (untestable in the plan, as in T310 test_plan_untestable_reference) -> every candidate and the control have status abstain (candidates) / untestable (control); candidates' reason 'no tested independent control: the null is not calibrated'; 0 attributed"
-    - "test_control_heterogeneity_abstains: control = glu_weights(GluSpec(seed=77)) with layer 5's gate/up/down/post_attention_layernorm replaced by the subject's layer 5 (subject = derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED)) -> that control test has z_adj >= crit (leave-one-out), control_ok False, every candidate and control abstains with the reason naming the control title and block 5; 0 attributed"
+    - "test_control_heterogeneity_abstains: control = glu_weights(GluSpec(seed=77)) with model.embed_tokens.weight AND layer 5's gate/up/down/post_attention_layernorm replaced by the subject's (subject = derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED)); the embedding is spliced too so the control's probe inputs live in the subject's hidden basis (r2 review: a spliced block read through the control's own, unrelated embedding basis carries no response signal) -> that control test has z_adj >= crit (leave-one-out), control_ok False, every candidate and control abstains with the reason naming the control title and block 5; 0 attributed"
+    - "test_paired_margin_values: null_summary([0.0, 1.0, 2.0], [1.0, 1.0, 4.0]) (s0 sqrt(3)) -> paired_margin(6.0, 1.0, null) == 5 / (sqrt(3) * sqrt(2)) within 1e-12; decide on hand-built arrays (1 candidate, 1 control, 30 positions, n_tests 60, 60 shift values 0.0 per reference): candidate z 9.0 at position 0 where the control z is 8.5, control z 0.0 elsewhere, candidate z 0.0 elsewhere -> crit 4.067, the candidate test at 0 has z_adj 5.526 (pooled_hit True) and z_pair 0.228, attributed_raw False; the control test at 0 has leave-one-out z_adj 8.357 >= 4.086 (fired), control_ok False; with the control z at 0 set to 0.0 instead -> z_adj 8.854, z_pair 6.364, attributed True (values within 1e-3; planner-computed)"
+    - "test_decide_depth_spike_mc (validation r2 major 1; pure function, no weights): numpy.random.default_rng(20260929); 2000 simulated jobs with L = 28 positions, n_tests = 56, one candidate and one control whose aligned z are independent N(mu_i, 1) with mu_0 = 4.0 and mu_i = 0.0 otherwise (the SAME profile for both), shift z N(0, 1) with 2L values each -> jobs with any attributed test <= 10 (planner measurement /tmp/p4r2/fwer2.py: 0 in 20,000), and jobs with any pooled_hit test while control_ok and null_ok >= 100 (measured rate 0.107, i.e. about 214; this shows the paired clause, not the control veto, is what prevents the false attributions)"
+    - "test_depth_spike_fixture (validation r2 major 1; weights): for each (p, q, c) in DEPTH_LOCAL_TRIPLES, each of the three models x is glu_weights(GluSpec(seed=x, depth_dict=DEPTH_LOCAL, **DEPTH_LOCAL_DIMS), attrib_vocab(x)) with layer 0's gate/up/down/post_attention_layernorm replaced by those of glu_weights(GluSpec(seed=x, depth_dict=DEPTH_LOCAL, **{**DEPTH_LOCAL_DIMS, 'a': 2 * DEPTH_LOCAL_DIMS['a']}), attrib_vocab(x)) (the same rng stream, so the same basis and neurons; only the shared-feature weight doubles at block 0: a one-depth spike of the null); subject p, references [q], controls [c] -> over the 4 triples, candidate tests with z_adj >= crit AND z_pair >= crit (i.e. attributed before the control veto) <= 1, and attributed blocks <= 1. The block-0 z values of candidate and control are printed (pytest -s shows them); the planner did not measure this fixture, so no magnitude is asserted. No skip marker (planner estimate +3-5 min, like test_depth_local_null)"
     - "test_shifted_copy_abstains: subject = derive(BASE, eps=0.0, seed=9, shift_blocks=1, permute_neurons=False), references [BASE], controls [CONTROL] -> null.guard >= crit (measured: shift max 22.6 against a control null near 0; the r0 guard (max - mu0)/s0 = 0.97 would NOT have fired, validation r1 finding), null_ok False, status abstain, 0 attributed, reason text as specified"
     - "test_quantised_subject: subject weights = T303 encode/dequant round trip of derive(BASE) in Q4_K for gate/up/embedding (provider returns the dequantised arrays) -> 16/16 attributed, z within 0.5 of the unquantised run"
     - "test_untestable_paths: reference with no vocab -> untestable; reference with only 300 common tokens -> untestable with the count; model untestable in the plan -> untestable; block statuses and reasons as specified; validate_attribution(result) == []"
     - "test_other_stacks_te: TE pipeline subject vs TE_BASE-derived reference (write_te_pipeline with derive(TE_BASE)) -> 12/12 attributed, other_stacks has the vision stack"
+    - "test_attributed_tests_carry_z_pair: in test_derived_all_attributed's result every attributed test has z_pair >= crit and every control test has z_pair None; median z_pair of the base >= 10 (expected about 0.7 x median z_adj)"
     - "test_bonferroni: n_tests equals the number of k=0 tests of every candidate and control that reached testing, INCLUDING a candidate that then abstains (run with a second candidate = the shifted-copy subject's reference setup so it abstains; its 16 tests still count); crit == scipy.stats.t.isf(0.01 / n_tests, n_control - 1) for candidates and t.isf(0.01 / n_tests, n_control - 2) for control tests; a block with z_adj just below crit (monkeypatched provider scaling) is not attributed"
     - "test_null_summary_values: null_summary([0.0, 1.0, 2.0], [1.0, 1.0, 4.0]) -> shift_mean 1.0, shift_sd 1.0, control_mean 2.0, control_sd sqrt(3), mu0 2.0, s0 sqrt(3), kappa sqrt(3) * sqrt(4/3) = 2.0, df 2, guard (2.0 - 2.0) / (sqrt(3) * sqrt(4/3)) = 0.0; adjusted(6.0, null) -> (2.0, t.sf(2.0, 2))"
     - "test_no_forbidden_imports: importing scout.view and scout.card in a subprocess does not load scout.attrib"
@@ -152,4 +180,4 @@ out_of_scope:
   - reading bytes, scratch and jobs (T312, T316); window search over reference blocks and MoE experts (later.md)
   - the paper's forward-pass activations (later.md)
 invariants_touched: [4, 5]
-decisions: [D68, D69, D70, D75, D76]
+decisions: [D68, D69, D70, D75, D76, D79]

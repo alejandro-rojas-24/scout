@@ -11,7 +11,7 @@ This directory holds the plan-only output of the orchestrator wave (see
 | 1 | `plan/phase-1-architecture-view` | PLANNED (3 revise rounds, approved under directive) |
 | 2 | `plan/phase-2-diff-view` | PLANNED (2 revise rounds, approved under directive) |
 | 3 | `plan/phase-3-analysis-backend` | PLANNED (2 revise rounds, approved under directive; D36 needs human ack) |
-| 4 | `plan/phase-4-infra-attribution` | planning |
+| 4 | `plan/phase-4-infra-attribution` | PLANNED (2 revise rounds, approved under directive) |
 | 5 | `plan/phase-5-product-refinement` | pending |
 
 Use the last branch in the table as the implementation base.

@@ -30,8 +30,9 @@ behavior: |
   2. Pinning: spec targets are built from the Cards: Hub -> f"{repo}@{revision_sha}" + ("#" + selector if any);
      local -> the absolute folder path (+ selector). A Hub target given without a 40-hex rev is resolved by the scan
      and pinned from its Card.
-  3. Attribution cache: hit = store.find_attribution(subject_key, [reference keys] + [control keys]) (the stored
-     attribution lists controls among its references with role "control", so the key set covers both) -> return AttributeResult(cached=True,
+  3. Attribution cache: hit = store.find_attribution(subject_key, [reference keys], [control keys]) (T309: role-aware;
+     the stored attribution lists controls among its references with role "control", and the key includes each role,
+     so swapping a reference and a control misses; validation r2 minor) -> return AttributeResult(cached=True,
      entry=hit, card=loaded card, text=format_attribution(card)); no plan, no job, no network beyond step 1 (which is
      itself 0 requests when the Cards are cached).
   4. Plan: loaded = [fullplan.LoadedModel(*store.load(e), target) ...]; host info from `hello` (or backend hello when
@@ -43,7 +44,9 @@ behavior: |
   6. d = run_full_gate(plan, log, flag_confirmer(confirm_plan, confirm_bytes), display=display) (the plan is displayed
      before the decision on every path). Not approved -> display("NOT CONFIRMED. " + confirm_line(plan.to_dict())) and
      raise GateDeclined(message, plan=plan.to_dict()) - no job is submitted.
-  7. spec = make_spec(plan=plan, decision=d, subject_target=..., reference_targets=..., endpoint=endpoint or
+  7. spec = make_spec(plan=plan, decision=d, subject_target=<pinned subject target>, reference_targets=[pinned
+     reference targets, in plan order], control_targets=[pinned control targets, in plan order] (T315 requires it;
+     validation r2 minor), endpoint=endpoint or
      DEFAULT_ENDPOINT, scratch_root=hello["scratch_root"], wire_audit=wire_audit, client_hostname=socket.gethostname(),
      git_commit=git_commit). outcome = run_job_via(backend, spec, log, display=display).
      Failed -> display the error, the sweep report, log.totals_by_origin() and the JobRecord (bytes by class, disk
@@ -75,6 +78,8 @@ acceptance:
     - "test_decline_no_job: wrong confirm bytes -> GateDeclined, the plan displayed first (spy order), backend.open never called"
     - "test_attribute_end_to_end_local_backend: exact confirmation, gate_threshold_bytes=0 -> AttributeResult with card.v3 subject Card, stats.attribution BASE 16/16 and CONTROL 0/16, fetch_log.jobs has 1 record with status succeeded, fetch_log events include origin-tagged worker events, stored in the store (find_attribution hits), scratch audit 0 files"
     - "test_second_call_cached: the same call again -> cached True, backend.open not called, 0 new FakeHub/Local reads"
+    - "test_cache_roles_swapped: after the end-to-end run, attribute(subject, references=[CONTROL], controls=[BASE], plan_only=True) -> cached False (the role-aware key misses), a plan is displayed whose plan_id differs from the first run's"
+    - "test_spec_has_controls: the spec passed to run_job_via (spy) has controls == [the pinned CONTROL target] and validate_spec(spec) == []"
     - "test_te_selector: subject te_dir + '#text_encoder' vs the TE reference -> 12/12, other_stacks listed; format_attribution contains 'no probe basis'"
     - "test_failed_job_reports_sweep: InProcessBackend with scout.jobs.download.download_plan monkeypatched to raise NetworkError after the first chunk -> JobError (exit 7) whose message has the worker's weight bytes (> 0); display shows the worker error, the sweep report and the totals by origin; no new store entry; scratch audit 0 files"
     - "test_text_disclaimers: format_attribution output contains the 3 DISCLAIMERS and ATTRIBUTION_CAVEAT verbatim"

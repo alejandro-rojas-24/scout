@@ -1,6 +1,8 @@
 # Phase 4 plan: Infrastructure + block attribution
 
-Status: DRAFT r1 (planner), 2026-09-29. Revised after validation round 1 (0 blockers, 6 majors, 14 minors; §11).
+Status: PLANNED — approved by orchestrator under human directive (review disabled), 2026-09-29.
+Revision r2 (planner): revised after validation round 1 (0 blockers, 6 majors, 14 minors) and round 2 (0 blockers,
+3 majors, 9 minors); §11.
 
 This plan builds on the Phase 1–3 plans (`plans/phase-{1,2,3}/plan.md`, tasks T001–T218) and treats them as contracts:
 Card v2 and its stats, the ByteLog and the P2 download gate (plan_id + exact cap), the frozen `SIGMA_PARAMS`,
@@ -14,27 +16,42 @@ confirmed through the P2 gate with bytes, disk and reason shown, streams its byt
 every weight byte from disk as soon as COMPUTE ends, with a sweeper that removes the scratch files of crashed jobs.
 Cards live in a content-addressed store that skips rescans. GGUF and FP8 inputs are read header-only and dequantised
 before any comparison. Each block of the subject's depth strip is then attributed to a base model by the Zhu et al.
-neuron-matching test, with a p-value calibrated against an independent control model at the same depths and a
-family-wise error bound that holds under a stated assumption about that control (§3.8).
+neuron-matching test, with a p-value calibrated against an independent control model at the same depths, a per-depth
+paired margin against that control, and a family-wise error bound that holds under a stated assumption about that
+control (§3.8).
 
 ## 2. Exit check (runnable, falsifiable)
 
 ### 2.1 Targets, references, pins (fixed)
 
-The exit has exactly two attribution targets. Each has one documented base and one independent control reference.
-They are frozen in `scripts/exit_expectations_p4.py::P4_TARGETS` (T320):
+The exit has exactly two attribution targets. Each has one documented base and one independent control reference;
+the te job also carries one independent candidate (below). They are frozen in
+`scripts/exit_expectations_p4.py::P4_TARGETS` (T320):
 
 | label | subject (target, selector) | base (derived-from, documented) | control (independent) |
 |---|---|---|---|
 | `70b` | `bartowski/DeepSeek-R1-Distill-Llama-70B-GGUF` `#DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf` (**V**: file name, single file) | `meta-llama/Llama-3.3-70B-Instruct` (gated). DeepSeek-R1 paper, arXiv 2501.12948: the 70B distilled model was fine-tuned from Llama-3.3-70B-Instruct. The GGUF is a llama.cpp Q4_K_M quantisation of `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` (the model card text states this, **V**) | `Qwen/Qwen2.5-72B`. Qwen2.5 technical report, arXiv 2412.15115, pretrained from scratch; same hidden size 8192 and depth 80 as the subject, and a different intermediate size (29568 vs 28672) |
 | `te` | `Qwen/Qwen-Image` `#text_encoder` (diffusers; `Qwen2_5_VLForConditionalGeneration`; **V**: which tokenizer file `tokenizer/` ships, `tokenizer.json` or `vocab.json` + `merges.txt`; C15 accepts either and is evaluated at E3) | `Qwen/Qwen2.5-VL-7B-Instruct`. Qwen-Image technical report, arXiv 2508.02324: Qwen2.5-VL is the frozen condition encoder (**V**: quote) | `meta-llama/Llama-3.1-8B` (gated). Llama 3 herd paper, arXiv 2407.21783, pretrained from scratch |
 
-- **Pins.** `exit/pins_p4.json` holds the 6 repos (subjects, bases, controls), committed as `"UNPINNED"`. It is written
+- **Independent candidate (te job only; validation r2 major 2).** `allenai/OLMo-2-1124-7B` (ungated, Apache-2.0).
+  OLMo 2 report, arXiv 2501.00656: pretrained from scratch by AI2 on its own data (OLMo-mix-1124). It enters the te job
+  as a second candidate (role `reference`, **not** `control`), so it is tested by exactly the rule that attributes the
+  base, and C10b requires 0 attributed blocks. It is the exit's specificity leg on real weights: the only live check
+  that an unrelated model is not attributed. Shape (**V** at E3): 32 blocks, hidden 4096 (= its embedding width),
+  intermediate 11008, vocab 100352, BF16 (**V**; F32 would double its bytes, and the E3 plan is exact either way). Its
+  blocks use post-sublayer norms (`post_attention_layernorm`, `post_feedforward_layernorm`), so the frozen norm role
+  matches `post_attention_layernorm`, which in OLMo 2 scales the attention output rather than the MLP input. That changes
+  only its probe scaling; independence, and therefore the null, is unaffected. Alignment to the 28-block subject is
+  reldepth (32 vs 28), like the te control. The 70b job has no independent candidate: a second 70B-class candidate would
+  add about 77 GB, and the te leg tests the same rule.
+- **Pins.** `exit/pins_p4.json` holds the 7 repos (subjects, bases, controls, the te independent candidate), committed
+  as `"UNPINNED"`. It is written
   by `scripts/pin_exit.py --phase 4`, which cross-checks `scout resolve` against `git ls-remote` and passes HF_TOKEN to
   git through `GIT_CONFIG_*` env (P2 D29).
-- **C0 target set.** The run FAILs before any request unless `set(pins) == P4_REPOS`, the 6 repos of the table.
+- **C0 target set.** The run FAILs before any request unless `set(pins) == P4_REPOS`, the 7 repos above.
   There is no fallback repo or file. Replacing a subject, a selector, a base or a control is a logged human decision
-  followed by a plan revision, made before the `P4_PLAN` ledger entry (§2.2 E3).
+  followed by a plan revision, made before the `P4_PLAN` ledger entry (§2.2 E3). The same holds for the independent
+  candidate.
 - **Fixed endpoint.** The endpoint is always `https://huggingface.co` on both the client and the worker. A foreign
   `HF_ENDPOINT` makes the run exit 1.
 - **Evidence line.** Every E-step prints one JSON line. PIN, PREFLIGHT, PLAN and EXIT must share the client
@@ -43,8 +60,8 @@ They are frozen in `scripts/exit_expectations_p4.py::P4_TARGETS` (T320):
   with a `kinds` argument by T321), with the kinds `P4_PREFLIGHT`, `P4_PLAN`, `P4_ATTEMPT` and `P4_EXIT`. Only
   `scripts/exit_check_p4.py` appends to it. `P4_ATTEMPT` is appended **before** the first job is submitted, and
   `P4_EXIT` afterwards, also when the run raises. Every rerun is therefore visible. Reruns are allowed, because the
-  statistic is deterministic at fixed pins and code (§2.5), but the EXIT evidence lists the number of earlier attempts
-  with the same plan ids.
+  statistic is reproducible at fixed pins and code up to float nondeterminism (§2.4), but the EXIT evidence lists the
+  number of earlier attempts with the same plan ids.
 - **Frozen before any real run.** The following are fixed by this plan and asserted literally by tests and by C2:
   - `ATTRIB_PARAMS`, `QUANT_PARAMS`, `GGUF_PARAMS`, `JOB_PARAMS`, `STORE_PARAMS` (§4.9)
   - the thresholds in §2.4 and the target table above
@@ -59,6 +76,10 @@ They are frozen in `scripts/exit_expectations_p4.py::P4_TARGETS` (T320):
   that has accepted the Llama 3.1 and Llama 3.3 licences. The worker reads `HF_TOKEN` from its environment, or else
   from `~/.cache/huggingface/token`. The token is never placed in a job spec.
 - The client needs ssh access to the Spark: key-based, `BatchMode=yes`, and the host name in `SCOUT_SPARK_HOST`.
+- The client sets `SCOUT_SPARK_CMD="cd <spark checkout> && <venv>/bin/python -m scout.jobs.worker"` (validation r2
+  minors): the `cd` puts the checkout root on `sys.path` (`python -m` adds the working directory), so `import
+  scripts.exit_check` works for `wire_audit_available` even with a PEP 660 editable install, and the worker runs the
+  checkout whose `code_id` C1 compares. The value is a shell prefix used verbatim (T315).
 - Scripts exit 3 before any request when a required credential is missing.
 - These are environment limits only. The offline suite needs neither the token nor the Spark.
 
@@ -79,11 +100,13 @@ pytest -q                                   # expect exit 0, 0 failures; network
 
 # E1 pins (client host, HF_TOKEN with the Llama 3.1 and 3.3 licences accepted)
 python scripts/pin_exit.py --phase 4 --pins exit/pins_p4.json
-# expect exit 0; last line {"step":"PIN","phase":4,"hostname":...,"repos":{6 entries}}
+# expect exit 0; last line {"step":"PIN","phase":4,"hostname":...,"repos":{7 entries}}
 
 # E2 Spark preflight (0 weight bytes; ssh to the Spark)
 python scripts/exit_check_p4.py preflight --pins exit/pins_p4.json --backend "ssh:$SCOUT_SPARK_HOST"
 # expect exit 0; rows C0, C1, C2 and C7a PASS; ledger gains P4_PREFLIGHT; the JSON line has the worker's hello
+# (at E2 no plan exists yet: C1's disk clause checks only disk_free_bytes >= the 50 GiB reserve; the full clause,
+#  max(disk_bytes) + reserve, is evaluated at E3 and E4)
 # (machine, mem_total_bytes, disk_free_bytes, scratch_root, git_commit, code_id, code_trees, git_dirty,
 #  wire_audit_available, python, numpy/scipy versions, has_hf_token)
 # Setup, not intervention: the Spark checkout must be at a commit whose CODE_PATHS trees equal the client's (C1 compares
@@ -93,11 +116,12 @@ python scripts/exit_check_p4.py preflight --pins exit/pins_p4.json --backend "ss
 python scripts/exit_check_p4.py plan --pins exit/pins_p4.json --backend "ssh:$SCOUT_SPARK_HOST" --store cards/p4-store
 # expect exit 0; 2 plans (format_full_plan: plan_id, bytes planned, hard cap, disk on <host>:<scratch_root> with
 # free space, memory peak, reason, per-model and per-file tables); "CONFIRM WITH: --confirm-plans <id70b>:<cap>,<idte>:<cap>";
-# "TOTAL CAP: <N> B"; client totals.weight == 0; te plan-time C15 rows (component, tokenizer file) PASS;
+# "TOTAL CAP: <N> B"; client totals.weight == 0; te plan-time C15 rows (component, tokenizer file) PASS; C1 re-evaluated
+# with disk_needed = max(disk_bytes) of the two plans (about 179 GB + 50 GiB reserve) PASS;
 # ledger gains P4_PLAN {plans, git_commit, code_id}.
 # At plan time (published configs; the exact values come from the E3 plans):
 #   70b  bytes_planned 179000967168  cap 179700189696   (slack = bytes_planned/256)
-#   te   bytes_planned  25956065280  cap  26224500736   (slack = 4 x 64 MiB)
+#   te   bytes_planned  32549773312  cap  32818208768   (slack = 4 x 64 MiB; incl. the independent candidate)
 # -> commit exit/ledger_p4.jsonl (exit/ is outside CODE_PATHS: HEAD moves, code_id does not, so C1 and C2 still hold
 #    and the Spark checkout needs no update)
 
@@ -116,21 +140,22 @@ python scripts/exit_check_p4.py run --pins exit/pins_p4.json --backend "ssh:$SCO
 
 ### 2.3 Checks (P4 namespace; one row per check: `target | check | expected | actual | PASS/FAIL`)
 
-C3–C15 are evaluated per target (`70b`, `te`).
+C3–C15 are evaluated per target (`70b`, `te`); C10b only for `te`.
 
 | # | Check | Threshold |
 |---|---|---|
 | C0 | target set: `set(pins) == P4_REPOS`, all pins 40-hex | equal, else FAIL and exit 1 before any request |
-| C1 | Spark environment, from the worker hello: `machine == "aarch64"`, `system == "Linux"`, `mem_total_bytes >= 100 GiB`, `disk_free_bytes >= max(disk_bytes) + JOB_PARAMS.disk_reserve_bytes`, `wire_audit_available`; worker `code_id ==` client `code_id` (tree hashes of `CODE_PATHS`, not commits; D78), both clean on `CODE_PATHS` | all true (a FAIL means an assumption of §5 does not hold: human decision) |
+| C1 | Spark environment, from the worker hello: `machine == "aarch64"`, `system == "Linux"`, `mem_total_bytes >= 100 GiB`, `disk_free_bytes >= max(disk_bytes) + JOB_PARAMS.disk_reserve_bytes` (at E2, before any plan, `max(disk_bytes)` is 0; the full clause is evaluated at E3 and E4), `wire_audit_available`, `has_hf_token is True`; worker `code_id ==` client `code_id` (tree hashes of `CODE_PATHS`, not commits; D78), both clean on `CODE_PATHS` | all true (a FAIL means an assumption of §5 does not hold: human decision) |
 | C2 | frozen params: `ATTRIB_PARAMS`, `QUANT_PARAMS`, `GGUF_PARAMS`, `JOB_PARAMS`, `STORE_PARAMS` equal the literals of `exit_expectations_p4.py`, on the client **and** in the worker hello (`params_digest`); P2/P3 params equal their frozen literals; code frozen since `P4_PLAN` (E4 only): client `code_id ==` the `P4_PLAN` entry's `code_id` and clean | equal |
-| C3 | plan: models `== [subject, base, control]`; for each model the tested stack depth `==` the config's layer count (`num_hidden_layers`, or `text_config.num_hidden_layers`); every block planned; `bytes_planned ==` Σ `nbytes` over the planned Parquet rows (gate, up and norm of every block, the whole embedding, FP8 scales), recomputed independently by the check from the stored Cards; `bytes_cap == bytes_planned + max(16 MiB, 4 × min(chunk, largest read), ceil(bytes_planned / 256))`; `disk_bytes == bytes_planned` | equal |
+| C3 | plan: models `== [subject, base, control]` (70b) or `[subject, base, independent, control]` (te); for each model the tested stack depth `==` the config's layer count (`num_hidden_layers`, or `text_config.num_hidden_layers`); every block planned; `bytes_planned ==` Σ `nbytes` over the planned Parquet rows (gate, up and norm of every block, the whole embedding, FP8 scales), recomputed independently by the check from the stored Cards; `bytes_cap == bytes_planned + max(16 MiB, 4 × min(chunk, largest read), ceil(bytes_planned / 256))`; `disk_bytes == bytes_planned` | equal |
 | C4 | gate: the client's plan-time snapshot has `totals.weight == 0`; in the run, exactly 1 approved client decision via `cli-flag` with `bytes_confirmed == bytes_cap`, whose `(plan_id, bytes_cap)` is in `--confirm-plans`, and exactly 1 worker decision via `job-spec` with the same pair; worker `plan_id ==` client `plan_id` | true |
 | C5 | bytes and streamed log: worker `bytes_planned <= totals.weight <= bytes_cap`; the ingested event count `==` the worker's `n_events`, and the worker seqs of the ingested events, in arrival order, are exactly `1..n_events` (the worker emits in seq order, D77); client totals of origin `<worker host>` `==` the worker's result totals | true |
 | C6 | worker wire (`wire_audit`): Σ body bytes of the worker's CountingTransport `==` worker ByteLog `meta + header + weight`; hosts ⊆ {`huggingface.co`, `*.hf.co`}; every request carrying a `Range` header is attributed to `(repo, file)` through the redirect chain (P1 `CountingTransport.orig_path`, repo from the `/{owner}/{name}/resolve/` URL of the chain's first request) and lies within that file's registered header bound or inside one planned read of that model; an unattributable ranged request FAILs | true |
 | C7 | disk and purge: (a) scratch audit before the job: 0 non-lock files; (b) worker `disk_peak_bytes <= disk_bytes`; (c) purge report `dir_absent`, `resident_after == 0`, `bytes_written == bytes_planned` and `bytes_removed >= bytes_written` (the removed bytes include `index.json`); (d) the live log has the COMPUTE `purge` event before the PURGE check event `PURGE check: disk_resident=0 files=0 scratch=absent`; (e) a scratch audit after the job, run over the backend: **0 non-lock files and 0 bytes** under `scratch_root` | all true |
 | C8 | no manual intervention: exactly 1 job submitted per target in this run, `status == "succeeded"`, worker exit code 0; the runner's stdin is never read | true |
-| C9 | resources: job wall-clock `<= max_wall_s` (70b 21600 s, te 3600 s); COMPUTE stage `<= max_compute_s` (70b 7200 s, te 1200 s); worker `rss_peak_bytes <= 48 GiB` | true |
+| C9 | resources: job wall-clock `<= max_wall_s` (70b 21600 s, te 5400 s); COMPUTE stage `<= max_compute_s` (70b 7200 s, te 1200 s); worker `rss_peak_bytes <= 48 GiB` | true |
 | C10 | **positive attribution** (base): reference `status == "tested"`, `null_ok == true`, `control_ok == true`; `n_tested ==` depth; **attributed fraction `>= 0.95`**; the share of blocks whose `primary` is the base `>= 0.95`; median `z_adj >= 10.0` | true |
+| C10b | **independent candidate** (te only; `allenai/OLMo-2-1124-7B`, role `reference`): `status == "tested"`, `null_ok == true`, `control_ok == true`, `n_tested ==` depth, **`n_attributed == 0`**, and it is the `primary` of 0 blocks | true |
 | C11 | **negative control** (role `control`): `status == "tested"`, `n_tested ==` depth, **0 control tests with `z_adj ≥ crit` under leave-one-out**, `control_ok == true` | true |
 | C12 | Card v3 and store: the attributed subject Card has `schema_version == "card.v3"`; `stats.attribution` validates as `attribution.v1` with `len(blocks) ==` depth; the store has it under `(repo, sha, component)` with `has.attribution`; recomputing the object id from the two files gives the stored id; `build_view` gives the tested stack's strip `depth` cells, each with `attribution.status` set, and `primary_title` equal to the base title for attributed cells | true |
 | C13 | cache: a second `attribute()` for the same subject and references returns the same object id, submits 0 jobs, and its client CountingTransport records **0 requests** | true |
@@ -138,15 +163,17 @@ C3–C15 are evaluated per target (`70b`, `te`).
 | C15 | te: subject `key.component == "text_encoder"`; the tested stack is the text stack (its depth equals `text_config.num_hidden_layers`, or `num_hidden_layers`); the vision stack is listed in `attribution.other_stacks` with the reason `no probe basis`; the subject Card's `stats.tokenizer_minhash.source_file` ∈ {`tokenizer/tokenizer.json`, `tokenizer/vocab.json`} (whichever the repo ships, **V**; the component and tokenizer clauses are also evaluated at E3 from the stored header-scan Card) | true |
 | C16 | disclaimers: the `scout attribute` text output and the view carry the three `DISCLAIMERS` plus `ATTRIBUTION_CAVEAT` | true |
 
-**E2** (`preflight`) evaluates C0, C1, C2 and C7a. **E3** (`plan`) adds C3, the plan-time half of C4 and the plan-time
-C15 clauses (te). **E4** (`run`) evaluates everything.
+**E2** (`preflight`) evaluates C0, C1 (disk against the reserve only), C2 and C7a. **E3** (`plan`) re-evaluates C1 with
+`disk_needed = max(disk_bytes)` of its plans and adds C3, the plan-time half of C4 and the plan-time C15 clauses (te).
+**E4** (`run`) evaluates everything.
 
 The `P4_EXIT` payload records, per target:
 - plan_id, bytes_planned, bytes_cap, weight bytes, disk_peak, wall_s, compute_s and rss_peak
-- `n_tested` and `n_attributed` per reference
+- `n_tested` and `n_attributed` per reference (base, independent candidate, control)
 - the null summary per reference (`n_shift`, `shift_mean`, `shift_sd`, `shift_max`, `n_control`, `control_mean`,
   `control_sd`, `mu0`, `s0`, `kappa`, `df`, `guard`) and `crit`
-- the median and minimum `z_adj` for the base, and the maximum (leave-one-out) `z_adj` for the control
+- the median and minimum `z_adj` and the minimum `z_pair` for the base; the maximum `z_adj` and `z_pair` for the
+  independent candidate; the maximum (leave-one-out) `z_adj` for the control
 - the object id
 
 It also records, per target, whether the subject's and the base's `weights.content_digest` are equal (a byte-identical
@@ -156,9 +183,13 @@ copy attributes trivially; validation r1 minor), and the worker hello, the backe
 ### 2.4 Why these numbers (frozen in T320; exit numbers set by planner under the 2026-09-28 delegation)
 
 - **α = 0.01, Bonferroni over all k = 0 tests of a job, Student-t critical values (§3.8 step 7).** 70b: 80 blocks ×
-  (base + control) = 160 tests, n_c = 80, crit 4.036 (control LOO 4.038). te: 56 tests, n_c = 28, crit 4.081 (control
-  4.103). The family-wise bound (≤ 1 % false block attributions per job) holds under assumption A-null of §3.8: an
-  independent candidate behaves like the control at equal depth. It is not an unconditional guarantee.
+  (base + control) = 160 tests, n_c = 80, crit 4.036 (control LOO 4.038). te: 28 blocks × (base + independent
+  candidate + control) = 84 tests, n_c = 28, crit 4.233 (control LOO 4.258). A candidate block is attributed only if
+  both `z_adj ≥ crit` and the per-depth paired margin `z_pair = (z − z_ctrl at the same position)/(s0·√2) ≥ crit` hold
+  (§3.8 step 7; validation r2 major 1). The family-wise bound (≤ 1 % false block attributions per job) is conservative
+  under assumption A-null of §3.8: at each depth, an independent candidate's aligned z and the control's are
+  exchangeable draws. The depth profile of their common mean may be anything, including a spike at block 0. It is not
+  an unconditional guarantee.
 - **Attributed fraction ≥ 0.95 and median z_adj ≥ 10 for the base (C10).**
   - *Synthetic measurement at the exit's m = 2048* (§3.8 step 6 table, r1 null): derived blocks at ε = 1.0 give raw z
     37.5–44.7 and median z_adj 25.0–43.7, 12/12 attributed in all 16 jobs, including the depth-local settings. At
@@ -173,17 +204,36 @@ copy attributes trivially; validation r1 minor), and the worker hello, the backe
 - **Control: 0 tests above crit under leave-one-out and control_ok (C11).** The control shares width (70b) or
   architecture family (te) with the subject, but not training. It calibrates the null (§3.8), and its own blocks are
   tested against the rest of the pool. A control block above crit means the null is not homogeneous across depth or the
-  control is not independent; every reference then abstains, and C10 and C11 FAIL. That goes to the human.
-- **False-FAIL probability of a correct implementation, and reruns (validation r1 minor).** Under A-null, C11 fails by
-  chance with probability ≤ 0.006 per target (Monte Carlo of the control LOO tests, §3.8), and the shift guard adds
-  well under 1 % (its statistic was ≤ 2.49 against 4.55 on every simulated legitimate run). So a correct
-  implementation FAILs C10/C11 with probability of about 1–2 % over both targets. The statistic is deterministic at
-  fixed pins and code, so a rerun reproduces such a FAIL: it can only be resolved by a logged human decision (a new
-  control, recorded with its documentation, followed by a plan revision before a new `P4_PLAN`), never by rerunning or
-  by changing a threshold.
+  control is not independent; every reference then abstains, and C10 and C11 FAIL. That goes to the human. Since r2 the
+  control self-test no longer carries the family-wise bound (the paired margin does); it is a conservative homogeneity
+  diagnostic, and its FAILs are abstentions, never false attributions.
+- **Independent candidate: 0 attributed blocks (C10b, te).** The one live specificity check on real weights. Under
+  A-null the Bonferroni share of its 28 tests is 28/84 × 0.01 ≤ 0.0034; measured with the r2 rule, its false-attribution
+  rate is ≤ 0.0003 in every simulated case (§3.8 step 6 Monte Carlo).
+- **False-FAIL probability of a correct implementation, and reruns (validation r1 minor; restated in r2, major 1).**
+  Measured with /tmp/p4r2/fwer2.py (20,000 jobs per row, the T314 rule reimplemented; §3.8 step 6). These numbers are
+  **conditional on the depth profile of the real null**, which nothing measures before E4:
+  - *Depth-homogeneous null* (every row with a flat mean, including mean 3 with sd 1.5, and AR(1) correlation across
+    depth up to φ = 0.8): the control self-test fires (C11 FAILs, and with it C10) with probability ≤ 0.0052 per job at
+    L = 80 and ≤ 0.0027 at L = 28. The shift guard fires with ≤ 0.0025. C10b fails with ≤ 0.003 (control veto
+    and guard included; ≤ 0.0003 from its own tests). Over both targets a correct implementation therefore FAILs with probability ≤ about 1.5 %.
+  - *A depth spike* (the common mean of candidate and control raised at one depth, e.g. block 0, whose probe input is
+    literally that block's real input): the control's own test fires at the spike, so every reference abstains, and
+    C10/C11 FAIL. For one spiked block with mean 4 this happens with probability 0.37 (L = 80) and 0.24 (L = 28); with
+    mean 5, 0.75 and 0.59; with mean ≥ 6, ≥ 0.87. For blocks 0–2 at mean 4 it is 0.52 and 0.05. For a smooth bump of
+    height 4–6 over about L/5 depths it is ≤ 0.014.
+  - *What the spike FAIL is.* It is an abstention, not a false attribution. With the r2 rule the false-attribution
+    rate in every spike case is ≤ 5 × 10⁻⁵ (r1: up to 0.20). The exit is designed to FAIL loudly rather than attribute
+    when the control reveals depth structure, and that FAIL goes to the human. The probability is stated honestly
+    instead of being engineered away: no threshold, α or control was changed to lower it.
+  - *Reruns.* The statistic is reproducible at fixed pins and code up to float nondeterminism (BLAS summation order
+    across thread counts, and near-ties in the linear assignment), so a rerun almost always reproduces such a FAIL. It
+    can only be resolved by a logged human decision (a new control, recorded with its documentation, followed by a plan
+    revision before a new `P4_PLAN`), never by rerunning or by changing a threshold.
 - **Resources (C9).** These are bounds, not targets.
   - *Wall clock.* 179 GB at ≥ 10 MB/s is ≤ 5 h, plus ≤ 1 h of compute (§2.5), for a 6 h cap on the 70b job. The te job
-    reads 26 GB, for a 1 h cap.
+    reads 32.5 GB (54 min at 10 MB/s) plus ≤ 10 min of compute, for a 1.5 h cap. r1's 1 h cap was raised with the added
+    candidate's 6.6 GB, before any real run; it is a byte-derived bound, not a fitted one.
   - *Memory.* 48 GiB is 4.5 × the §2.5 estimate of about 10.5 GiB and well under the 128 GB unified memory.
   - *What a FAIL means.* Something is wrong with the host or the code. It is never answered by raising the bound.
 - **Quantised subject.** The 70b subject is Q4_K_M. By the measurements of §3.7, dequantisation noise does not move z
@@ -200,18 +250,23 @@ copy attributes trivially; validation r1 minor), and the worker hello, the backe
 - **V** CUDA is installed. **P4 does not use the GPU**: numpy and scipy run on the 20-core Arm CPU (D74).
 - **V** Python ≥ 3.11 with aarch64 wheels for numpy, scipy, pyarrow and httpx (manylinux aarch64 wheels exist for all
   four), and scout installed editable (`pip install -e .`) from a git checkout whose `CODE_PATHS` trees equal the
-  client's (C1: `code_id`; `wire_audit_available` needs the editable install, because `scripts` is not packaged).
+  client's (C1: `code_id`; `wire_audit_available` needs `import scripts.exit_check`, and `scripts` is not packaged).
+- **V** `SCOUT_SPARK_CMD` on the client is `cd <spark checkout> && <venv>/bin/python -m scout.jobs.worker`, so the
+  worker runs from the checkout root and `scripts` is importable (a PEP 660 editable install alone does not put the
+  repo root on `sys.path`). C1's `wire_audit_available` checks the result at E2.
 - **V** sshd is reachable from the client host, with key auth.
 - **V** Outbound HTTPS to `huggingface.co`, `*.hf.co` (`cdn-lfs*.hf.co`, `cas-bridge.xethub.hf.co`).
-- **V** `HF_TOKEN`, or `~/.cache/huggingface/token`, is present on the Spark.
-- **V** Internet throughput is unknown. The C9 bound assumes ≥ 10 MB/s sustained.
+- **V** `HF_TOKEN`, or `~/.cache/huggingface/token`, is present on the Spark (C1: hello `has_hf_token`), for an
+  account that accepted the Llama 3.1 and 3.3 licences (only E4 can show the latter).
+- **V** Internet throughput is unknown. The C9 bound assumes ≥ 10 MB/s sustained; below about 9.5 MB/s the 70b job
+  cannot meet its 6 h cap (179 GB in 5.25 h after ≤ 0.75 h of compute). Nothing measures it before E4 (§11 deferred).
 
 | Step | Needs | This container |
 |---|---|---|
 | E0, all implementation | PyPI: numpy, scipy (new, T314), pyarrow, httpx, pyyaml, pytest, anthropic | available (scipy 1.17.1 installed in a scratch venv) |
-| E1, E3 (client) | `huggingface.co` API + git; HF_TOKEN; about 60 MB meta+header (six tokenizers, 30 + 37 shard headers, one GGUF header of about 8 MB) | blocked (proxy 403 on huggingface.co) |
+| E1, E3 (client) | `huggingface.co` API + git; HF_TOKEN; about 65 MB meta+header (seven tokenizers, about 30 + 37 + 3 shard headers, one GGUF header of about 8 MB) | blocked (proxy 403 on huggingface.co) |
 | E2–E4 (worker) | ssh to the Spark; Spark egress to the Hub; HF_TOKEN on the Spark | no Spark from this container |
-| E4 bytes | about 205 GB of weight ranges (179.0 GB + 26.0 GB), the same on the Spark's disk, peak 179 GB at a time | — |
+| E4 bytes | about 211.6 GB of weight ranges (179.0 GB + 32.5 GB), the same on the Spark's disk, peak 179 GB at a time | — |
 
 **Byte estimate at plan time (published configs; the E3 plans are the exact values).**
 
@@ -223,8 +278,9 @@ copy attributes trivially; validation r1 minor), and the worker hello, the backe
 | 70b | **total** / slack (bytes_planned/256) / cap | | **179,000,967,168** / 699,222,528 / 179,700,189,696 |
 | te | subject Qwen-Image text_encoder (**V** BF16) | text stack only: gate+up 28 × 2 × 18944×3584 × 2 = 7,604,273,152; embed 1,089,994,752; norms 200,704 | 8,694,468,608 |
 | te | base Qwen2.5-VL-7B-Instruct BF16 | same shapes | 8,694,468,608 |
+| te | independent candidate OLMo-2-1124-7B (**V** BF16) | gate+up 32 × 2 × 11008×4096 × 2 = 5,771,362,304; embed 100352×4096 × 2 = 822,083,584; norms 262,144 | 6,593,708,032 |
 | te | control Llama-3.1-8B BF16 | gate+up 7,516,192,768; embed 1,050,673,152; norms 262,144 | 8,567,128,064 |
-| te | **total** / slack (4 × 64 MiB) / cap | | **25,956,065,280** / 268,435,456 / 26,224,500,736 |
+| te | **total** / slack (4 × 64 MiB) / cap | | **32,549,773,312** / 268,435,456 / 32,818,208,768 |
 
 **Compute estimate (70b; measured on this 4-core x86 container, scaled conservatively).**
 - *Neuron responses.* A reference block's response matrix `X·Wᵀ` (2048 × 8192 × 28672, float32) takes 2.4 s. There
@@ -234,7 +290,7 @@ copy attributes trivially; validation r1 minor), and the worker hello, the backe
 - *Decoding.* Decoding and reading 179 GB from NVMe: about 5 min.
 - *Total and memory.* COMPUTE is about 45 min. The memory estimate is 10.5 GiB (§3.2).
 
-The te job is about 6 % of this.
+The te job (3 references × 28 blocks at smaller widths) is about 10 % of this.
 
 ## 3. Definitions
 
@@ -306,10 +362,12 @@ number must equal the cap of exactly those ranges.
 
 **Transport (D56): ssh + JSON lines, no daemon.**
 - `SshBackend(host)` runs `ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 <host>
-  <SCOUT_SPARK_CMD or "scout jobs worker">`. It writes the job spec (`job.v1`, §4.4) on stdin and reads `jobproto.v1`
+  "<prefix> <shlex-quoted args>"`, where `<prefix>` is `SCOUT_SPARK_CMD` used verbatim as a shell fragment, default
+  `python3 -m scout.jobs.worker` (T315; validation r2 minor: the remote command line is the same module entry the
+  offline rehearsal runs, never a CLI subcommand whose argument forwarding is a separate contract). It writes the job spec (`job.v1`, §4.4) on stdin and reads `jobproto.v1`
   messages (§4.5), one JSON object per stdout line. Remote stderr lines are passed to the client display, prefixed with
   the host.
-- `LocalBackend` runs the same worker as a local subprocess (`sys.executable -m scout jobs worker`). It is used on the
+- `LocalBackend` runs the same worker as a local subprocess (`sys.executable -m scout.jobs.worker`). It is used on the
   Spark itself and by the offline rehearsal.
 - `InProcessBackend` runs `run_job` in a thread. It is used by unit tests with FakeHub.
 - Rejected alternatives:
@@ -378,7 +436,7 @@ worker's auto-approval threshold (the rehearsal uses 0) but never raise it.
     documented cron line for the Spark (`*/15 * * * * scout jobs sweep --json > /dev/null 2>&1`). The cron writes no
     file: its result is visible in the next hello, job result (`sweep_before`) or `scout jobs audit`.
 - **Client side.** On disconnect, the client marks the job failed and immediately runs `backend.sweep()` (for ssh:
-  `ssh host scout jobs sweep --json`), then prints its report. A still-running worker keeps its lock and is not
+  `ssh host "<prefix> sweep --json"`), then prints its report. A still-running worker keeps its lock and is not
   touched; it aborts on its next write to the broken pipe.
 - `scout jobs audit` lists every non-lock file and byte under the root, read-only. C7a and C7e use it.
 
@@ -443,8 +501,10 @@ a lock file. The store holds no weights: `put_files` accepts only `.card.json` a
   - Otherwise it scans into a temporary directory, puts each Card and returns the entries.
   - An unpinned Hub target is always scanned; resolving would already cost the API call.
   - `refs.units` records the full component list of a whole-repo scan, so a pipeline hit is known to be complete.
-- **Attribution cache.** `find_attribution(subject_key, reference_keys)` returns an entry with `has.attribution`,
-  `attribution_refs == sorted(reference keys)` and the current `params_digest`.
+- **Attribution cache.** `find_attribution(subject_key, reference_keys, control_keys)` returns an entry with
+  `has.attribution`, `attribution_refs == sorted([f"reference:{k}" for the reference keys] + [f"control:{k}" for the
+  control keys])` and the current `params_digest`. The role is part of the key (validation r2 minor), as it is part of
+  `plan_id`: swapping a base and a control is a different attribution and misses the cache.
 - **Invalidation.**
   - Pins never go stale, since a new commit is a new key.
   - Entries record `params_digest`, the sha256 of the canonical JSON of `{card: SCHEMA_VERSION, sigma, align, cka,
@@ -692,9 +752,14 @@ For a subject block ℓ and a reference block j = a(ℓ):
      neuron permutations of either model and to hidden rotations (step 1), so permuting or rotating inside the aligned
      block reproduces the observed z exactly and carries no null information. Breaking the gate/up pairing instead
      destroys the shared-feature signal as well, which gives back the paper's N(0, 1) null.
-   - *Rejected: a paired per-depth control (T = (z − z_ctrl(ℓ))/(s√2)).* It is robust to any depth profile, but it loses
-     about 30 % of z (median 22–29 vs 31–39 at ε = 1) and leaves the control untestable, so the exit would have no
-     negative check without a second 80 GB control.
+   - *A paired per-depth control: rejected as the sole statistic (r1), adopted as an additional clause (r2).* Used
+     alone, `z_pair = (z − z_ctrl(ℓ))/(s0·√2)` is robust to any depth profile, but it loses about 30 % of z (median
+     22–29 vs 31–39 at ε = 1) and leaves the control untestable, so the exit would have no negative check. Validation
+     r2 (major 1) showed that the pooled rule alone does **not** bound the error when the null spikes at one depth: at
+     the spike, the candidate's and the control's aligned z are exchangeable draws, so the control's leave-one-out test
+     fires only about as often as the candidate's, and the candidate is falsely attributed in up to 20 % of jobs
+     (reproduced below). r2 therefore requires **both** clauses. The pooled `z_adj` keeps the control testable and
+     drives C10's median; the paired `z_pair` is what bounds the error under any depth profile.
    - *The r1 null.* Every job names at least one **control**: a model the human documents as trained independently of
      the subject and of every candidate, at least as close to the subject as an independent candidate could be (same
      width class and data era). The control is not fitted to anything; it is chosen from documentation, as the exit
@@ -705,8 +770,15 @@ For a subject block ℓ and a reference block j = a(ℓ):
        draw from the control's null, so the estimation error of μ and s is in the distribution, not ignored)
      - **control self-test, leave-one-out:** the control's own block i uses `C` without that value (df n_c − 2). If any
        control test reaches the critical value, `control_ok` is false and **every** reference abstains ("independent
-       control attributed at block i: the in-run null is not homogeneous"). This is the check that catches a depth
-       where the shared structure spikes, or a control that is not independent.
+       control attributed at block i: the in-run null is not homogeneous"). It is a conservative homogeneity
+       diagnostic: it makes every reference abstain when the control reveals depth structure (a spike fires it with
+       probability 0.24–0.75 for a spike mean of 4–5, §2.4) or is not independent. It does **not** carry the
+       family-wise bound; the paired margin does (validation r2 major 1: the r1 text claimed otherwise).
+     - **paired margin (r2):** for candidate r at subject position ℓ, `z_pair = (z_ℓ − zc_ℓ) / (s0_r · √2)`, where
+       `zc_ℓ` is the largest k = 0 z of the tested controls at the same subject position ℓ (if no control was tested
+       at ℓ, `max(C)`), and `s0_r` is the candidate's null scale above. Under A-null, `z_ℓ − zc_ℓ` has mean 0 at every
+       depth, whatever the depth profile of the common mean, and sd `σ√2 ≤ s0·√2` in expectation. A control test
+       has `z_pair = null`.
      - **shift guard:** `guard_r = (max(S_r) − max(0, mean(C))) / (max(1, sd(C)) · √(1 + 1/n_c))`. `null_ok_r` is
        `guard_r < crit`. It is measured against the control null alone, so a subject block that copies a reference block
        at another depth cannot hide by inflating the shift sd. (The r0 guard `(max − μ0)/s0` gave 0.97 on the frozen
@@ -737,22 +809,53 @@ For a subject block ℓ and a reference block j = a(ℓ):
      shifted copy abstains (guard ≈ 22); a subject with blocks 3 and 7 re-initialised attributes exactly the other 14.
      Depth-local at m = 1024 (inter 1024, K = 16, 4 triples, the new T313/T314 test dimensions): 0 of 48 candidate and
      0 of 48 control blocks (max z_adj 1.96, crit 4.548); ε = 1 subjects 12/12 (median 20.6–27.7).
-   - *Monte Carlo of the decision rule* (fwer_mc.py; 20,000 jobs per row, Gaussian nulls where an independent candidate
-     and the control share mean μ and sd σ per block, shift null N(μ_s, σ_s) with μ_s ≤ μ, μ up to 6 and σ up to 2):
-     family-wise error of the candidate's tests ≤ 0.0054, of the control LOO tests ≤ 0.0060, and of either ≤ 0.0111, at
-     L = 12, 16, 28 and 80.
+   - *Monte Carlo of the decision rule, r1* (fwer_mc.py; 20,000 jobs per row, Gaussian nulls where an independent
+     candidate and the control share mean μ and sd σ per block, shift null N(μ_s, σ_s) with μ_s ≤ μ, μ up to 6 and σ up
+     to 2): family-wise error of the candidate's tests ≤ 0.0054, of the control LOO tests ≤ 0.0060, and of either
+     ≤ 0.0111, at L = 12, 16, 28 and 80. **This covers depth-homogeneous means only** (validation r2 major 1).
+   - *Monte Carlo of the decision rule, r2, including depth spikes* (/tmp/p4r2/fwer2.py, output fwer2_log.txt; the
+     validator's generator /tmp/val4r2/fwer.py reimplemented with the T314 rule: candidate and control aligned z
+     ~ N(μ_ℓ, σ) with the **same** per-depth profile μ_ℓ, shift z ~ N(0, 1), control LOO, shift guard, Bonferroni;
+     20,000 jobs per row; "FWER" = P(≥ 1 false candidate block and control_ok and null_ok); "C11" = P(control LOO fires)):
+
+     | null depth profile | L = 80, 160 tests: FWER r1 / **r2** / C11 | L = 28, 84 tests (te r2): FWER r1 / **r2** / C11 |
+     |---|---|---|
+     | flat μ = 0 | 0.0009 / **0.00015** / 0.0007 | 0.00015 / **0** / 0.0002 |
+     | flat μ = 3, σ = 1.5 | 0.0057 / **0.0005** / 0.0052 | 0.0033 / **0.00025** / 0.0027 |
+     | block-0 spike μ = 3 | 0.076 / **0.00005** / 0.096 | 0.027 / **0** / 0.045 |
+     | block-0 spike μ = 4 | 0.201 / **0** / 0.378 | 0.081 / **0** / 0.238 |
+     | block-0 spike μ = 5 | 0.169 / **0** / 0.748 | 0.118 / **0** / 0.586 |
+     | block-0 spike μ = 6 | 0.043 / **0** / 0.953 | 0.063 / **0** / 0.875 |
+     | block-0 spike μ = 8 | 0.00005 / **0** / 1.000 | 0.0011 / **0** / 0.999 |
+     | mid-depth spike μ = 4 / 5 | 0.198, 0.170 / **≤ 0.00005** / 0.374, 0.747 | 0.083, 0.117 / **0** / 0.229, 0.589 |
+     | blocks 0–2 at μ = 4 / 6 | 0.165, 0.015 / **0** / 0.521, 0.981 | 0.012, 0.004 / **0** / 0.052, 0.065 |
+     | smooth bump, height 4 / 6 | 0.0076, 0.0015 / **0** / 0.013, 0.004 | 0.0036, 0.0006 / **0** / 0.014, 0.008 |
+     | AR(1) across depth, φ = 0.5 / 0.8 | 0.0011, 0.0006 / **≤ 0.00015** / ≤ 0.0006 | ≤ 0.0001 / **0** / ≤ 0.0001 |
+
+     The r1 validator's figures (0.196 / 0.104 at μ = 4, 0.168 / 0.123 at μ = 5) are reproduced; they used L = 28 with
+     56 tests, where this script gives 0.107 and 0.126. **r2 FWER ≤ 0.0005 in every row, and ≤ 5 × 10⁻⁵ in every spike
+     or bump row.** Power (same script; derived candidate z ~ N(D, 1) per block against a flat control): the r2 clause
+     costs nothing at D ≥ 15 (P(attributed fraction ≥ 0.95) = 0.996–1.000 for both rules). At D = 10 it is 0.996
+     (L = 80) and 0.944 (L = 28), against 0.997 and 1.000 for r1. At D = 8 it collapses (0.37 and 0.20), but there
+     median z_adj ≈ 7.5 already fails C10's median ≥ 10. On the planner's m = 2048 synthetic runs
+     (/tmp/p4r2/raw_r2.py over the 20 r1 raw jobs): null candidates 0 of 480 blocks for r1 and r2 (max z_pair 2.38);
+     derived ε = 1: 240/240 for both (median z_pair 15.2–29.4); ε = 2: 210 → 185 of 240 (median z_pair 2.4–12.3).
 7. **Multiple comparisons and the claim.** `n_tests` counts the k = 0 tests of **every candidate and every control that
    reached testing**, including a reference that later abstains (on `null_ok` or `control_ok`); it is fixed before any
    status is assigned. `crit = t.isf(α/n_tests, n_c − 1)` (candidates) or `t.isf(α/n_tests, n_c − 2)` (control LOO
-   tests), α = 0.01. A candidate test is attributed iff `control_ok`, `null_ok` and `z_adj ≥ crit`. At the exit sizes:
-   70b `n_tests = 160`, `n_c = 80`, crit 4.036 (control 4.038); te `n_tests = 56`, `n_c = 28`, crit 4.081 (control 4.103).
-   - **The family-wise error claim, stated honestly.** P(any false attribution in a job) ≤ α holds *if* (A-null) at every
-     tested depth, the aligned z of an independent candidate is distributed like the pooled aligned z of the control(s)
-     (same mean and spread over the tested depths) and approximately normal. The Student-t prediction statistic makes
-     the bound exact under that assumption; Bonferroni covers the dependence between tests. Nothing in a single job
-     can verify A-null. What each job does check: the control's own blocks under leave-one-out (a depth spike or a
-     non-independent control makes every reference abstain) and the shift guard. The claim is therefore **conditional
-     on the control choice**: a candidate that is independent but much closer to the subject than the control (same
+   tests), α = 0.01. A candidate test is attributed iff `control_ok`, `null_ok`, `z_adj ≥ crit` **and** `z_pair ≥ crit`
+   (r2). At the exit sizes: 70b `n_tests = 160`, `n_c = 80`, crit 4.036 (control 4.038); te `n_tests = 84` (base,
+   independent candidate, control), `n_c = 28`, crit 4.233 (control 4.258).
+   - **The family-wise error claim, stated honestly.** P(any false attribution in a job) ≤ α holds *if* (A-null) at
+     every tested depth ℓ the aligned z of an independent candidate and that of the control are exchangeable,
+     approximately normal draws with a common mean μ_ℓ (any depth profile) and spread at most the pooled control
+     spread, drawn independently of each other given μ_ℓ. The paired clause bounds each test at a spike; the pooled
+     clause bounds it where the profile is flat. The bound is **conservative under A-null (independent draws)**, not
+     exact: the `max(0, ·)` and `max(1, ·)` floors, Bonferroni, and requiring two clauses each make it smaller than α.
+     Nothing in a single job can verify A-null. What each job does check: the control's own blocks under leave-one-out
+     (depth structure or a non-independent control makes every reference abstain) and the shift guard; the te exit
+     job also tests a documented independent candidate (C10b). The claim is therefore **conditional on the control
+     choice**: a candidate that is independent but much closer to the subject than the control (same
      organisation, same data, different initialisation) is not protected. Reports say so (`ATTRIBUTION_CAVEAT`, the
      `format_attribution` null line, §4.2), and p-values are described as "control-calibrated, assumes the candidate
      behaves like the control at equal depth", never as an unconditional FWER.
@@ -778,9 +881,11 @@ For a subject block ℓ and a reference block j = a(ℓ):
 - a is P3's structure-only alignment (`features.structure_alignment`; reldepth when S is constant and non-zero), with
   window 0: each subject block is tested against exactly one reference block.
 - Equal-depth pairs get the identity: both exit bases (70b: 80 vs 80; te: 28 vs 28) and the 70b control (80). The te
-  control Llama-3.1-8B has 32 blocks against the subject's 28, so its alignment is reldepth (validation r1 minor). The
-  plan still downloads all 32 control blocks (about 0.94 GB more than the 28 aligned ones); planning only the aligned
-  and shifted blocks is deferred (§11).
+  control Llama-3.1-8B and the te independent candidate OLMo-2-1124-7B each have 32 blocks against the subject's 28,
+  so their alignment is reldepth (validation r1 minor). `zc_ℓ` for the paired margin is always read at the same
+  **subject** position ℓ, so the two reldepth alignments need no further matching. The plan still downloads all 32
+  blocks of each (about 0.94 GB + 0.72 GB more than the 28 aligned ones); planning only the aligned and shifted blocks
+  is deferred (§11).
 - Depth-upscaled or pruned subjects need a search window with its own correction. It is later.md, together with the
   P3 note that such alignments are tie-breaks.
 
@@ -860,6 +965,7 @@ JobRecord = {job_id, backend: "inproc"|"local"|"ssh", host: str, worker_hostname
            primary: int|null,
            tests: [{reference: int, reference_block: int|null, m: int|null, rho: float|null, z: float|null,
                     z_adj: float|null, p: float|null, crit: float|null, agree_frac: float|null,
+                    z_pair: float|null,        # r2 paired margin (§3.8 step 6); null for a control test
                     attributed: bool,          # always false for a control test
                     reason: str|null}]}],
  caveat: ATTRIBUTION_CAVEAT,
@@ -925,7 +1031,7 @@ A worker invoked with the argument `hello` prints only the hello line and exits 
 ```
 StoreEntry = {component: str|null, object: str (content hash), schema_version, options: {sample, tokenizer, anchors},
               has: {sigma: bool, tokenizer: bool, anchors: bool, attribution: bool},
-              attribution_refs: [str] ("repo@sha/component" sorted) | [],
+              attribution_refs: [str] ("<role>:repo@sha/component", role "reference"|"control", sorted) | [],
               params_digest: str, content_digest: str|null, created_at: ISO-8601 Z, scout_version}
 ```
 
@@ -955,6 +1061,7 @@ ATTRIB_PARAMS = {"version": "attrib.v1", "method": "zhu2025-match-glu-probe",
   "critical": "student-t isf(alpha/n_tests, n_control-1); control leave-one-out n_control-2",
   "guard": "(max_shift-max(0,mean_control))/(max(1,sd_control)*sqrt(1+1/n_control)) < crit",
   "control_self_test": "leave-one-out; any control test >= crit -> all references abstain",
+  "paired_margin": "(z-max_control_z_same_subject_position)/(s0*sqrt(2)) >= crit",
   "alpha": 0.01, "correction": "bonferroni-all-tests", "sided": "upper", "window": 0}
 QUANT_PARAMS = {"version": "quant.v1",
   "gguf_decodable": ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K"],
@@ -1008,8 +1115,11 @@ Assumptions:
   the statistic as specified here, which is frozen.
 - **A8.** The exit repos keep the layouts assumed in §2.1 (V items). A mismatch found at E1/E3 is a plan revision
   before `P4_PLAN`.
-- **A9 (A-null).** An independent candidate's aligned z behaves like the control's at equal depth (§3.8 step 7). It is
-  what the family-wise bound rests on; per job only the control self-test and the shift guard probe it. The P3
+- **A9 (A-null).** At each depth, an independent candidate's aligned z and the control's are exchangeable draws with a
+  common mean (any depth profile, including spikes) and a spread no larger than the pooled control spread (§3.8 step 7).
+  It is what the family-wise bound rests on. Per job, the control self-test and the shift guard probe it, and the te
+  exit job tests one documented independent candidate (C10b). r1 stated A-null as "distributed like the pooled control",
+  i.e. depth-homogeneous; the r2 paired margin removes that requirement (validation r2 major 1). The P3
   labeled set's hard negatives are the natural place to measure it on real models (later.md, re-deferred §12).
 
 | # | Decision | Default (recommended) | Rationale |
@@ -1029,14 +1139,16 @@ Assumptions:
 | D68 | Attribution statistic | Zhu et al. gate/up Spearman of rectangular LAP matchings on embedding-probe responses; control-calibrated null (D76); Bonferroni α = 0.01 with Student-t critical values | §3.8. Both deviations are measured and stated. |
 | D69 | Block semantics | Attributed / not attributed (not evidence of independence) / untestable; MLP only; structure-only alignment, window 0; MoE blocks untestable | Honest about what the test sees. Windowed search and MoE experts are later.md. |
 | D70 | Text encoders | Component selector; the tested stack is the GLU stack whose width equals the embedding; P2 tokenizer resolution; T5/CLIP untestable | §3.9. |
-| D71 | Exit targets | §2.1: 70b = the R1-Distill-Llama-70B Q4_K_M GGUF (base Llama-3.3-70B-Instruct, control Qwen2.5-72B); te = the Qwen-Image text_encoder (base Qwen2.5-VL-7B-Instruct, control Llama-3.1-8B) | The GGUF subject exercises quantised input, full downloads and the 70B scale in one job, at 179 GB instead of 234 GB. Alternative: `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` (BF16) as the subject, +55 GB and no quantised path in the exit. |
+| D71 | Exit targets | §2.1: 70b = the R1-Distill-Llama-70B Q4_K_M GGUF (base Llama-3.3-70B-Instruct, control Qwen2.5-72B); te = the Qwen-Image text_encoder (base Qwen2.5-VL-7B-Instruct, independent candidate OLMo-2-1124-7B, control Llama-3.1-8B) | The GGUF subject exercises quantised input, full downloads and the 70B scale in one job, at 179 GB instead of 234 GB. Alternative: `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` (BF16) as the subject, +55 GB and no quantised path in the exit. |
 | D72 | Spark assumptions | §2.5 (V) | Checked by C1 at E2. |
 | D73 | Exit ledger | P3 line format and chain, kinds P4_*; `p3_ledger` gains a `kinds` argument | Reruns are visible, and the code freeze is anchored at `P4_PLAN`. |
 | D74 | GPU | Not used in P4 | Compute is about 45 min on CPU (§2.5). CUDA wheels for aarch64 would add an environment dependency for no exit need (later.md). |
 | D75 | New dependency | `scipy>=1.11` for `linear_sum_assignment` (and `scipy.stats.t`, D76) | A numpy Jonker–Volgenant would be about 150 lines of untested-in-the-wild code. scipy has aarch64 wheels. |
-| D76 | Null for block attribution (r1) | Every job names ≥ 1 independent **control**; the null centre and scale are `max` over the shift null and the pooled aligned control z; Student-t prediction statistic; control self-test by leave-one-out (any hit → all abstain); shift guard against the control null; no control → abstain; CLI `--control` required. **Open for the human:** the control choice per job is a documented human decision; the default for the exit is the §2.1 table | The r0 shift null fails under depth-local shared features (validation r1 major 1; reproduced at m = 2048: 1 false in 384, r1 rule 0 in 384). Alternatives measured and rejected: in-block permutation/rotation (no information, the statistic is invariant), paired per-depth control (−30 % z, no negative check). |
+| D76 | Null for block attribution (r1) | Every job names ≥ 1 independent **control**; the null centre and scale are `max` over the shift null and the pooled aligned control z; Student-t prediction statistic; control self-test by leave-one-out (any hit → all abstain); shift guard against the control null; no control → abstain; CLI `--control` required. **Open for the human:** the control choice per job is a documented human decision; the default for the exit is the §2.1 table | The r0 shift null fails under depth-local shared features (validation r1 major 1; reproduced at m = 2048: 1 false in 384, r1 rule 0 in 384). Alternatives measured and rejected: in-block permutation/rotation (no information, the statistic is invariant), paired per-depth control **as the only statistic** (−30 % z, no negative check). r2 adds it as a second clause (D79). |
 | D77 | Ordered log emission | `ByteLog.on_event` called in seq order under a re-entrant emit lock (P1 T002 contract change, T301); the worker writes each line under an output lock; the client requires seqs `1..n` | The stream is the byte log of invariant 2; out-of-order arrival would fail healthy jobs (validation r1 major 2). |
 | D78 | Code identity across hosts | `code_id` = hash of the `CODE_PATHS` tree hashes at HEAD (plus a clean check), compared by C1 (client vs worker) and C2 (run vs `P4_PLAN`); commits are recorded, not compared | Committing the ledger or pins under `exit/` must not break the exit, and the Spark checkout need not track the client's HEAD (validation r1 major 5). |
+| D79 | Paired per-depth margin (r2) | A candidate test also needs `z_pair = (z − zc_ℓ)/(s0·√2) ≥ crit`, with `zc_ℓ` the largest control z at the same subject position; the pooled `z_adj` clause, the control LOO self-test and the guard stay | The pooled rule alone gives FWER up to 0.20 under a one-depth spike (validation r2 major 1, reproduced); with both clauses it is ≤ 5 × 10⁻⁵ in every spike row and ≤ 0.0005 overall, with no power loss at ε = 1 (§3.8). Rejected: restating A-null as depth-homogeneous (keeps a known failure mode); per-block instead of global control veto (changes nothing for the exit, since C11 still requires 0 exceedances; later) |
+| D80 | Specificity leg at the exit (r2) | te job gets one ungated independent candidate, `allenai/OLMo-2-1124-7B` (role `reference`); C10b requires 0 attributed blocks | Without it, no live check tests the rule on an unrelated real model (validation r2 major 2). About 6.6 GB of extra reads; te cap 32.8 GB, max_wall_s 5400. Alternative `mistralai/Mistral-7B-v0.1` is gated |
 
 ## 6. Architecture (files)
 
@@ -1046,7 +1158,7 @@ scout/sources.py, scout/hub.py (lfs_sha256)                     T302
 tests/helpers/gguf_fixtures.py                                  T303  GGUF writer + ggml block encoders (test only)
 scout/dequant.py                                                T305  GGML_TYPES, decoders, FP8, QUANT_PARAMS, detect_quant
 scout/gguf.py                                                   T304  header parser, adapter, config/vocab
-scout/card.py (card.v3), P2 C8 / P3 C3 edits                    T306
+scout/card.py (card.v3), P2 C8 / P3 C3 / p3_set edits           T306
 scout/scan.py (selector, GGUF intake, inspect_all, v3 fill)     T307
 scout/gate.py, scout/sigma.py, scout/cka.py (quantised σ/anchors)   T308
 scout/store.py                                                  T309
@@ -1083,6 +1195,8 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | Gate declined | `GateDeclined`, no job submitted | T317 `test_decline_no_job` |
 | Independent reference | 0 attributed at α, calibrated by an independent control | T314 `test_null_family`, T321 |
 | Depth-local shared features (m = 1024) | Control-calibrated null; 0 false | T314 `test_depth_local_null` |
+| A null that spikes at one depth (r2) | Paired margin: a candidate block never attributes on the shared spike | T314 `test_decide_depth_spike_mc` (decision rule, 2000 simulated jobs), `test_depth_spike_fixture` (weights, block 0 spiked) |
+| Independent real model in an exit job (r2) | Tested as a candidate; must attribute 0 blocks | T320 C10b, T321 rehearsal te row (independent fixture candidate) |
 | No control / a control that is not independent | Every reference abstains | T314 `test_no_control_abstains`, `test_control_heterogeneity_abstains`; T319 `test_control_required` |
 | Partially re-initialised subject | Exactly the re-initialised blocks are not attributed | T314 `test_partial_reinit` |
 | Neuron-permuted / hidden-rotated / norm-folded derivative | Attributed (invariance) | T314 `test_invariances` |
@@ -1103,6 +1217,8 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | Committing the ledger or pins breaks the exit's code check (validation r1 major 5) | `code_id` over the `CODE_PATHS` trees (D78); T316 `test_hello_code_identity` (a commit under exit/ keeps code_id), T320 `test_c1_code_identity`, T321 `test_rehearsal_code_identity` |
 | The te tokenizer file differs from the assumed one (validation r1 major 6) | C15 accepts `tokenizer/tokenizer.json` or `tokenizer/vocab.json` (V) and is evaluated at E3 before `P4_PLAN`; T320 `test_c15_tokenizer_files` |
 | A sweep deletes a job directory that is being created | Create under `.pending-*`, lock, then rename; T311 `test_create_sweep_race` |
+| The null spikes at one depth (validation r2 major 1), so the pooled control null under-covers that depth | Paired per-depth margin (D79). Tests: T314 `test_decide_depth_spike_mc` (validator's generator, L = 28, block-0 spike μ = 4, 2000 jobs: ≤ 10 jobs with a false attribution, and the pooled clause alone fires in ≥ 100 of them, so the test shows the paired clause is what holds), `test_depth_spike_fixture` (≤ 1 false over the 4 depth-local triples with block 0 spiked), `test_paired_margin_values`. Measured: FWER ≤ 5 × 10⁻⁵ in every spike row (§3.8). Residual: a spike makes C10/C11 FAIL by abstention with the probabilities of §2.4 |
+| No live exit check tests an unrelated real model (validation r2 major 2) | C10b on the te job's independent candidate (OLMo-2-1124-7B, 0 attributed blocks); T320 `test_each_check_pass_and_fail` (C10b), T321 rehearsal with an independent fixture candidate |
 | The matching test's null is invalid on real independent models (shared neuron structure, including depth-local universality) | Control-calibrated depth-matched null (D76, §3.8), control self-test, shift guard; the FWER claim is stated as conditional on A-null (A9). Tests: T314 `test_inflated_null_adjusted` (the paper's rule attributes in ≥ 4 of 6 triples, measured 6; r1 ≤ 1 block in total, measured 0), `test_depth_local_null` (m = 1024; ≤ 1 false over 4 triples, measured 0 of 48, max z_adj 1.96 vs 4.548; power 12/12), `test_shifted_copy_abstains`, `test_control_heterogeneity_abstains`, `test_bonferroni`; planner measurement at m = 2048 in §3.8 (0 of 384 vs 1 of 384 for r0). Live: C11 (control self-test at the exit). A real FAIL goes to the human; A-null on real hard negatives is later.md. |
 | Embedding-probe deviation loses power on real models | Measured power on fixtures (ε up to 1.0); C10 needs median z_adj ≥ 10; a FAIL goes to the human with z per block in the evidence. Forward-pass activations are later.md. |
 | Wrong neuron roles for an architecture | Roles only from `ATTRIB_PARAMS.roles`; missing → untestable with a reason; C3 (every block planned), C14/C15 |
@@ -1113,7 +1229,7 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | P3 ledger hashes break | Byte-identical import/export; T309 `test_export_import_bytes` |
 | Client/worker version skew | `params_digest` and `git_commit` in the hello and spec; `JobError` on mismatch (T316); C1/C2 |
 | P3 C10 import rule broken (`scout.analysis` must not reach `scout.gate`/`scan`/`hub`/`sources`) | `scout.card` and `scout.view` never import `scout.attrib` or `scout.fullplan`; `ATTRIBUTION_CAVEAT` is duplicated by value in `view.py` and tested equal; `scout.cka` imports only `scout.dequant`. Tests: T306 `test_card_imports`, T308 `test_cka_imports`, T314 `test_no_forbidden_imports`, T318 `test_caveat_equal`, and P3 C10 itself in the P3 rehearsal (E0) |
-| P1–P3 regressions (card.v3) | T306 changes P2 C8 and P3 C3 in the same change; T308 `test_p3_plan_unchanged`; every task runs the full `pytest -q` |
+| P1–P3 regressions (card.v3) | T306 changes P2 C8 and P3 C3 in the same change, and updates every P1–P3 file that asserts a schema literal (`tests/test_scan_p3.py`, `scripts/p3_set.py`, `tests/test_p3_set.py`; validation r2 major 3, found by grep over all P1–P3 task specs); `p3_set` skips an existing `card.v2` or `card.v3` Card without re-reading weights (T306 `test_existing_v3_card_skipped`); T308 `test_p3_plan_unchanged`; every task runs the full `pytest -q` |
 | Hub throughput too low for C9 | Bound documented (≥ 10 MB/s); the evidence records per-stage times; a FAIL goes to the human, and the bound is never raised after the fact |
 | Memory on the unified 128 GB | Estimate in the plan display (≈ 10.5 GiB); `rss_peak_bytes` in the result; C9 ≤ 48 GiB |
 
@@ -1130,6 +1246,8 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | `scout/card.py` (P1 T009, P2 T102, P3 T202) | `card.v3` (§4.1); `component_slug` maps characters outside `[A-Za-z0-9._-]` to `_` (P1 component names are unaffected; GGUF components `gguf:<path>`); `SUPPORTED_SCHEMA_VERSIONS` += v3; `PARQUET_SCHEMA` += `source_name`; `build_card` kwargs `weights_format`, `quant`, `content_digest`, `gguf_files`, `source_names`; new `with_attribution()`, `object_id()`; the P1–P3 card tests are updated to v3 | T306 |
 | `scripts/exit_expectations_p2.py` C8 (P2 T115, P3 T202) | accepts `card.v1`, `card.v2` or `card.v3`; not a threshold | T306 |
 | `scripts/exit_expectations_p3.py` C3 (P3 T216) | `card.v2` becomes `card.v2` or `card.v3`, every other C3 condition unchanged; not a threshold | T306 |
+| `scripts/p3_set.py` (P3 T213 behavior 2) | the skip rule "an existing Card loads with schema card.v2 and options all true" becomes "card.v2 or card.v3"; nothing else changes, and weights are never re-read for an existing Card (validation r2 major 3) | T306 |
+| `tests/test_scan_p3.py` (P3 T207), `tests/test_p3_set.py` (P3 T213) | the `card.v2` literals (`test_anchors_approved_hub`, `test_confirm_mode`) become `card.v3`; `test_existing_card_skipped` unchanged (0 CDN weight requests on a rerun) | T306 |
 | `scout/scan.py` (P1 T010, P2 T108, P3 T207) | selector (`split_selector`), GGUF intake (P1 D10 extended), GGUF config/tokenizer, Card v3 fill, `inspect_all()`; `parse_target` signature unchanged | T307 |
 | `scout/gate.py` (P2 T106, P3 T206) | σ-role and anchor eligibility also accept `QUANT_PARAMS["sample_dtypes"]`; anchor row byte size via `dequant.row_nbytes`. Plans of float dtypes are byte-identical | T308 |
 | `scout/cka.py` (P3 T205) | `find_embedding` also accepts dtypes in `QUANT_PARAMS["sample_dtypes"]`; `CKA_PARAMS` unchanged | T308 |
@@ -1138,7 +1256,7 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | `scout/server.py` (P1 T013, P2 T113) | `make_server(..., store: CardStore \| None = None)`; `GET /api/cards` lists store entries when a store is set; new `GET /api/view?repo=&revision_sha=&component=[&object=]` | T318 |
 | `scout/web/index.html` (P1 T014, P2 T114) | adds `#stored`, `#stored-list`, `#stored-refresh`; P1/P2 ids kept | T318 |
 | `scout/web/app.js` (P1 T014, P2 T114) | stored-Card list and view; strip cells coloured by attribution; legend with caveat | T318 |
-| `scout/cli.py` (P1 T012, P2 T112, P3 T215) | `scout attribute`, `scout jobs {worker,sweep,audit}`, `scout store {import,ls}`, `scout scan --store DIR`, `#selector` targets, `scout serve --store` | T319 |
+| `scout/cli.py` (P1 T012, P2 T112, P3 T215) | `scout attribute`, `scout jobs {worker,hello,sweep,audit}` (`jobs worker` forwards its remaining argv to `scout.jobs.worker.main` unchanged), `scout store {import,ls}`, `scout scan --store DIR`, `#selector` targets, `scout serve --store` | T319 |
 | `scripts/pin_exit.py` (P1–P3) | `--phase 4` (targets `P4_REPOS`, HF_TOKEN required) | T321 |
 | `scripts/p3_ledger.py` (P3 T218) | `append`, `verify` and `read_ledger` take `kinds: tuple[str, ...] = KINDS`; P3 behaviour and P3 tests unchanged | T321 |
 | `pyproject.toml` | dependency `scipy>=1.11` | T314 |
@@ -1152,7 +1270,7 @@ scripts/exit_check_p4.py, exit/pins_p4.json, scripts/pin_exit.py (--phase 4), sc
 | T302 | `RepoFile.lfs_sha256` from the Hub API (+ FakeHub option) | sonnet | T003, T004, T005, T101 |
 | T303 | GGUF fixture writer + ggml block encoders (test only) | sonnet | T103 |
 | T305 | Dequantisation: GGML type table, GGUF decoders, FP8 + scales, QUANT_PARAMS, quant detection | opus | T303 |
-| T306 | Card v3 schema, `with_attribution`, `object_id`; P2 C8 / P3 C3 accept v3 | opus | T202, T216, T301, T302 |
+| T306 | Card v3 schema, `with_attribution`, `object_id`; P2 C8 / P3 C3 / `p3_set` accept v3 | opus | T202, T207, T213, T216, T301, T302 |
 | T311 | Scratch dir, disk accounting, purge, orphan sweeper, audit, worker lock | opus | T301 |
 | T313 | Attribution fixtures: GLU families, derivations, GGUF/FP8/TE writers (test only) | sonnet | T103, T208, T303 |
 | T304 | GGUF header parser (safe lookahead), adapter, config and vocab | opus | T203, T301, T303, T305 |
@@ -1187,7 +1305,7 @@ that P4 edits have these owners:
 |---|---|
 | `scout/bytelog.py`, `scout/errors.py` | T301 |
 | `scout/sources.py`, `scout/hub.py`, `tests/helpers/fakehub.py` | T302 |
-| `scout/card.py`, `tests/test_card*.py`, `scripts/exit_expectations_p2.py`, `scripts/exit_expectations_p3.py` and their tests | T306 |
+| `scout/card.py`, `tests/test_card*.py`, `scripts/exit_expectations_p2.py`, `scripts/exit_expectations_p3.py` and their tests, `scripts/p3_set.py`, `tests/test_p3_set.py`, `tests/test_scan_p3.py` | T306 |
 | `scout/scan.py` | T307 |
 | `scout/gate.py`, `scout/sigma.py`, `scout/cka.py` | T308 |
 | `pyproject.toml` | T314 |
@@ -1196,7 +1314,9 @@ that P4 edits have these owners:
 | `scripts/pin_exit.py`, `scripts/p3_ledger.py`, `.gitignore` | T321 |
 
 **Suites stay green.** Every task's acceptance runs the full `pytest -q` (P1–P4, including the P1–P3 offline exit
-rehearsals). T306 flips `card.v3` and amends P2 C8 and P3 C3 in the same change.
+rehearsals). T306 flips `card.v3` and, in the same change, amends P2 C8, P3 C3, the `p3_set` skip rule and the three
+P1–P3 test literals that assert `card.v2` (a grep of every P1–P3 task spec for `card.v` found no others; P2 T115's
+`card.v1` C8 literal is the P2 C8 edit above).
 
 **Routing.**
 - Opus: tasks that touch download gating (T301, T304, T310, T312, T315, T316, T317), Card schema (T306, T309), similarity
@@ -1207,7 +1327,9 @@ rehearsals). T306 flips `card.v3` and amends P2 C8 and P3 C3 in the same change.
   - T318 (view fields, one route, rendering over a finished schema)
   - T319 (CLI plumbing over finished functions)
 
-## 11. Validation responses — round 1
+## 11. Validation responses
+
+### 11.1 Round 1
 
 Validator verdict on r0: REVISE (0 blockers, 6 majors, 14 minors; `validation.md`). Task graph after r1, checked by
 `/tmp/p4r1/validate_tasks.py` (YAML parse, required keys, deps exist in P1–P4, no cycle, wave order, single file
@@ -1248,6 +1370,43 @@ against the control null (≈ 22 on that fixture).
 - The rehearsal has no partially re-initialised subject with per-block expected statuses (localisation is covered offline by T314 `test_partial_reinit`; C10's 0.95 bound makes such a subject a separate rehearsal row, later).
 - The te job downloads all 32 control blocks although 28 are aligned (about 0.94 GB): planning only aligned and shifted reference blocks is later.
 - The by-weights index and the stored-Card UI list are kept, knowingly accepting their small surface (P1 later.md asked for the store listing).
+
+### 11.2 Validation responses — round 2
+
+Validator verdict on r1: REVISE (0 blockers, 3 majors, 9 minors; `validation.md`). Task graph after r2, checked by
+`/tmp/p4r2/validate_tasks.py` (YAML parse, required keys, deps exist, no cycle, wave order, single file owner, explicit
+within-wave file disjointness, every edited P1–P3 file's original owner in the editing task's transitive deps, plan
+table deps and routes equal the YAMLs) and by the validator's `/tmp/val4r2/deps.py`: 21 tasks, waves 3/4/3/4/2/2/2/1,
+result OK, no finding. Statistics: `/tmp/p4r2/fwer2.py` (output `fwer2_log.txt`) and `/tmp/p4r2/raw_r2.py`, numpy
+2.4.6 + scipy 1.17.1. No number below was fitted to an exit target: α, the controls, the independent candidate and every
+threshold were fixed from documentation and the simulation before any real run, and no exit data exists.
+
+**Majors (all resolved).**
+
+| # | Finding | Fix | Where |
+|---|---|---|---|
+| 1 | Under a one-depth spike of the null, the pooled control rule does not bound the FWER (the control's LOO test fires only about as often as the candidate's) | Reproduced (L = 80 / 28: FWER 0.201 / 0.107 at μ = 4, 0.169 / 0.126 at μ = 5, validator 0.196 / 0.104 and 0.168 / 0.123). **Added the per-depth paired margin** as a second clause: a candidate test is attributed only if `z_adj ≥ crit` **and** `z_pair = (z − zc_ℓ)/(s0·√2) ≥ crit`, with `zc_ℓ` the control's z at the same subject position (D79). Measured over 15 null profiles × 2 layouts (block-0, mid-depth and 3-block spikes up to μ = 8, bumps, flat, AR(1)): **FWER ≤ 5 × 10⁻⁵ in every spike/bump row, ≤ 0.0005 overall** (L = 80 and L = 28). Power: no loss at D ≥ 15 or at m = 2048, ε = 1 (240/240); at D = 10, P(attributed fraction ≥ 0.95) is 0.996 / 0.944; ε = 2 drops 210 → 185 of 240. C10's median z_adj criterion is unchanged. A-null restated (A9: exchangeable per depth, any depth profile). The "catches a spike" claims were removed (§3.8, D76). The control LOO self-test is kept as a conservative homogeneity diagnostic. **C11 false-FAIL restated honestly** (§2.4): ≤ 0.0052 / 0.0027 per job under a flat null; **0.37 / 0.24 for one spiked block at μ = 4, 0.75 / 0.59 at μ = 5, ≥ 0.87 at μ ≥ 6** (L = 80 / 28). These are abstentions, never false attributions, and go to the human | §1, §2.4, §3.8 steps 6–7, §4.2 `z_pair`, §4.9 `paired_margin`, A9, D76, D79, §7, §8; T314 (`paired_margin`, `decide`, `test_paired_margin_values`, `test_decide_depth_spike_mc`, `test_depth_spike_fixture`, `test_attributed_tests_carry_z_pair`), T306 (`validate_attribution` z_pair rules) |
+| 2 | The live exit tests no independent candidate, so specificity on real weights is never checked | te job gains the ungated, documented-independent `allenai/OLMo-2-1124-7B` as a second candidate (role `reference`); **C10b**: tested, `null_ok`, 0 attributed blocks, primary of 0 blocks. P4_TARGETS field `independent`, P4_REPOS and pins 7 repos, C0/C3 model lists, te `n_tests` 84 (crit 4.233, control 4.258), te bytes 25,956,065,280 → **32,549,773,312**, cap 26,224,500,736 → **32,818,208,768**, E4 total 211.6 GB, te `max_wall_s` 3600 → 5400 (byte-derived, §2.4). Added false-FAIL: ≤ 0.0034 by Bonferroni share under A-null; measured ≤ 0.0003 from its own tests (≤ 0.003 including the control veto and guard) | §2.1, §2.2, §2.3 (C0, C3, C9, C10b), §2.4, §2.5, §3.8 alignment, D71, D80, §7, §8; T320 (`independent`, `check_independent`, C1/C3/C11 indices, tests), T321 (pins, references, rehearsal independent fixture, C10b), T317/T309 (cache key covers it) |
+| 3 | T306 flips `card.v3` but three P3 files hard-code `card.v2`, and `p3_set` would re-read weights for v3 Cards | T306 now owns `tests/test_scan_p3.py`, `scripts/p3_set.py`, `tests/test_p3_set.py` and depends on T207 and T213. `p3_set` skips an existing Card whose schema is in `P3_SET_SKIP_SCHEMAS = ("card.v2", "card.v3")` without re-reading weights (new `test_existing_v3_card_skipped`; `test_existing_card_skipped` unchanged). The two literals move to v3; no assertion weakened. Grep of every P1–P3 task spec for `card.v`: no other file. File ownership stays disjoint within wave 2 (script) | §2.1 status rule, §8, §9, §10 (table, ownership, suites); T306 files/deps/interface/behavior 8/tests |
+
+**Minors fixed.**
+- Cache key roles: `attribution_refs` entries are `"<role>:repo@sha/component"`; `find_attribution(subject, reference_keys, control_keys)`; swapped roles miss (T309 `test_find_attribution`, T317 `test_cache_roles_swapped`; §3.5, §4.6).
+- T317 behavior 7 passes `control_targets=` to `make_spec` (T317 `test_spec_has_controls`).
+- ssh argv: `SshBackend` runs `"<SCOUT_SPARK_CMD or 'python3 -m scout.jobs.worker'> <shlex-joined args>"` (T315 `test_ssh_argv`), exercised end to end through a local ssh shim before E2 (T316 `test_ssh_backend_runs_worker_module`); `scout jobs worker` forwards `argparse.REMAINDER` to `worker.main`, specified with tests (T319 stays sonnet: every signature and argv is given).
+- C1 checks `has_hf_token is True`; `SCOUT_SPARK_CMD="cd <checkout> && <venv>/bin/python -m scout.jobs.worker"` makes `scripts` importable and is in the §2.5 V list (T320, §2.1 credentials).
+- Wording: the bound is "conservative under A-null (independent draws)", not exact (§3.8 step 7); the statistic is "reproducible up to float nondeterminism", not deterministic (§2.1, §2.4).
+- E2 disk: at E2 C1 checks only the 50 GiB reserve (no plan yet); `plan` (E3) and `run` (E4) re-evaluate C1 with `max(disk_bytes)` (§2.2, §2.3; T320 behavior 2, T321 behavior 3 and `test_rehearsal_plan_disk_row`).
+
+**Found while fixing.**
+- T314 `test_control_heterogeneity_abstains` spliced the subject's block 5 into a control whose own embedding lives in another hidden basis. Through the embedding probe that block would carry no response signal, so the test's expected `control_ok False` was not guaranteed. The control now also takes the subject's embedding.
+- The ssh shim test sets `SCOUT_SCRATCH_ROOT` to a temp dir, so it never touches the real home directory.
+
+#### Deferred minors
+- Shift guard false veto under cross-layer neuron inheritance (validator minor 1): not measured at 80 blocks; a relative or per-block guard is later.md. A veto is an abstention, never a false attribution.
+- C9 throughput: the implied minimum (about 9.5 MB/s for the 70b 6 h cap) is now stated in §2.5; a timed ranged read at E2 is later.
+- The by-weights index, `same_weights`, `reindex`, `scout store import` and the stored-Card UI list are kept as accepted surface (validator minor 9; round 1 deferred minor).
+- Per-block instead of global control veto (considered for major 1): it changes nothing for the exit while C11 requires 0 exceedances; later.
+- Planning only the aligned and shifted reference blocks (the te control and independent candidate download 32 of which 28 are aligned, about 1.7 GB): later (round 1 item, extended).
 
 ## 12. Items deferred to P4 by earlier phases, and their disposition
 

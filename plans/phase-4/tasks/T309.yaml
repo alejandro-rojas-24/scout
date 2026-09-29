@@ -35,7 +35,8 @@ interface: |
         def units(self, repo: str, revision_sha: str) -> list[str | None] | None
         def set_units(self, repo: str, revision_sha: str, units: list[str | None]) -> None
         def find(self, repo: str, revision_sha: str, component: str | None, *, require: Collection[str] = ()) -> StoreEntry | None
-        def find_attribution(self, subject_key: dict, reference_keys: list[dict]) -> StoreEntry | None
+        def find_attribution(self, subject_key: dict, reference_keys: list[dict], control_keys: list[dict]) -> StoreEntry | None
+            # role-aware (validation r2 minor): swapping a reference and a control misses
         def object_paths(self, entry: StoreEntry) -> CardPaths
         def load(self, entry: StoreEntry) -> tuple[dict, pyarrow.Table]
         def export(self, entry: StoreEntry, out_dir: pathlib.Path) -> CardPaths
@@ -61,14 +62,15 @@ behavior: |
      entry with the same object exists (dedup; return the existing one). Entry fields: component = key.component;
      object = h; schema_version; options = card.scan.options (missing keys False); has = {sigma: stats.sigma_curves is
      not None, tokenizer: stats.tokenizer_minhash is not None, anchors: stats.anchor_embedding is not None, attribution:
-     stats.attribution is not None}; attribution_refs = sorted(key_string(r["card_key"]) for r in attribution.references)
-     or []; params_digest = params_digest(); content_digest = weights.content_digest (v3) or None; created_at = UTC now;
+     stats.attribution is not None}; attribution_refs = sorted(f"{r['role']}:{key_string(r['card_key'])}" for r in attribution.references)
+     or [] (role "reference" or "control", plan.md 4.6); params_digest = params_digest(); content_digest = weights.content_digest (v3) or None; created_at = UTC now;
      scout_version. If content_digest: by-weights/<hex>.json gains key_string(card_key) (set semantics).
   4. find(repo, sha, component, require): entries with that component, params_digest == params_digest(), and
      has[k] for every k in require; newest created_at wins (ties: larger object id). require keys outside HAS_KEYS ->
      ValueError.
-  5. find_attribution(subject_key, reference_keys): entries of the subject key with has.attribution, current
-     params_digest, attribution_refs == sorted(key_string(k) for k in reference_keys); newest wins.
+  5. find_attribution(subject_key, reference_keys, control_keys): entries of the subject key with has.attribution,
+     current params_digest, attribution_refs == sorted([f"reference:{key_string(k)}" for k in reference_keys] +
+     [f"control:{key_string(k)}" for k in control_keys]); newest wins.
   6. load(entry) = card.load_card(object json path). export(entry, out_dir): copy both files byte-identically to
      card.card_paths(out_dir, repo, sha, component) (atomic), return the paths.
   7. import_tree(cards_dir): every "*/*/*.card.json" with its sibling parquet (from the JSON's tensors_parquet) ->
@@ -104,7 +106,7 @@ acceptance:
     - "test_cached_scan_local: local folder -> second call hits with 0 reads (spy on LocalSource.read_range/read_file), the caller's ByteLog unchanged by the key computation"
     - "test_cached_scan_pipeline_units: pipeline repo without selector -> set_units records all components; second call hits; with '#text_encoder' hits the single unit"
     - "test_params_digest_invalidates: monkeypatch ATTRIB_PARAMS['alpha'] -> find misses; list_all(stale=True) lists the old entry"
-    - "test_find_attribution: a Card built by card.with_attribution with 2 references -> find_attribution(subject, refs in any order) hits; different reference set misses"
+    - "test_find_attribution: a Card built by card.with_attribution with references [A (role reference), B (role reference), K (role control)] -> find_attribution(subject, [B, A], [K]) hits (order-independent); a different reference set misses; find_attribution(subject, [A, K], [B]) (roles swapped, same key set) misses; entry.attribution_refs == sorted(['control:' + key_string(K), 'reference:' + key_string(A), 'reference:' + key_string(B)])"
     - "test_same_weights: two FakeHub repos with identical safetensors bytes (lfs on) -> same content_digest -> same_weights lists both keys"
     - "test_concurrent_put: 8 processes (multiprocessing spawn) each put a distinct Card for the same (repo, sha) with different components -> 8 entries, the ref JSON valid, no temp files left"
     - "test_reindex: put 3 Cards (2 with content_digest), delete refs/ and by-weights/ -> reindex() == 3; find/find_attribution/same_weights give the same answers as before (units None); objects untouched (bytes equal)"

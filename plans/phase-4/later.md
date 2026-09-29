@@ -56,3 +56,9 @@
   - The 405B σ-sample limitation (v_proj > 16 MiB per layer).
 - **Environment.** Allowlisting `huggingface.co` and `*.hf.co` in this container, plus an ssh route to the Spark,
   would let E1–E4 run from here.
+- **From validation round 2 (plan §11.2 deferred minors).**
+  - Shift guard: measure its false-veto rate with cross-layer neuron inheritance at 80 blocks; make it relative (a
+    shift z must exceed the same subject block's aligned z) or per block.
+  - C9: a timed ranged read at E2, recorded in the preflight, so a throughput below about 9.5 MB/s is visible before
+    the 6 h job.
+  - Per-block control veto (a control LOO hit makes only that depth abstain) instead of the global one.

@@ -15,8 +15,10 @@ interface: |
                     [--plan-only | --confirm-plan PLAN_ID --confirm-bytes N] [--gate-threshold-bytes N]
                     [--out DIR] [--json] [--endpoint URL]
       defaults: --backend = env SCOUT_BACKEND or "local"; --store = env SCOUT_STORE or "cards/store"
-    scout jobs worker [--scratch-root DIR] [--wire-audit]       # delegates to scout.jobs.worker.main
-    scout jobs hello|sweep|audit [--scratch-root DIR] [--dry-run (sweep)] [--json]   # delegates to scout.jobs.worker.main
+    scout jobs worker [ARGS ...]        # ARGS = argparse.REMAINDER, forwarded unchanged: worker.main(ARGS)
+                                        # (so `scout jobs worker`, `scout jobs worker hello`, `scout jobs worker sweep
+                                        #  --json --scratch-root DIR` all work; validation r2 minor)
+    scout jobs hello|sweep|audit [ARGS ...]   # ARGS = argparse.REMAINDER: worker.main([sub] + ARGS)
     scout store import DIR [--store DIR]
     scout store ls [--store DIR] [--stale] [--json]
     scout scan TARGET ... [--store DIR]                         # with --store: cached_scan; prints hit/scanned + keys
@@ -30,7 +32,12 @@ behavior: |
      "attribution", "disclaimers": scout.view.DISCLAIMERS, "caveat": ATTRIBUTION_CAVEAT}; invariant 5 holds for the
      machine-readable output too), exit 0. GateDeclined -> exit 6 with the P2 message and the CONFIRM WITH line on stderr. JobError 7,
      PurgeError 8, DiskSpaceError 9, other ScoutError -> their exit codes with the message on stderr.
-  2. jobs subcommands forward argv to scout.jobs.worker.main unchanged and return its exit code.
+  2. jobs subcommands: the `jobs` subparser has a positional `sub` with choices ("worker", "hello", "sweep", "audit")
+     and `rest` = nargs=argparse.REMAINDER. worker -> return scout.jobs.worker.main(rest); hello/sweep/audit -> return
+     scout.jobs.worker.main([sub] + rest). No option of the worker is parsed by cli.py (the worker's own argparse
+     validates them), and the exit code is returned unchanged. stdin/stdout are the process's own (worker.main's
+     defaults). The ssh backend does NOT use this path (T315 runs `python3 -m scout.jobs.worker`); it is the
+     human-facing alias.
   3. store import DIR -> prints f"imported {n} Cards into {store}" and exit 0; store ls -> one line per entry
      "{key_string}  {object[:12]}  {flags}  {created_at}" (flags = has keys that are true, comma-joined, or "-"),
      --stale lists only stale entries, --json a JSON list of entry dicts.
@@ -49,6 +56,7 @@ acceptance:
     - "test_control_required: attribute without --control -> exit 2 with the message"
     - "test_confirm_flags_together: only --confirm-plan -> exit 2"
     - "test_jobs_cli: `scout jobs hello --scratch-root tmp` prints a hello JSON; `scout jobs sweep --json --scratch-root tmp` prints a SweepReport JSON; exit 0"
+    - "test_jobs_worker_forwards: main(['jobs', 'worker', 'hello', '--scratch-root', tmp]) prints one hello JSON line (same keys as `scout jobs hello`) and returns 0; main(['jobs', 'worker', 'sweep', '--json', '--scratch-root', tmp]) prints a SweepReport JSON and returns 0; with scout.jobs.worker.main monkeypatched to a spy returning 5, main(['jobs', 'worker', '--scratch-root', 'x', '--wire-audit']) calls it with exactly ['--scratch-root', 'x', '--wire-audit'] and returns 5"
     - "test_store_cli: store import of a P1-layout dir with 2 Cards -> 'imported 2'; store ls lists 2 lines; --json parses"
     - "test_scan_store: scan <st dir> --store tmp twice -> second stdout JSON has hit true"
     - "test_p1_p3_cli_unchanged: the P1/P2/P3 CLI test modules still pass (run in the full suite)"

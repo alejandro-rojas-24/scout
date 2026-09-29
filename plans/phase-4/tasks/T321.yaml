@@ -16,8 +16,9 @@ route: opus
 spec_complete: true
 interface: |
   exit/pins_p4.json (committed as): {"Qwen/Qwen-Image": "UNPINNED", "Qwen/Qwen2.5-72B": "UNPINNED",
-    "Qwen/Qwen2.5-VL-7B-Instruct": "UNPINNED", "bartowski/DeepSeek-R1-Distill-Llama-70B-GGUF": "UNPINNED",
-    "meta-llama/Llama-3.1-8B": "UNPINNED", "meta-llama/Llama-3.3-70B-Instruct": "UNPINNED"}     (keys sorted)
+    "Qwen/Qwen2.5-VL-7B-Instruct": "UNPINNED", "allenai/OLMo-2-1124-7B": "UNPINNED",
+    "bartowski/DeepSeek-R1-Distill-Llama-70B-GGUF": "UNPINNED", "meta-llama/Llama-3.1-8B": "UNPINNED",
+    "meta-llama/Llama-3.3-70B-Instruct": "UNPINNED"}     (keys sorted; 7 repos)
   .gitignore: += "cards/p4-store/"
   scripts/p3_ledger.py (P3 T218): verify(path, *, kinds: tuple[str, ...] = KINDS), read_ledger(path, *, kinds=KINDS),
     append(path, kind, payload, *, ts=None, hostname=None, kinds=KINDS); P3 behaviour and P3 tests unchanged.
@@ -50,12 +51,15 @@ behavior: |
      entry if any, else 0), C2 (plan_code_id None), C7a (audit files == 0). Print the table, the hello JSON line;
      append P4_PREFLIGHT {hello, checks, git_commit, code_id, code_dirty}; exit 0 iff all rows ok.
   3. plan: preflight rows first (not appended separately); for each target row: subject_target = f"{subject}@{pin}#{selector}",
-     references = [f"{base}@{pin}"], controls = [f"{control}@{pin}"] (local rehearsal: the override's paths); result = attribute(...,
+     references = [f"{base}@{pin}"] + [f"{r}@{pin}" for r in independent] (base first, then the independent
+     candidates; validation r2 major 2), controls = [f"{control}@{pin}"] (local rehearsal: the override's paths); result = attribute(...,
      plan_only=True, store=CardStore(store), backend=backend, hello=hello, client=client_factory() if given) -> plan.
      The CountingTransport of the client (scripts.exit_check.CountingTransport around the client's transport) records
      the wire; plan-time client totals.weight must be 0 (C4a). Rows C3 per target (models loaded from the store) and
      C4a, and for kind text_encoder the plan-time C15 rows (check_te(label, subject header-scan Card from the store,
-     None): component and tokenizer source_file; validation r1 major 6). Print each plan (format_full_plan_dict) to stderr, then "CONFIRM WITH: --confirm-plans ID70:CAP,IDTE:CAP"
+     None): component and tokenizer source_file; validation r1 major 6), and C1 re-evaluated with disk_needed =
+     max(plan disk_bytes) over the targets (validation r2 minor: at E2 no plan exists, so only the reserve was checked).
+     Print each plan (format_full_plan_dict) to stderr, then "CONFIRM WITH: --confirm-plans ID70:CAP,IDTE:CAP"
      (P4_TARGETS order) and "TOTAL CAP: <sum> B". Append P4_PLAN {plans: {label: {plan_id, bytes_planned, bytes_cap,
      disk_bytes}}, git_commit, code_id, code_dirty}. Exit 0 iff all rows ok.
   4. run: steps of plan (same plan ids required: they must equal the last P4_PLAN entry's ids, else FAIL "plan changed
@@ -68,7 +72,8 @@ behavior: |
      display=stderr) -> AttributeResult; audit_after = worker_audit(backend); second = attribute(same args, a fresh
      client whose CountingTransport counts requests) for C13. Collect the evidence and evaluate C3-C16 with T320's
      functions (C5 uses JobOutcome.worker_seqs and the client log's totals_by_origin, C6 the result wire and the
-     Cards' header bounds, C7 the live client log events (ingested worker events), C12 the store, C14/C15 by kind).
+     Cards' header bounds, C7 the live client log events (ingested worker events), C10b for targets with independent
+     candidates, C12 the store, C14/C15 by kind). The run's C1 uses disk_needed = max(plan disk_bytes), as in plan.
      Any exception inside a target -> rows of that target FAIL with the error text; the other target still runs.
      Append P4_EXIT (plan.md 4.10 payload; always, also after an exception) and print the table, "EXIT CHECK (P4):
      PASS|FAIL" and {"step": "EXIT", "phase": 4, "ledger_seq": seq, ...payload}. Exit 0 iff every row ok.
@@ -76,15 +81,17 @@ behavior: |
   6. Offline rehearsal (tests/test_exit_check_p4_offline.py), targets override = two rows built from T313 fixtures as
      LOCAL folders ("70b": subject GGUF Q4_K of derive(BASE) with selector "model-Q4_K.gguf", base BASE, control
      CONTROL, kind gguf; "te": subject write_te_pipeline(derive(TE_BASE)) with selector "text_encoder", base TE_BASE st
-     repo, control CONTROL, kind text_encoder), pins = the local stat-hash keys, backend_factory -> LocalBackend(tmp
-     scratch) (real worker subprocesses), env = Env(machine=platform.machine(), system=platform.system(),
+     repo, independent = (a write_st_repo of glu_weights(GluSpec(seed=5), attrib_vocab(5)): an independent fixture
+     family; T313 constructors), control CONTROL, kind text_encoder), pins = the local stat-hash keys, backend_factory -> LocalBackend(tmp
+     scratch, env={**os.environ, "HF_TOKEN": "rehearsal-dummy"}) (real worker subprocesses; the dummy makes the hello's
+     has_hf_token true for C1 and is never sent, since every rehearsal target is a local folder), env = Env(machine=platform.machine(), system=platform.system(),
      min_mem_total_bytes=0, require_clean=False), allow_local_targets=True, code_state = the real code_identity (client
      and worker run from the same checkout, so their code_id values match), gate threshold: the rehearsal
      sets attribute's gate_threshold_bytes=0 through the targets override field "gate_threshold_bytes" so exact
      confirmation is exercised (the real exit uses the default threshold; its plans are far above it anyway).
 acceptance:
   tests:
-    - "test_rehearsal_pass: preflight -> 0; plan -> 0 and prints CONFIRM WITH; run with the printed pairs -> 0; table C0-C16 all PASS; ledger has P4_PREFLIGHT, P4_PLAN, P4_ATTEMPT, P4_EXIT in order and verifies; store holds the attributed Cards; scratch audit 0 files"
+    - "test_rehearsal_pass: preflight -> 0; plan -> 0 and prints CONFIRM WITH; run with the printed pairs -> 0; table C0-C16 all PASS, including the te C10b rows (independent fixture candidate 0/12 attributed); ledger has P4_PREFLIGHT, P4_PLAN, P4_ATTEMPT, P4_EXIT in order and verifies; store holds the attributed Cards; scratch audit 0 files"
     - "test_rehearsal_missing_pair: run with only the 70b pair -> te C4 FAIL (declined, no job), 70b rows PASS, exit 1, P4_EXIT passed false"
     - "test_rehearsal_code_identity: code_state stub returning another code_id for the client -> preflight C1 FAIL, exit 1; a stub whose commit differs but code_id matches -> C1 PASS; run with a code_id different from P4_PLAN's -> C2 FAIL"
     - "test_rehearsal_plan_changed: modify the control fixture after plan (new file) -> run exits 1 'plan changed since P4_PLAN', no P4_ATTEMPT appended"
@@ -92,8 +99,9 @@ acceptance:
     - "test_rehearsal_target_set: pins missing one repo -> exit 1 with C0 FAIL and nothing appended"
     - "test_rehearsal_ledger_tampered: flip one byte in the ledger -> LEDGER BROKEN exit 1"
     - "test_p3_ledger_kinds: P3 ledger tests unchanged; verify/append with kinds=P4_KINDS accept P4 entries and reject a P3 kind; default kinds reject P4 kinds"
-    - "test_pin_exit_p4: phase 4 with fake run_cmd (scout resolve and git ls-remote agree) writes 6 pins; disagreement -> non-zero and nothing written; HF_TOKEN unset -> exit 3"
-    - "test_pins_file: exit/pins_p4.json has exactly the 6 repos with 'UNPINNED'"
+    - "test_pin_exit_p4: phase 4 with fake run_cmd (scout resolve and git ls-remote agree) writes 7 pins; disagreement -> non-zero and nothing written; HF_TOKEN unset -> exit 3"
+    - "test_pins_file: exit/pins_p4.json has exactly the 7 repos with 'UNPINNED'"
+    - "test_rehearsal_plan_disk_row: check_env (as imported by scripts.exit_check_p4) monkeypatched with a spy that wraps the real function -> preflight calls it with disk_needed 0; plan calls it again with disk_needed == max(disk_bytes) of the two rehearsal plans, and prints that C1 row"
   commands:
     - pytest -q tests/test_exit_check_p4_offline.py tests/test_pin_exit_p4.py tests/test_p3_ledger_kinds.py
     - pytest -q
