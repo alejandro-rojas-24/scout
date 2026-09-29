@@ -1,5 +1,5 @@
 id: T301
-title: ByteLog P4 - GGUF header class (monotone bound), grant stage (FULL_DOWNLOAD), per-model LogView, remote ingest with origin, disk accounting, job records; new error types
+title: ByteLog P4 - GGUF header class (monotone bound), grant stage (FULL_DOWNLOAD), per-model LogView, remote ingest with origin (accepts the P1 "NONE" stage), on_event emitted in seq order (P1 contract change), disk accounting, job records; new error types
 depends_on: [T101]
 files:
   - scout/bytelog.py
@@ -33,7 +33,12 @@ interface: |
         # ".gguf" (case-insensitive) now follows the safetensors rule: bound = 8 + header_len when registered,
         # else GGUF_PROLOGUE; bytes < bound -> header, >= bound -> weight. Every other extension unchanged.
 
+    STAGE_NAMES_INGEST: frozenset[str]     # {s.name for s in Stage} | {"NONE"} (P1 T002 labels pre-stage events "NONE")
+
     class ByteLog:
+        # P1 CONTRACT CHANGE (plan.md 9, validation r1 major 2): on_event is called in strictly increasing seq order,
+        # also under concurrent callers. A second lock, self._emit_lock (threading.RLock), is held from seq assignment
+        # through the on_event call; the data lock (self._lock) is still released before on_event (P1 T002 behavior 5).
         def set_header_len(self, path: str, header_len: int) -> None
             # ".gguf": may be called again with a value >= the registered one (smaller -> ValueError); other paths: P1 behaviour
         def grant(self, plan_id: str, ranges: Iterable[tuple[str, int, int]], cap_bytes: int, *,
@@ -79,7 +84,9 @@ behavior: |
   4. view(prefix): return LogView(self, prefix). Views share the parent's lock, totals, reservations, grant and events.
      Grant ranges are always given with the prefixed path (the caller builds them).
   5. ingest(event, origin): origin non-empty str else ValueError. Validate: event["event"] in INGEST_EVENTS;
-     bytes int >= 0; bytes_by_class has exactly meta/header/weight ints >= 0 summing to bytes; stage is a Stage name.
+     bytes int >= 0; bytes_by_class has exactly meta/header/weight ints >= 0 summing to bytes; stage in
+     STAGE_NAMES_INGEST (a Stage name, or "NONE": the P1 label of events logged before the first stage() call, e.g. the
+     worker's sweep note; validation r1 major 3).
      Under the lock: append LogEvent(seq=<next local seq>, ts=float(event["ts"]), stage=event["stage"],
      event=event["event"], source=event.get("source"), path=event.get("path"), url=event.get("url"),
      range=tuple(event["range"]) if event.get("range") else None, status=event.get("status"),
@@ -91,6 +98,15 @@ behavior: |
      ValueError; resident -= n. Thread-safe (the ByteLog lock).
   8. add_job_record: append a deep copy; job_records returns deep copies.
   9. No behaviour of P1/P2 changes when none of the new features is used: the P1/P2 test files are not edited and pass.
+  10. Ordered emission (P1 contract change; plan.md 9). Every method that appends an event (stage, record, note,
+      preflight's refused event, ingest, and the P2 gate/decision notes) does:
+        with self._emit_lock:
+            with self._lock: assign seq, update totals, append the event
+            if on_event: on_event(event)
+      so on_event observes seqs 1, 2, 3, ... in order even with many threads. _emit_lock is re-entrant, so an on_event
+      that logs again (not done by scout) cannot deadlock; readers (events, events_since, totals, to_card_dict) take
+      only self._lock and are never blocked by a slow on_event. The cost is that recording threads wait for the
+      previous on_event to return (the worker's on_event is one stdout line; 4 download threads at 64 MiB chunks).
 acceptance:
   tests:
     - "test_gguf_classify: classify_range('m.gguf', 0, 24, None) -> header 24; (0, 25, None) -> header 24, weight 1; after set_header_len('m.gguf', 992) -> [0, 1000) header, [1000, 1001) weight; '.GGUF' upper case same; '.bin' unchanged (all weight)"
@@ -99,7 +115,9 @@ acceptance:
     - "test_view_prefix: two views 'm0:' and 'm1:' each set_header_len('model.safetensors', N0 / N1) -> parent.header_len('m0:model.safetensors') == N0 and 'm1:...' == N1; a record through view m1 logs path 'm1:model.safetensors'; totals shared"
     - "test_view_grant: grant ranges [('m1:a.safetensors', s, e)] -> view('m1:').preflight('a.safetensors', s, e) allowed; view('m0:').preflight('a.safetensors', s, e) refused"
     - "test_ingest: ingest 3 worker event dicts (stage_start, fetch weight 100, purge) with origin 'spark' -> client seqs continue, totals.weight += 100, totals_by_origin()['spark']['weight'] == 100 and 'local' unchanged, to_dict of ingested events has origin 'spark', local events have no 'origin' key; current_stage unchanged"
-    - "test_ingest_rejects: unknown event type, negative bytes, classes not summing, unknown stage, empty origin -> ValueError and nothing appended"
+    - "test_ingest_rejects: unknown event type, negative bytes, classes not summing, unknown stage ('BOGUS'), empty origin -> ValueError and nothing appended"
+    - "test_ingest_none_stage: a worker event dict with stage 'NONE' (a note logged before any stage) is ingested; its to_dict has stage 'NONE' and origin set"
+    - "test_on_event_ordered_concurrent: on_event appends e.seq to a list after time.sleep(random.uniform(0, 1e-4)); 8 threads x 500 record() calls (1 meta byte each) plus 2 threads x 200 note('error', 'x') calls, started behind a Barrier -> the list == list(range(1, N + 1)) exactly; repeated 5 times"
     - "test_disk_accounting: disk_add 10, 20, release 25 -> resident 5, peak 30; release 6 -> ValueError; 8 threads x 1000 disk_add(1) -> resident 8000"
     - "test_job_records: add_job_record(d); mutate d; job_records[0] unchanged"
     - "test_errors: exit codes JobError 7, PlanMismatch 7 (subclass of JobError), BackendError 7, PurgeError 8, DiskSpaceError 9 with needed/free/root attrs, StoreError 1, QuantError 1"
@@ -109,4 +127,4 @@ acceptance:
 out_of_scope:
   - GGUF parsing (T304), scratch files (T311), the job protocol (T315)
 invariants_touched: [1, 2]
-decisions: [D57, D59, D61, D66]
+decisions: [D57, D59, D61, D66, D77]

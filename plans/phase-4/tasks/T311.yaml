@@ -11,7 +11,7 @@ interface: |
   scout/jobs/__init__.py:
     JOB_PARAMS: dict          # EXACTLY the plan.md 4.9 literal
   scout/jobs/scratch.py (stdlib + numpy only; Linux/macOS fcntl):
-    LOCK_NAME = ".lock"; WORKER_LOCK_NAME = ".worker.lock"; INDEX_NAME = "index.json"
+    LOCK_NAME = ".lock"; WORKER_LOCK_NAME = ".worker.lock"; INDEX_NAME = "index.json"; PENDING_GRACE_S = 300
 
     def scratch_root_default() -> pathlib.Path
         # env JOB_PARAMS["scratch_root_env"] if set and non-empty, else Path(JOB_PARAMS["scratch_root_default"]).expanduser()
@@ -47,10 +47,13 @@ interface: |
         def __init__(self, root: pathlib.Path, wait_s: float = JOB_PARAMS["lock_wait_s"], poll_s: float = 1.0) -> None
         # waits up to wait_s (polling LOCK_NB); timeout -> JobError("worker busy: another job holds <path>")
 behavior: |
-  1. create: root.mkdir(parents=True, exist_ok=True, mode=0o700); job_id must match ^[A-Za-z0-9TZ._-]{8,80}$ (else
-     ValueError); path = root/job_id; path.mkdir(mode=0o700) (exists -> JobError "scratch dir exists"); open path/.lock
-     and flock(LOCK_EX | LOCK_NB) and KEEP the fd open until purge (the lock is what marks the job alive); write
-     index.json {"job_id", "tensors": {}} (no weights).
+  1. create (no sweep race; validation r1 minor): root.mkdir(parents=True, exist_ok=True, mode=0o700); job_id must
+     match ^[A-Za-z0-9TZ_-][A-Za-z0-9TZ._-]{7,79}$ (no leading dot; else ValueError); path = root/job_id; path exists ->
+     JobError "scratch dir exists". tmp = root / f".pending-{job_id}-{secrets.token_hex(4)}"; tmp.mkdir(mode=0o700);
+     open tmp/.lock and flock(LOCK_EX | LOCK_NB) and KEEP the fd open until purge (the lock is what marks the job
+     alive); write index.json {"job_id", "tensors": {}} (no weights); then os.rename(tmp, path) (atomic; the open fd and
+     its flock move with the inode). A directory under its final name therefore always has a held .lock from the
+     moment it appears, so a concurrent sweep can never see it unlocked.
   2. tensor_path(model, tensor) = path / f"m{model}" / (hashlib.sha1(tensor.encode()).hexdigest()[:16] + ".bin").
      allocate creates the parent dir and an empty file (no preallocation), records the expected size and updates
      index.json {"tensors": {"m<model>/<file>": {"tensor", "size"}}}. Allocating the same (model, tensor) twice -> ValueError.
@@ -64,8 +67,10 @@ behavior: |
      a missing file; OSError on unlink/rmdir is recorded (the report is then not ok) and re-raised after the attempt on
      every remaining file.
   6. sweep(root, dry_run, only_job): root missing -> empty report. For each child directory d of root (sorted; if
-     only_job only that name): lock = d/.lock; if lock exists: open it and try flock(LOCK_EX | LOCK_NB); BlockingIOError
-     -> active (skip). Acquired or no .lock -> orphan: count files and bytes (lstat, not following symlinks); unless
+     only_job only that name and its ".pending-<job_id>-*" siblings): a ".pending-*" directory younger than
+     PENDING_GRACE_S = 300 s (st_mtime) is skipped and listed in active (a create() in progress); an older one is
+     treated like any other directory. lock = d/.lock; if lock exists: open it and try flock(LOCK_EX | LOCK_NB);
+     BlockingIOError -> active (skip). Acquired or no .lock -> orphan: count files and bytes (lstat, not following symlinks); unless
      dry_run delete everything under d (unlink files, rmdir bottom-up) and set removed True. Files directly under root
      other than WORKER_LOCK_NAME -> stray (reported, never deleted). bytes_found sums orphan bytes; bytes_removed sums
      deleted bytes.
@@ -82,6 +87,7 @@ acceptance:
     - "test_read_incomplete: a partially written tensor -> JobError"
     - "test_sweep_active_skipped: a live ScratchDir (lock held in this process via a second fd in a child process) is reported active and untouched"
     - "test_sweep_orphan_after_kill: a child process (multiprocessing, spawn) creates a ScratchDir, writes 1 MiB, then os.kill(SIGKILL) itself; sweep(dry_run=True) reports 1 orphan with bytes >= 1 MiB and removes nothing; sweep() removes it; audit(root) then files 0, bytes 0"
+    - "test_create_sweep_race: 4 threads loop sweep(root) while the main thread runs 50 x (ScratchDir.create, write 1 KiB, check the file is still there, purge) -> every write/read succeeds, no job dir is ever reported as orphan, no .pending-* dir remains; a .pending-x dir with mtime set 301 s in the past and no .lock is removed as an orphan, a fresh one is skipped"
     - "test_sweep_no_lock_is_orphan: a directory without .lock is an orphan; a stray root file is reported and kept; .worker.lock is not stray"
     - "test_worker_lock: a child holds WorkerLock; WorkerLock(root, wait_s=0.3, poll_s=0.05) in the parent raises JobError('worker busy...'); after the child exits it succeeds"
     - "test_scratch_root_default: env var set -> that path; unset -> ~/.cache/scout/scratch expanded (monkeypatched HOME)"

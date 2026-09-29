@@ -29,7 +29,9 @@ interface: |
     def main(argv: list[str] | None = None, *, backend_factory: Callable[[str], Backend] | None = None,
              targets: tuple[dict, ...] | None = None, env: Env | None = None,
              client_factory: Callable[[], httpx.Client] | None = None, endpoint: str | None = None,
-             git_state: Callable[..., dict] | None = None, allow_local_targets: bool = False) -> int
+             code_state: Callable[[Path], dict] | None = None, allow_local_targets: bool = False) -> int
+      # code_state defaults to scout.jobs.runner.code_identity (T316): the SAME function the worker hello uses, so
+      # client and worker compare CODE_PATHS tree hashes, never commits (validation r1 major 5)
       # subcommands: preflight | plan | run ; flags: --pins (exit/pins_p4.json) --backend (required: "ssh:HOST"; tests
       # use backend_factory) --store (cards/p4-store) --ledger (exit/ledger_p4.jsonl); run requires --confirm-plans
       # ID:CAP,... (P2 parse_confirm_plans; invalid -> argparse exit 2). Keyword arguments are for the offline rehearsal
@@ -43,21 +45,23 @@ behavior: |
      allow_local_targets); pins = json; C0 = check_target_set(pins) (targets override -> the override's repo set) ->
      FAIL: print table, exit 1, append nothing. ledger problems (p3_ledger.verify(ledger, kinds=P4_KINDS)) -> "LEDGER
      BROKEN", exit 1. backend = backend_factory(text) or parse_backend(text).
-  2. preflight: hello = worker_hello(backend); audit = worker_audit(backend); client git = git_state(repo_root);
-     rows C1 (disk_needed = 0 at preflight: C1 disk row uses the largest plan disk_bytes of the last P4_PLAN entry if
-     any, else 0), C2 (no code_state), C7a (audit files == 0). Print the table, the hello JSON line; append P4_PREFLIGHT;
-     exit 0 iff all rows ok.
+  2. preflight: hello = worker_hello(backend); audit = worker_audit(backend); client_code = code_state(repo_root);
+     rows C1 (check_env(hello, client_code, disk_needed); disk_needed = the largest disk_bytes of the last P4_PLAN
+     entry if any, else 0), C2 (plan_code_id None), C7a (audit files == 0). Print the table, the hello JSON line;
+     append P4_PREFLIGHT {hello, checks, git_commit, code_id, code_dirty}; exit 0 iff all rows ok.
   3. plan: preflight rows first (not appended separately); for each target row: subject_target = f"{subject}@{pin}#{selector}",
-     refs = [f"{base}@{pin}", f"{control}@{pin}"] (local rehearsal: the override's paths); result = attribute(...,
+     references = [f"{base}@{pin}"], controls = [f"{control}@{pin}"] (local rehearsal: the override's paths); result = attribute(...,
      plan_only=True, store=CardStore(store), backend=backend, hello=hello, client=client_factory() if given) -> plan.
      The CountingTransport of the client (scripts.exit_check.CountingTransport around the client's transport) records
      the wire; plan-time client totals.weight must be 0 (C4a). Rows C3 per target (models loaded from the store) and
-     C4a. Print each plan (format_full_plan_dict) to stderr, then "CONFIRM WITH: --confirm-plans ID70:CAP,IDTE:CAP"
+     C4a, and for kind text_encoder the plan-time C15 rows (check_te(label, subject header-scan Card from the store,
+     None): component and tokenizer source_file; validation r1 major 6). Print each plan (format_full_plan_dict) to stderr, then "CONFIRM WITH: --confirm-plans ID70:CAP,IDTE:CAP"
      (P4_TARGETS order) and "TOTAL CAP: <sum> B". Append P4_PLAN {plans: {label: {plan_id, bytes_planned, bytes_cap,
-     disk_bytes}}, git_commit, code_dirty}. Exit 0 iff all rows ok.
+     disk_bytes}}, git_commit, code_id, code_dirty}. Exit 0 iff all rows ok.
   4. run: steps of plan (same plan ids required: they must equal the last P4_PLAN entry's ids, else FAIL "plan changed
-     since P4_PLAN" and exit 1 before any job) -> C2 with code_state = git diff over CODE_PATHS since the P4_PLAN
-     commit. audit_before = worker_audit. Append P4_ATTEMPT {plans, confirm_plans, git_commit, code_dirty,
+     since P4_PLAN" and exit 1 before any job) -> C2 with plan_code_id = the last P4_PLAN entry's code_id (committing
+     the ledger or pins after E3 moves HEAD but not code_id). audit_before = worker_audit. Append P4_ATTEMPT {plans,
+     confirm_plans, git_commit, code_id, code_dirty,
      prior_attempts = count of earlier P4_ATTEMPT entries with the same plan ids} BEFORE the first job.
      For each target in P4_TARGETS order: attribute(..., confirm_plan=id, confirm_bytes=cap from --confirm-plans only
      when that exact pair is listed (else the call declines: C4 FAIL, continue to the next target), wire_audit=True,
@@ -74,14 +78,15 @@ behavior: |
      CONTROL, kind gguf; "te": subject write_te_pipeline(derive(TE_BASE)) with selector "text_encoder", base TE_BASE st
      repo, control CONTROL, kind text_encoder), pins = the local stat-hash keys, backend_factory -> LocalBackend(tmp
      scratch) (real worker subprocesses), env = Env(machine=platform.machine(), system=platform.system(),
-     min_mem_total_bytes=0, require_clean=False), allow_local_targets=True, git_state = the real git_code_state (so the
-     client and worker commits match), gate threshold: the rehearsal
+     min_mem_total_bytes=0, require_clean=False), allow_local_targets=True, code_state = the real code_identity (client
+     and worker run from the same checkout, so their code_id values match), gate threshold: the rehearsal
      sets attribute's gate_threshold_bytes=0 through the targets override field "gate_threshold_bytes" so exact
      confirmation is exercised (the real exit uses the default threshold; its plans are far above it anyway).
 acceptance:
   tests:
     - "test_rehearsal_pass: preflight -> 0; plan -> 0 and prints CONFIRM WITH; run with the printed pairs -> 0; table C0-C16 all PASS; ledger has P4_PREFLIGHT, P4_PLAN, P4_ATTEMPT, P4_EXIT in order and verifies; store holds the attributed Cards; scratch audit 0 files"
     - "test_rehearsal_missing_pair: run with only the 70b pair -> te C4 FAIL (declined, no job), 70b rows PASS, exit 1, P4_EXIT passed false"
+    - "test_rehearsal_code_identity: code_state stub returning another code_id for the client -> preflight C1 FAIL, exit 1; a stub whose commit differs but code_id matches -> C1 PASS; run with a code_id different from P4_PLAN's -> C2 FAIL"
     - "test_rehearsal_plan_changed: modify the control fixture after plan (new file) -> run exits 1 'plan changed since P4_PLAN', no P4_ATTEMPT appended"
     - "test_rehearsal_crash_then_sweep: backend argv_prefix = [sys.executable, '-m', 'tests.helpers.crash_worker'] for the first run -> the job fails, JobOutcome.sweep_after_failure reports 1 orphan removed (the crashed job's dir), C8 FAIL; a second run with the normal worker -> PASS and prior_attempts == 1 in its P4_ATTEMPT"
     - "test_rehearsal_target_set: pins missing one repo -> exit 1 with C0 FAIL and nothing appended"

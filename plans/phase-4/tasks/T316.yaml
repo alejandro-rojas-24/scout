@@ -5,6 +5,7 @@ files:
   - scout/jobs/runner.py
   - scout/jobs/worker.py
   - tests/test_jobs_runner.py
+  - tests/helpers/small_chunk_worker.py
 route: opus
 spec_complete: true
 interface: |
@@ -15,16 +16,29 @@ interface: |
         def tensor(self, model: int, name: str) -> numpy.ndarray
         def rows(self, model: int, name: str, rows: Sequence[int]) -> numpy.ndarray
     def resolve_token() -> str | None   # env HF_TOKEN (non-empty) else ~/.cache/huggingface/token (stripped) else None
+    CODE_PATHS = ("scout", "scripts", "pyproject.toml")          # == P3 T214 / T320 CODE_PATHS
+    def code_identity(repo_root: pathlib.Path) -> dict
+        # {"code_id": str | None, "trees": {path: tree-or-blob sha}, "commit": str | None, "dirty": bool | None}
+        # trees[p] = `git -C repo_root rev-parse HEAD:<p>` for p in CODE_PATHS; code_id = sha256("\n".join(f"{p} {trees[p]}"
+        # for p in CODE_PATHS).encode()).hexdigest(); commit = `git rev-parse HEAD`; dirty = bool(`git status --porcelain
+        # -- scout scripts pyproject.toml`) (untracked files count). No .git or any git error -> all None.
+        # The code identity depends only on the committed CODE_PATHS trees, so committing exit/ (ledger, pins) or any
+        # other path does not change it (validation r1 major 5). T321 uses this same function on the client.
     def hello(scratch_root: pathlib.Path) -> dict                  # plan.md 4.5 hello fields (job_id None)
-        # git_commit/git_dirty: repo_root = Path(scout.__file__).resolve().parent.parent; if (repo_root / ".git") exists:
-        # `git -C repo_root rev-parse HEAD` and bool(`git -C repo_root status --porcelain -- scout scripts pyproject.toml`);
-        # else (or on any error) None and None. machine/system from platform; mem_total_bytes from
+        # repo_root = Path(scout.__file__).resolve().parent.parent; ident = code_identity(repo_root):
+        # git_commit = ident["commit"], git_dirty = ident["dirty"], code_id = ident["code_id"], code_trees = ident["trees"].
+        # wire_audit_available = `import scripts.exit_check` succeeds and has CountingTransport (validation r1 minor:
+        # checked by C1 at E2, so a non-editable install fails before E4). machine/system from platform; mem_total_bytes from
         # os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"); disk_free_bytes = shutil.disk_usage(scratch_root
         # or its nearest existing parent).free; has_hf_token = resolve_token() is not None (the token itself is never sent)
     def run_job(spec: dict, *, scratch_root: pathlib.Path, emit: Callable[[dict], None],
                 client_factory: Callable[[], httpx.Client] | None = None, endpoint: str | None = None,
                 token: str | None = None, disk_usage: Callable[[str], Any] = shutil.disk_usage,
                 wall_clock: Callable[[], float] = time.time) -> dict   # JobResult (plan.md 4.5)
+  tests/helpers/small_chunk_worker.py: `python -m tests.helpers.small_chunk_worker [worker args]` replaces
+    scout.jobs.download.download_plan by functools.partial(original, chunk_bytes=4096) and runs scout.jobs.worker.main
+    (runner.py calls download.download_plan through the module attribute, so the patch applies; T321's crash_worker
+    relies on the same lookup).
   scout/jobs/worker.py:
     def main(argv: list[str] | None = None, *, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
              client_factory: Callable[[], httpx.Client] | None = None, endpoint: str | None = None,
@@ -47,10 +61,12 @@ behavior: |
   4. token = token or resolve_token(); client = client_factory() if given else httpx.Client(timeout=10.0), wrapped when
      spec["wire_audit"] is true: the worker imports scripts.exit_check.CountingTransport (ImportError -> JobError
      "wire audit needs a repo checkout"), and builds the client over CountingTransport(httpx.HTTPTransport()).
-  5. insp = scan.inspect_all([subject target] + reference targets, log, client=client, endpoint=endpoint, token=token)
+  5. insp = scan.inspect_all([subject target] + reference targets + control targets, log, client=client, endpoint=endpoint, token=token)
      (stages RESOLVE, HEADERS, META). Each Inspection must yield exactly one Card (selectors are in the targets).
-  6. hello_disk = disk_usage(scratch_root). plan = fullplan.plan_attribution(LoadedModel(card, table, target) for
-     subject and references, threshold_bytes=spec["plan"]["threshold_bytes"], host=socket.gethostname(),
+  6. hello_disk = disk_usage(scratch_root). threshold = min(spec["plan"]["threshold_bytes"],
+     scout.gate.DEFAULT_GATE_THRESHOLD_BYTES) (the worker never auto-approves more than its own default, whatever the
+     spec says; validation r1 minor). plan = fullplan.plan_attribution(LoadedModel(card, table, target) of the subject,
+     [... of spec references], controls=[... of spec controls], threshold_bytes=threshold, host=socket.gethostname(),
      scratch_root=str(scratch_root), disk_free_bytes=hello_disk.free).
      plan.plan_id != spec.plan.plan_id or plan.bytes_cap != spec.plan.bytes_cap -> log.note("gate", format_full_plan(plan))
      then PlanMismatch(f"worker plan {plan.plan_id}/{plan.bytes_cap} != confirmed {..}/{..}") (0 weight bytes).
@@ -58,7 +74,7 @@ behavior: |
   8. log.stage(FULL_DOWNLOAD); d = run_full_gate(plan, log, spec_confirmer(spec["confirmation"]), display=<stderr>);
      emit({"type": "gate", "decision": d.to_dict()}); not approved -> GateDeclined. log.grant(plan.plan_id,
      plan.grant_ranges(), plan.bytes_cap, stage=FULL_DOWNLOAD). scratch = ScratchDir.create(scratch_root,
-     spec["job_id"], log). try: download_plan(plan, {i: insp[i].source}, scratch, log); log.stage(COMPUTE) (revokes the
+     spec["job_id"], log). try: download.download_plan(plan, {i: insp[i].source}, scratch, log); log.stage(COMPUTE) (revokes the
      grant); attribution = attrib.attribute(plan, models, vocabs, ScratchProvider(scratch, plan, block_sizes))
      finally: report = scratch.purge(); log.note("purge", f"released {report.bytes_removed} weight bytes from disk;
      disk_resident={log.disk_resident} files={report.files_removed if not report.dir_absent else 0}"). The finally runs
@@ -76,15 +92,18 @@ behavior: |
       dequant.decode(raw, r.dtype, r.shape, out="float32"); FP8 -> multiply by the decoded scale tensor
       (roles_by_block gate_scale/up_scale; dequant.apply_scale with block_sizes[model]); returns (out, in) or (n,).
       rows: decode_rows on the embedding.
-  12. worker.main: prints hello first for jobs; runs run_job with emit writing protocol lines to stdout (flush each);
+  12. worker.main: prints hello first for jobs; runs run_job with emit writing protocol lines to stdout (flush each).
+      emit holds a module-level threading.Lock for the whole encode + write + flush, so a heartbeat line and an event
+      line can never interleave bytes; event lines leave in seq order because the ByteLog calls on_event in seq order
+      (T301 behavior 10) and emit is called from inside on_event;
       on success emits result then bye 0 and returns 0; on ScoutError e emits {"type": "error", "error": {"type",
       "message", "exit_code"}, "purge": report or None} then bye e.exit_code and returns it; on any other exception exit
       code 1 likewise. hello/sweep/audit subcommands print one JSON line and return 0. Logs of human text go to stderr.
 acceptance:
   tests:
     - "fixtures: T313 local repos (BASE, CONTROL, GGUF Q4_K of derive(BASE), FP8 of derive(BASE), TE pipeline of derive(TE_BASE) + TE_BASE st repo); client plans built with T310 from Cards scanned into a tmp dir; specs via T315 make_spec with gate_threshold_bytes 0 and an exact cli-flag decision"
-    - "test_run_job_gguf_subject: InProcessBackend-free direct call run_job(spec, emit=collector) with subject GGUF, refs BASE and CONTROL -> result attribution: BASE 16/16 attributed, CONTROL 0; purge report ok; scratch root audit 0 files; totals.weight within [bytes_planned, bytes_cap]; events contain the COMPUTE purge note before the PURGE check note; exactly 1 gate message via job-spec"
-    - "test_run_job_fp8_and_te: FP8 subject vs BASE -> 16/16; TE pipeline subject '#text_encoder' vs TE reference -> 12/12, other_stacks has the vision stack"
+    - "test_run_job_gguf_subject: InProcessBackend-free direct call run_job(spec, emit=collector) with subject GGUF, reference BASE and control CONTROL -> result attribution: BASE 16/16 attributed, CONTROL (role control) 0 tests above crit, control_ok; purge report ok; scratch root audit 0 files; totals.weight within [bytes_planned, bytes_cap]; events contain the COMPUTE purge note before the PURGE check note; exactly 1 gate message via job-spec"
+    - "test_run_job_fp8_and_te: FP8 subject vs BASE (control CONTROL) -> 16/16; TE pipeline subject '#text_encoder' vs TE reference (control CONTROL) -> 12/12, other_stacks has the vision stack"
     - "test_plan_mismatch_zero_weight: spec with plan_id altered -> PlanMismatch; 0 weight bytes; no scratch dir created"
     - "test_spec_cap_widened_refused: spec.plan.bytes_cap + 1 (and the confirmation bytes_confirmed matching it) -> PlanMismatch, 0 weight bytes"
     - "test_disk_space: disk_usage stub with free = disk_bytes -> DiskSpaceError, 0 weight bytes"
@@ -93,6 +112,9 @@ acceptance:
     - "test_worker_main_local_backend: T315 LocalBackend (default argv, real subprocess) + run_job_via on the GGUF subject job -> succeeded, n_ingested == result n_events, client log totals.weight == worker totals.weight"
     - "test_inprocess_backend: T315 InProcessBackend with FakeHub hub targets (write repos into FakeHub, pinned shas) -> succeeded"
     - "test_hello_sweep_audit_cli: `python -m scout.jobs.worker hello --scratch-root tmp` prints one hello JSON with params_digest; sweep/audit print reports"
+    - "test_emitted_seqs_ordered_under_concurrency: GGUF subject job with download_plan chunk_bytes monkeypatched to 4096 (hundreds of chunks over 4 threads) and heartbeat_s monkeypatched to 0.01 -> the emitted event messages have seqs exactly 1..n in emission order, every emitted line decodes (no interleaving), and run_job_via over LocalBackend(argv_prefix=[sys.executable, '-m', 'tests.helpers.small_chunk_worker']) -> succeeded with n_ingested == result n_events"
+    - "test_threshold_capped: spec plan.threshold_bytes = 10**15 with a declined confirmation (approved True but bytes_confirmed None) -> the worker gate declines (threshold capped at DEFAULT_GATE_THRESHOLD_BYTES); 0 weight bytes"
+    - "test_hello_code_identity: in a tmp git repo with scout/, scripts/, pyproject.toml committed: code_identity gives 3 trees and a code_id; committing a new file under exit/ changes commit but not code_id; editing scout/x.py uncommitted -> dirty True; no .git -> all None"
     - "test_worker_lock_serial: two concurrent run_job calls on the same scratch root -> the second waits for the first (lock_wait monkeypatched; both succeed, timestamps ordered)"
   commands:
     - pytest -q tests/test_jobs_runner.py

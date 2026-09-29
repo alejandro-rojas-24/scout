@@ -24,7 +24,8 @@
   - Attention blocks: head-level matching of q/k/v/o.
 - **Attribution evaluation on the P3 labeled set.** Run all blocks for the 51 pairs on the Spark (about 60–80 GB of
   MLP reads) to measure the null on 9+ independent families and the recall on the derived pairs. P4 only measures the
-  null on the two exit controls.
+  null on the two exit controls. Since plan r1 this is also the measurement of assumption A-null (plan.md 3.8 step 7):
+  on real hard negatives, does an independent candidate's aligned z look like a documented control's at equal depth?
 - **JEV on quantised pairs.** The P3 JEV was calibrated on unquantised pairs. Quantisation adds distance, as a light
   fine-tune would (plan.md 3.7), so it is fail-safe for false derived but can cost recall. Add quantised derived pairs
   to the labeled set, or an explicit abstain policy.

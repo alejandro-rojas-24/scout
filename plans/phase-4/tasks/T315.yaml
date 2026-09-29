@@ -17,6 +17,7 @@ interface: |
                                      # "quant": QUANT_PARAMS, "gguf": GGUF_PARAMS} (imports inside the function)
     def new_job_id(plan_id: str, *, now: datetime | None = None, rand_hex: Callable[[int], str] = secrets.token_hex) -> str
     def make_spec(*, plan: FullPlan, decision: GateDecision, subject_target: str, reference_targets: list[str],
+                  control_targets: list[str],
                   endpoint: str, scratch_root: str | None, wire_audit: bool, client_hostname: str,
                   git_commit: str | None, now: datetime | None = None) -> dict          # plan.md 4.4
     def validate_spec(spec: dict) -> list[str]                                         # [] when valid
@@ -62,15 +63,17 @@ interface: |
                     idle_timeout_s: float = JOB_PARAMS["client_idle_timeout_s"],
                     clock: Callable[[], float] = time.monotonic) -> JobOutcome
   tests/helpers/fake_worker.py: a scriptable fake worker (python -m tests.helpers.fake_worker SCENARIO) that prints
-    jobproto lines for scenarios "ok", "no_bye", "malformed", "silent", "error", "crash_mid" (used by these tests only)
+    jobproto lines for scenarios "ok", "no_bye", "malformed", "silent", "error", "crash_mid", "none_first", "bad_event",
+    "swapped" (used by these tests only)
 behavior: |
   1. make_spec builds plan.md 4.4 exactly: job_id = new_job_id(plan.plan_id) ("%Y%m%dT%H%M%SZ" UTC + "-" + plan_id[:8]
-     + "-" + rand_hex(3)); subject/references from plan.models (target, repo, revision_sha, component); plan =
+     + "-" + rand_hex(3)); subject/references/controls from plan.models by role (target, repo, revision_sha, component); plan =
      {plan_id, bytes_planned, bytes_cap, disk_bytes, threshold_bytes}; confirmation = {plan_id, approved, via,
      bytes_confirmed, decided_at} from the decision (declined decision -> ValueError: never submit a declined plan);
      params_digest(); endpoint; scratch_root; wire_audit. No token anywhere (validate_spec rejects any key containing
      "token" or "authorization", case-insensitive, at any depth).
-  2. validate_spec: schema, job_id format, kind "attribute", subject/references shape, targets pinned (Hub:
+  2. validate_spec: schema, job_id format, kind "attribute", subject/references/controls shape (references and controls
+     each non-empty: an attribution job without a control is invalid, D76), targets pinned (Hub:
      repo@<40-hex>[#sel]; local: absolute path), plan/confirmation keys and types, confirmation.plan_id == plan.plan_id,
      approved True, endpoint str, wire_audit bool.
   3. Channels: LocalBackend/SshBackend use subprocess.Popen(argv, stdin=PIPE, stdout=PIPE, stderr=PIPE); stdin is
@@ -86,9 +89,20 @@ behavior: |
      e. event -> worker_seqs.append(msg["event"]["seq"]); log.ingest(msg["event"], origin=origin); n_ingested += 1; stage_start events -> display(f"[{origin}]
         {stage} ..."). gate -> log.add_gate_decision({**decision, "origin": origin}). heartbeat -> nothing displayed.
         result -> keep. error -> keep. bye -> stop reading; exit_code = msg["exit_code"].
+        Events with stage "NONE" (worker notes logged before its first stage, e.g. the sweep note) are ingested
+        normally (T301 accepts "NONE").
+     e2. Ingest and message errors (validation r1 major 3). Any exception raised while handling one message
+        (protocol.decode -> BackendError; log.ingest / add_gate_decision -> ValueError; a missing key -> KeyError) is
+        caught at the message loop: ch.kill() (the remote worker then fails its next write with BrokenPipeError and
+        purges in its finally, T316), status "failed", error = {"type": type(e).__name__, "message": f"message
+        {n_read} ({msg_type}): {e}", "exit_code": 7}; no further message is read or ingested; then steps f-h run as
+        for any failure (sweep_after_failure, JobRecord, the job note). run_job_via never lets such an exception
+        escape; T317 turns the failed outcome into JobError.
      f. ch.wait(); a process exit code different from bye.exit_code, a missing bye, or a malformed line -> failed
         (BackendError text in error). status "succeeded" iff result present, error absent, exit_code 0,
-        result["n_events"] == n_ingested and worker_seqs is consecutive (each seq = previous + 1).
+        result["n_events"] == n_ingested and worker_seqs == list(range(1, n_ingested + 1)) (the worker ByteLog numbers
+        its events from 1 and emits them in seq order, T301 behavior 10; an out-of-order or missing seq is therefore a
+        real defect and fails the job).
      g. On failure: sweep_after_failure = worker_sweep(backend) (exceptions caught and reported as {"error": str}).
      h. record = plan.md 4.1 JobRecord built from spec, hello, result/error, timings (started/finished UTC ISO, wall_s),
         backend kind and host; log.add_job_record(record); log.note("job", f"{job_id} {status} (exit {exit_code})").
@@ -102,6 +116,9 @@ acceptance:
     - "test_protocol: encode/decode round trip for every type; unknown type, wrong proto, missing required key -> BackendError"
     - "test_run_ok_fake_worker: LocalBackend(argv_prefix=[sys.executable, '-m', 'tests.helpers.fake_worker', 'ok']) -> succeeded; the fake's 5 events ingested with origin 'fakehost', client totals include their bytes, gate decision recorded with origin, job record appended, display saw the stage lines"
     - "test_ingest_complete: fake result with n_events 4 while 5 events were sent -> failed"
+    - "test_none_stage_first_event: scenario 'none_first' (first event is a 'job' note with stage 'NONE', as the real worker's sweep note) -> succeeded, that event ingested with origin"
+    - "test_ingest_error_kills_and_sweeps: scenario 'bad_event' (3rd event has bytes -1) -> status failed, error type ValueError with 'message 4 (event)' in its text, the fake process was killed (wait returns a signal code), events after it not ingested (n_ingested == 2), worker_sweep called, JobRecord appended; run_job_via does not raise"
+    - "test_out_of_order_seq_fails: scenario 'swapped' (seqs 1, 3, 2, 4, 5) -> failed (seq check)"
     - "test_idle_timeout: scenario 'silent' with idle_timeout_s=0.5 -> failed 'idle timeout', process killed, worker_sweep called (fake records the call)"
     - "test_no_bye_and_malformed: scenarios -> failed with BackendError text; sweep_after_failure present"
     - "test_digest_mismatch: fake hello with another params_digest -> failed 'worker code differs', no event ingested"

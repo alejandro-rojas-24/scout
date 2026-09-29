@@ -42,6 +42,9 @@ interface: |
         def import_tree(self, cards_dir: pathlib.Path) -> list[StoreEntry]
         def same_weights(self, content_digest: str) -> list[str]           # key strings
         def list_all(self, *, stale: bool = False) -> list[StoreEntry]
+        def reindex(self) -> int
+            # rebuild refs/ and by-weights/ from objects/ alone; returns the number of entries (plan.md 3.5: the
+            # indexes are derived data, the Card objects are the only persisted artifact, invariant 1)
 
     def cached_scan(target: str, store: CardStore, log: ByteLog | None = None, *, tokenizer: bool = False,
                     sample: bool = False, anchors: bool = False, **scan_kwargs) -> tuple[list[StoreEntry], bool]
@@ -84,6 +87,11 @@ behavior: |
         tokenizer=..., sample=..., anchors=..., **kw); entries = [store.put_files(p.json_path, p.parquet_path) for p in
         res.cards]; if sel is None: store.set_units(repo, res.revision_sha, [e.component for e in entries]).
         Return (entries, False).
+  10a. reindex(): under the writer lock, build every entry exactly as put_files would (behavior 3) from each
+      objects/<h[:2]>/<h>/ pair (created_at = the Card's `scan.scanned_at` (P1 Card field) if present, else the
+      JSON file's mtime as ISO Z; scout_version from the Card), write fresh refs (units None: a whole-repo hit needs one
+      rescan after a reindex) and by-weights files to a temp tree, then replace refs/ and by-weights/ atomically
+      (rename the old trees aside, rename the new ones in, delete the old). Objects are never modified.
   10. No weights are ever stored: put_files rejects any file whose name does not end with ".card.json" /
       ".tensors.parquet" (StoreError).
 acceptance:
@@ -99,6 +107,7 @@ acceptance:
     - "test_find_attribution: a Card built by card.with_attribution with 2 references -> find_attribution(subject, refs in any order) hits; different reference set misses"
     - "test_same_weights: two FakeHub repos with identical safetensors bytes (lfs on) -> same content_digest -> same_weights lists both keys"
     - "test_concurrent_put: 8 processes (multiprocessing spawn) each put a distinct Card for the same (repo, sha) with different components -> 8 entries, the ref JSON valid, no temp files left"
+    - "test_reindex: put 3 Cards (2 with content_digest), delete refs/ and by-weights/ -> reindex() == 3; find/find_attribution/same_weights give the same answers as before (units None); objects untouched (bytes equal)"
     - "test_rejects_non_card: put_files of a .safetensors path -> StoreError"
   commands:
     - pytest -q tests/test_store.py

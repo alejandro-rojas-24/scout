@@ -10,7 +10,8 @@ interface: |
   scout/cli.py (additions to P3 T215; main signature unchanged, plus a test-only keyword backend_factory):
     def main(argv=None, *, client_factory=None, s2_client_factory=None,
              backend_factory: Callable[[str], Backend] | None = None) -> int
-    scout attribute SUBJECT --base TARGET [--base TARGET ...] [--backend local|ssh:HOST] [--store DIR]
+    scout attribute SUBJECT --base TARGET [--base TARGET ...] --control TARGET [--control TARGET ...]
+                    [--backend local|ssh:HOST] [--store DIR]
                     [--plan-only | --confirm-plan PLAN_ID --confirm-bytes N] [--gate-threshold-bytes N]
                     [--out DIR] [--json] [--endpoint URL]
       defaults: --backend = env SCOUT_BACKEND or "local"; --store = env SCOUT_STORE or "cards/store"
@@ -21,11 +22,13 @@ interface: |
     scout scan TARGET ... [--store DIR]                         # with --store: cached_scan; prints hit/scanned + keys
     scout serve ... [--store DIR]                               # passes store_dir to serve()
 behavior: |
-  1. attribute: backend = backend_factory(text) if given else parse_backend(text). Calls scout.attribute.attribute(...)
+  1. attribute: at least one --base and one --control are required (argparse error exit 2 "block attribution needs
+     an independent --control model; see plan.md 3.8"). backend = backend_factory(text) if given else parse_backend(text). Calls scout.attribute.attribute(...)
      with display = stderr printer. --plan-only prints the plan and the CONFIRM WITH line to stderr, exit 0.
      --confirm-plan without --confirm-bytes (or the reverse) -> argparse error exit 2 "--confirm-plan and
-     --confirm-bytes go together". Success: stdout = result.text (or JSON {"card_key", "object", "cached", "attribution"}
-     with --json), exit 0. GateDeclined -> exit 6 with the P2 message and the CONFIRM WITH line on stderr. JobError 7,
+     --confirm-bytes go together". Success: stdout = result.text (or, with --json, JSON {"card_key", "object", "cached",
+     "attribution", "disclaimers": scout.view.DISCLAIMERS, "caveat": ATTRIBUTION_CAVEAT}; invariant 5 holds for the
+     machine-readable output too), exit 0. GateDeclined -> exit 6 with the P2 message and the CONFIRM WITH line on stderr. JobError 7,
      PurgeError 8, DiskSpaceError 9, other ScoutError -> their exit codes with the message on stderr.
   2. jobs subcommands forward argv to scout.jobs.worker.main unchanged and return its exit code.
   3. store import DIR -> prints f"imported {n} Cards into {store}" and exit 0; store ls -> one line per entry
@@ -39,9 +42,11 @@ behavior: |
      removed.
 acceptance:
   tests:
-    - "test_attribute_plan_only: backend_factory -> InProcessBackend over T313 local repos; `scout attribute <gguf dir> --base <base dir> --base <control dir> --plan-only --store tmp` -> exit 0, stderr has FULL DOWNLOAD GATE and CONFIRM WITH, stdout empty"
+    - "test_attribute_plan_only: backend_factory -> InProcessBackend over T313 local repos; `scout attribute <gguf dir> --base <base dir> --control <control dir> --plan-only --store tmp` -> exit 0, stderr has FULL DOWNLOAD GATE and CONFIRM WITH, stdout empty"
     - "test_attribute_confirmed: copy the plan_id/cap from the plan-only stderr, run with --confirm-plan/--confirm-bytes and --gate-threshold-bytes 0 -> exit 0, stdout contains 'BLOCK ATTRIBUTION' and the caveat; a second run prints the same text with 0 jobs (cached)"
+    - "test_attribute_json_disclaimers: the confirmed run with --json -> stdout parses; 'disclaimers' == scout.view.DISCLAIMERS (all three) and 'caveat' == ATTRIBUTION_CAVEAT"
     - "test_attribute_declined: wrong bytes -> exit 6, stderr has NOT CONFIRMED and the CONFIRM WITH line"
+    - "test_control_required: attribute without --control -> exit 2 with the message"
     - "test_confirm_flags_together: only --confirm-plan -> exit 2"
     - "test_jobs_cli: `scout jobs hello --scratch-root tmp` prints a hello JSON; `scout jobs sweep --json --scratch-root tmp` prints a SweepReport JSON; exit 0"
     - "test_store_cli: store import of a P1-layout dir with 2 Cards -> 'imported 2'; store ls lists 2 lines; --json parses"

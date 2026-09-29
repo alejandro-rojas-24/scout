@@ -30,7 +30,12 @@ interface: |
         s: float = 0.3            # embedding semantic weight
         a: float = 0.3            # neuron semantic weight
         gamma: float = 0.3        # within-neuron gate/up correlation
+        depth_dict: tuple[int, int, float] | None = None
+            # (dict_seed, K, drift): depth-local universality (validation r1 major 1). Every family with the same
+            # depth_dict draws its neurons' semantic directions from the SAME per-layer dictionary, so independent
+            # families share features at equal depth but not across depths.
 
+    def depth_dicts(dict_seed: int, n_layers: int, K: int, drift: float) -> list[numpy.ndarray]   # n_layers x (K, SEM_RANK)
     def glu_weights(spec: GluSpec, vocab: list[str]) -> dict[str, numpy.ndarray]     # float32, llama-style HF names
     def derive(w: dict, *, eps: float, seed: int, permute_neurons: bool = True, rotate_hidden: bool = False,
                reinit_blocks: Sequence[int] = (), reinit_spec: GluSpec | None = None, shift_blocks: int = 0) -> dict
@@ -49,7 +54,13 @@ interface: |
     CONTROL = GluSpec(seed=2, inter=768)
     TE_BASE = GluSpec(seed=3, n_layers=12)
     INFLATED = (1.0, 2.0, 0.9)                 # (s, a, gamma) of the inflated-null families
-    NULL_PAIRS: tuple[tuple[int, int], ...] = tuple((100 + 2 * p, 101 + 2 * p) for p in range(6))
+    NULL_TRIPLES: tuple[tuple[int, int, int], ...] = tuple((100 + 3 * p, 101 + 3 * p, 102 + 3 * p) for p in range(6))
+        # (subject seed, independent candidate seed, independent control seed); replaces r0 NULL_PAIRS
+    DEPTH_LOCAL: tuple[int, int, float] = (5, 16, 1.0)          # (dict_seed, K, drift)
+    DEPTH_LOCAL_DIMS: dict = {"n_layers": 12, "hidden": 256, "inter": 1024, "s": 1.0, "a": 2.0, "gamma": 0.9}
+        # m = min(m_test, 1024, 1024) = 1024 >= 1024 as validation r1 asks; every neuron is tested (m == inter), the
+        # regime where the depth-local inflation is largest (plan.md 3.8 table)
+    DEPTH_LOCAL_TRIPLES: tuple[tuple[int, int, int], ...] = tuple((300 + 3 * p, 301 + 3 * p, 302 + 3 * p) for p in range(4))
     DERIVE_EPS: float = 0.05
     DERIVE_SEED: int = 8
 behavior: |
@@ -58,7 +69,10 @@ behavior: |
      SEM_SEED + int.from_bytes(hashlib.sha256(t.encode()).digest()[:4], 'little')).standard_normal(r).
      B = rng.standard_normal((r, H)) (model-specific basis).
      E = spec.s * Z @ B + rng.standard_normal((V, H)); model.embed_tokens.weight = (0.02 * E).astype(float32).
-     For each layer l: c = rng.standard_normal((I, r)); g = spec.a * c @ B / sqrt(r) + rng.standard_normal((I, H));
+     With spec.depth_dict = (ds, K, drift): F = depth_dicts(ds, spec.n_layers, K, drift), else F = None (computed
+     BEFORE any draw from rng, from its own generator, so the rng stream of families without depth_dict is unchanged).
+     For each layer l: c = rng.standard_normal((I, r)) if F is None else F[l][rng.integers(0, K, I)] + 0.3 *
+     rng.standard_normal((I, r)); g = spec.a * c @ B / sqrt(r) + rng.standard_normal((I, H));
        c2 = spec.gamma * c + sqrt(1 - gamma^2) * rng.standard_normal((I, r));
        u = spec.a * c2 @ B / sqrt(r) + spec.gamma * (g - spec.a * c @ B / sqrt(r)) + sqrt(1 - gamma^2) * rng.standard_normal((I, H));
        mlp.gate_proj.weight = g / sqrt(H); mlp.up_proj.weight = u / sqrt(H); mlp.down_proj.weight = rng.standard_normal((H, I)) / sqrt(I);
@@ -68,6 +82,9 @@ behavior: |
      model.norm.weight = ones(H); lm_head.weight = 0.02 * rng.standard_normal((V, H)). All float32, insertion order =
      embed, layers in order (input_layernorm, q, k, v, o, post_attention_layernorm, gate, up, down), norm, lm_head.
      (This is the planner's measured generator, plan.md 3.8; the rng stream is part of the fixture.)
+  1b. depth_dicts(dict_seed, L, K, drift): g = numpy.random.default_rng(dict_seed); F_0 = g.standard_normal((K, SEM_RANK));
+     F_l = sqrt(1 - drift**2) * F_{l-1} + drift * g.standard_normal((K, SEM_RANK)) for l >= 1 (drift 1.0: an independent
+     dictionary per depth, shared by all families; the validator's /tmp/val4/depthlocal.py model).
   2. derive(w, eps, seed, ...): rng = default_rng(seed). Every tensor X gets X + eps * X.std() * rng.standard_normal(X.shape)
      (float32), in insertion order. permute_neurons: per layer P = rng.permutation(I): gate/up rows and down columns
      permuted by P. rotate_hidden: Q = orthogonal from numpy.linalg.qr(rng.standard_normal((H, H)))[0]; fold each norm
@@ -102,7 +119,8 @@ behavior: |
      excluded from candidates); nearest finite code by absolute difference, ties to the even code; clip to +-448.
 acceptance:
   tests:
-    - "test_frozen: the constants, BASE/CONTROL/TE_BASE, INFLATED, NULL_PAIRS, DERIVE_EPS, DERIVE_SEED equal the literals"
+    - "test_frozen: the constants, BASE/CONTROL/TE_BASE, INFLATED, NULL_TRIPLES, DEPTH_LOCAL, DEPTH_LOCAL_DIMS, DEPTH_LOCAL_TRIPLES, DERIVE_EPS, DERIVE_SEED equal the literals"
+    - "test_depth_dicts: depth_dicts(5, 12, 16, 1.0) is deterministic, 12 arrays of shape (16, 16); with drift 0.0 all 12 are equal; with drift 1.0 consecutive arrays are uncorrelated (|Pearson of flattened arrays| < 0.35); glu_weights(GluSpec(seed=300, depth_dict=DEPTH_LOCAL, **DEPTH_LOCAL_DIMS), attrib_vocab(300)) has inter 1024 gate rows per layer and is deterministic; a spec without depth_dict never calls depth_dicts (spy)"
     - "test_glu_shapes: glu_weights(BASE, attrib_vocab(1)) has 1 + 16*9 + 2 tensors with the stated shapes; deterministic across calls; two families share Z for shared tokens (same row of Z) but not B"
     - "test_derive_permute: derive(..., eps=0, permute_neurons=True) -> each layer's gate rows are a permutation of the input's (sorted row norms equal) and down columns permuted consistently"
     - "test_derive_rotation_function: with eps=0, rotate_hidden=True: for a random probe row x from E, (rmsnorm-free) x_derived @ gate_derived.T equals x @ (gate * post_norm).T within 1e-4 relative"

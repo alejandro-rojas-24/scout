@@ -30,6 +30,8 @@ interface: |
     @dataclass(frozen=True)
     class ModelPlan:
         index: int; role: str; card_key: dict; target: str; title: str; stack_prefix: str | None; blocks: list[int]
+        # role: "subject" | "reference" (a candidate base) | "control" (an independent model that calibrates the null,
+        # plan.md 3.8 step 6; D76)
         roles_by_block: dict[int, dict[str, str]]      # block -> {"gate": name, "up": name, "norm": name, ["gate_scale", "up_scale"]}
         embed: str | None; hidden: int | None; model_type: str | None
         status: str                                    # "planned" | "untestable"
@@ -39,10 +41,13 @@ interface: |
 
     @dataclass(frozen=True)
     class FullPlan:
-        plan_id: str; models: list[ModelPlan]; bytes_planned: int; bytes_cap: int; slack_bytes: int; disk_bytes: int
+        # Satisfies the P2 SamplePlan attributes that scout.gate.decision / flag_confirmer read (P2 T106: plan_id,
+        # reads (len), bytes_planned, bytes_cap, threshold_bytes, disk_bytes, memory_peak_bytes, reason), so the P2
+        # confirmers apply unchanged (validation r1 major 4). `reads` is a FIELD, not a method.
+        plan_id: str; models: list[ModelPlan]; reads: list[FullRead]      # reads = all models' reads, plan order
+        bytes_planned: int; bytes_cap: int; slack_bytes: int; disk_bytes: int
         memory_peak_bytes: int; threshold_bytes: int; reason: str
         host: str | None = None; scratch_root: str | None = None; disk_free_bytes: int | None = None
-        def reads(self) -> list[FullRead]
         def per_file(self) -> list[dict]               # [{"model", "path", "n_reads", "bytes"}] sorted by (model, path)
         def grant_ranges(self) -> list[tuple[str, int, int]]   # (f"m{model}:{path}", start, end_exclusive)
         def to_dict(self) -> dict                      # plan.md 4.3
@@ -50,7 +55,7 @@ interface: |
     def select_stack(m: LoadedModel) -> tuple[str | None, list[int], dict[int, dict[str, str]], list[dict], str | None]
         # (stack_prefix, tested blocks, roles_by_block, other_stacks, reason if untestable)
     def slack_bytes(bytes_planned: int, largest_read: int, chunk_bytes: int) -> int
-    def plan_attribution(subject: LoadedModel, references: list[LoadedModel], *,
+    def plan_attribution(subject: LoadedModel, references: list[LoadedModel], *, controls: list[LoadedModel],
                          threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES, host: str | None = None,
                          scratch_root: str | None = None, disk_free_bytes: int | None = None,
                          chunk_bytes: int = JOB_PARAMS["chunk_bytes"], workers: int = JOB_PARAMS["download_workers"],
@@ -82,7 +87,10 @@ behavior: |
      "no GLU MLP (gate_proj/up_proj) stack" (+ " (fused gate_up_proj)" when seen); fewer than MIN_BLOCKS eligible ->
      f"only {n} testable blocks (< {MIN_BLOCKS})".
   4. Subject untestable -> plan_attribution raises JobError(f"subject not attributable: {reason}") (no plan, 0 bytes).
-     An untestable reference is kept with status "untestable", no reads, bytes 0.
+     An untestable reference or control is kept with status "untestable", no reads, bytes 0. models = [subject] +
+     references (role "reference") + controls (role "control"), indices in that order. references empty or controls
+     empty -> ValueError("block attribution needs >= 1 reference and >= 1 independent control") (no plan). A plan
+     whose controls are all untestable is still built (the statistic then abstains, T314).
   5. Reads per planned model, in order: embed (role "embed", block_index -1), then for each tested block ascending:
      gate, gate_scale (if any, role "scale"), up, up_scale, norm. Duplicate ranges within a model are impossible
      (distinct tensors). component = key.component.
@@ -92,8 +100,9 @@ behavior: |
      memory_peak_bytes = 4 * (4 * G + 4 * P * I + 2 * L_s * m * m * S) + workers * chunk_bytes with G = max gate numel
      over planned models, P = n_probe, I = max gate rows, L_s = len(subject blocks), m = min(m_test, subject gate rows),
      S = number of planned references (one probe set each, conservatively).
-  7. plan_id = sha256(json.dumps(["attrib.v1", [[k["repo"], k["revision_sha"], k["component"], [[r.path, r.start,
-     r.end_exclusive] for r in m.reads]] for m in models]], separators=(",", ":")).encode()).hexdigest()[:16].
+  7. plan_id = sha256(json.dumps(["attrib.v1", [[m.role, k["repo"], k["revision_sha"], k["component"], [[r.path, r.start,
+     r.end_exclusive] for r in m.reads]] for m in models]], separators=(",", ":")).encode()).hexdigest()[:16]
+     (the role is part of the id: swapping a reference and a control changes the plan the human confirms).
      host, scratch_root and disk_free_bytes are display-only (not in plan_id).
   8. reason = "; ".join(f"block attribution (Zhu et al. matching test): gate/up/norm x {len(blocks)} blocks of {prefix} +
      embedding {embed} of {title} [{role}]" for planned models).
@@ -125,7 +134,8 @@ behavior: |
 acceptance:
   tests:
     - "fixtures: T313 write_st_repo(BASE), write_st_repo(CONTROL), write_st_repo(derive(BASE, eps=DERIVE_EPS, seed=DERIVE_SEED)), write_fp8_repo(BASE), write_te_pipeline(TE_BASE); Cards from the P1-P3 scan() over the local folders into a tmp out dir, then load_card. GGUF Cards need T307 (a later wave): the planner sees GGUF only through the T304 adapter, so its GGUF plans are covered by T307/T316/T321 tests"
-    - "test_plan_basic: subject (derived BF16) + base + control -> 3 planned models, blocks 0..15 each, reads per model = 1 + 16*3, every read range equals the Parquet row's absolute range, bytes_planned == sum of Parquet nbytes of those rows; plan_id stable across calls, changes when one reference changes"
+    - "test_roles: plan_attribution(subj, [base], controls=[control]) -> roles subject/reference/control in that order; swapping base and control changes plan_id; controls=[] or references=[] -> ValueError"
+    - "test_plan_basic: subject (derived BF16) + base (reference) + control (controls=[...]) -> 3 planned models, blocks 0..15 each, reads per model = 1 + 16*3, every read range equals the Parquet row's absolute range, bytes_planned == sum of Parquet nbytes of those rows; plan_id stable across calls, changes when one reference changes"
     - "test_slack: slack_bytes(179000967168, 939524096, 2**26) == 699222528; slack_bytes(25956065280, 271581184, 2**26) == 268435456; slack_bytes(10**6, 10**5, 2**26) == 16777216"
     - "test_plan_fp8_companions: FP8 subject -> reads include role 'scale' for every gate/up with the _scale_inv tensor range"
     - "test_plan_text_encoder: TE pipeline Card (component text_encoder) -> stack model.language_model.layers tested (12 blocks); other_stacks lists model.visual.blocks with reason 'no probe basis (width 64 != embedding 256)'"
@@ -134,7 +144,8 @@ acceptance:
     - "test_format_full_plan: text contains 'FULL DOWNLOAD GATE', exact bytes with thousands separators, 'deleted after COMPUTE', the plan_id, one line per model and per file; dict variant identical"
     - "test_run_full_gate: below-threshold approves without calling the confirmer; flag_confirmer(plan_id, cap) approves via cli-flag; cap-1, cap+1, 10**15, another plan_id -> declined; display and the gate note happen before the confirmer (spy); decision has disk_bytes == bytes_planned"
     - "test_spec_confirmer: exact pair approves via job-spec; approved False / wrong id / wrong cap / bytes_confirmed None above threshold -> declined"
-    - "test_grant_ranges: prefixed paths m0:/m1:/m2: and the ranges of reads()"
+    - "test_grant_ranges: prefixed paths m0:/m1:/m2: and the ranges of plan.reads"
+    - "test_p2_confirmer_contract: plan.reads is a list equal to the concatenation of models[i].reads; scout.gate.decision(plan, approved=True, via='x', bytes_confirmed=plan.bytes_cap) returns a GateDecision with n_reads == len(plan.reads) and disk_bytes == plan.disk_bytes; scout.gate.flag_confirmer(plan.plan_id, plan.bytes_cap)(plan).approved is True via 'cli-flag'; the same through run_full_gate (above threshold) approves"
   commands:
     - pytest -q tests/test_fullplan.py
     - pytest -q

@@ -1,6 +1,6 @@
 id: T306
 title: Card v3 schema (format, quant, content_digest, lfs_sha256, gguf file block, source_name column, fetch_log disk/jobs, attribution slot), with_attribution, object_id, validate_attribution; P2 C8 and P3 C3 accept card.v3 in the same change
-depends_on: [T202, T216, T301]
+depends_on: [T202, T216, T301, T302]
 files:
   - scout/card.py
   - tests/test_card.py
@@ -52,13 +52,17 @@ behavior: |
   2. content_digest(hashes): any None or empty list -> None; else "sha256:" + sha256("\n".join(sorted(hashes)).encode()).hexdigest().
   3. object_id(j, p) = sha256(b"scout.card-object.v1\n" + sha256(j).hexdigest().encode() + b"\n" + sha256(p).hexdigest().encode()).hexdigest().
   4. validate_attribution(att): checks, collecting one message per problem:
-     keys exactly {version, method, params, subject_stack, other_stacks, alpha, n_tests, z_crit, references, blocks,
-     caveat, job, computed_at}; version == "attribution.v1"; subject_stack has prefix/depth/indices with
-     len(indices) == depth; len(blocks) == depth and blocks[i].index == indices[i]; each block status in
-     {"attributed", "not_attributed", "untestable"}; attributed <=> some test attributed; primary is None unless
-     attributed, and then indexes an attributed test's reference; every test.reference < len(references); each reference
-     status in {"tested", "abstain", "untestable"}; n_attributed == number of blocks whose tests include that reference
-     attributed; abstain/untestable references attribute nothing; 0 < alpha < 1; z_crit a float.
+     keys exactly {version, method, params, subject_stack, other_stacks, alpha, n_tests, null_model, control_ok,
+     references, blocks, caveat, job, computed_at} (plan.md 4.2 r1: z_crit replaced by per-reference crit/df);
+     version == "attribution.v1"; null_model == "control-calibrated"; control_ok bool; subject_stack has
+     prefix/depth/indices with len(indices) == depth; len(blocks) == depth and blocks[i].index == indices[i]; each block
+     status in {"attributed", "not_attributed", "untestable"}; attributed <=> some test attributed; primary is None
+     unless attributed, and then indexes an attributed test's reference whose role is "reference"; every
+     test.reference < len(references); each reference role in {"reference", "control"} and status in {"tested",
+     "abstain", "untestable"}; at least one reference with role "control"; a control never has an attributed test;
+     n_attributed == number of blocks whose tests include that reference attributed, except for a control, where it
+     counts tests with z_adj >= crit; control_ok False -> no test attributed; abstain/untestable references attribute
+     nothing; 0 < alpha < 1; a tested reference has crit and df numbers.
      (It checks literals only; it imports nothing from scout.attrib.)
   5. with_attribution: problems = validate_attribution(attribution) -> non-empty raises ValueError listing them.
      (card2, table2) = upgrade_to_v3(card, table); card2 = deep copy with stats.attribution = attribution;
@@ -81,7 +85,7 @@ acceptance:
     - "test_component_slug: None -> '_model'; 'text_encoder' unchanged; 'gguf:sub/M-Q4_K_M.gguf' -> 'gguf_sub_M-Q4_K_M.gguf'"
     - "test_content_digest: order-independent; any None -> None; [] -> None"
     - "test_object_id: equals the formula; changes if one byte of either file changes"
-    - "test_validate_attribution: a hand-built valid attribution.v1 (3 blocks, 2 references) -> []; each of 8 targeted corruptions (wrong version, len(blocks) != depth, attributed without attributed test, primary pointing to a non-attributed test, n_attributed mismatch, abstain reference with attributed test, unknown status, missing key) yields a problem"
+    - "test_validate_attribution: a hand-built valid attribution.v1 (3 blocks, 2 references: one 'reference', one 'control') -> []; each of 11 targeted corruptions (wrong version, len(blocks) != depth, attributed without attributed test, primary pointing to a non-attributed test, n_attributed mismatch, abstain reference with attributed test, unknown status, missing key, no control reference, a control test marked attributed, control_ok False with an attributed test) yields a problem"
     - "test_with_attribution: v2 Card + table + valid attribution + extra log (2 events, 1 gate, 1 job) -> v3 Card with stats.attribution set, events seq contiguous, totals summed, gate/jobs appended, disk from extra; table has source_name; write_card + load_card round-trip; invalid attribution -> ValueError"
     - "test_load_all_versions: v0, v1, v2 and v3 Cards load; upgrade_to_v3 of each gives v3 defaults"
     - "test_p2_c8_accepts_v3 and test_p3_c3_accepts_v3 (in the P2/P3 expectation test files): v3 passes; v0 still fails C8"

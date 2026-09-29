@@ -16,7 +16,7 @@ interface: |
     def build_view(card: dict, table: pyarrow.Table) -> dict
         # P1 view plus (plan.md 4.8):
         #   depth_strips[].cells[].attribution: null | {"status", "primary_title", "z_adj", "p"}
-        #   view["attribution"]: null | {"stack_prefix", "references": [{"title", "status", "n_tested", "n_attributed"}],
+        #   view["attribution"]: null | {"stack_prefix", "references": [{"title", "role", "status", "n_tested", "n_attributed"}],
         #                                "caveat": ATTRIBUTION_CAVEAT}
   scout/server.py (P1 T013 / P2 T113):
     def make_server(..., store: CardStore | None = None) -> ScoutServer          # new keyword, default None
@@ -34,8 +34,9 @@ behavior: |
   1. build_view: when card.stats.attribution (att) is non-null, for the depth strip whose prefix == att.subject_stack.prefix,
      cell i (cells are in block index order) gets attribution = {"status": blocks[i].status, "primary_title":
      att.references[blocks[i].primary].title if primary is not None else None, "z_adj": the primary test's z_adj (or,
-     for not_attributed, the max z_adj over tests; None if none), "p": that test's p}. Cells of other strips get
-     attribution None. view["attribution"] = {"stack_prefix", "references": [{"title", "status", "n_tested",
+     for not_attributed, the max z_adj over the tests of role-"reference" references (a control is never shown as a
+     block's match); None if none), "p": that test's p}. Cells of other strips get
+     attribution None. view["attribution"] = {"stack_prefix", "references": [{"title", "role", "status", "n_tested",
      "n_attributed"}], "caveat": ATTRIBUTION_CAVEAT}. Without att: every cell attribution None and view.attribution None.
      disclaimers unchanged. Works for card.v0-v3.
   2. Colours (app.js): attributed cells use a fixed palette by reference index: ["#2e7d32", "#1565c0", "#6a1b9a",
