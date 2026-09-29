@@ -8,13 +8,18 @@ files:
 route: opus
 spec_complete: true
 interface: |
-  pyproject.toml: dependencies += "anthropic>=<installed version at implementation>" (record the exact version in the task log;
-    it must support messages.create(output_config=...), thinking {"type": "adaptive"} and client.beta.messages.create)
+  pyproject.toml: dependencies += "anthropic>=1.8.0,<2"   (plan.md 3.4.1: 1.x uses httpx2; 1.8.0 is the first release
+    with the claude-opus-5-5 literal; fallbacks/"server-side-fallback-2026-07-01"/adaptive/output_config exist from 1.0.0)
+    [project.optional-dependencies] dev += "httpx2>=2.0,<3"   (imported only by the SDK-contract test; anthropic 1.x
+    already depends on it). Record the installed anthropic and httpx2 versions in the task log.
 
   scout/system2.py:
     PROMPT_VERSION = "s2p.v1"; INPUT_SCHEMA = "s2in.v1"; OUTPUT_SCHEMA = "s2.v1"
-    DEFAULT_MODEL = "claude-opus-5-5"; CHEAP_MODEL = "claude-sonnet-5"
-    FALLBACK_BETA = "server-side-fallback-2026-07-01"; FALLBACK_MODELS = frozenset({"claude-opus-5-5"})
+    DEFAULT_MODEL = "claude-opus-5-5"; CHEAP_MODEL = "claude-sonnet-5-5"
+    FALLBACK_BETA = "server-side-fallback-2026-07-01"; FALLBACK_MODELS = frozenset({"claude-opus-5-5", "claude-sonnet-5-5"})
+    STUB_HOST = "stub.invalid"
+    FORBIDDEN_KEYS = frozenset({"gram", "signature", "sigma", "tensors", "token_ids"})
+    REQUEST_BODY_KEYS = frozenset({"model", "max_tokens", "system", "messages", "thinking", "output_config", "fallbacks"})
     VERDICTS = ("derived", "not_derived", "abstain")
     REASON_CODES = ("agree", "claim_conflict", "weak_evidence", "structure_mismatch", "missing_weight_evidence",
                     "config_inconsistent", "s2_unavailable", "s2_missing", "other")
@@ -32,19 +37,29 @@ interface: |
     @dataclass(frozen=True)
     class S2Raw:
         text: str | None; served_model: str | None; stop_reason: str | None; usage: dict | None
+        request_host: str | None = None       # host of the request actually sent
+        request_body: dict | None = None      # JSON body actually sent (parsed)
 
-    class S2Client(Protocol):
+    class S2Client(Protocol):                 # THE test seam (plan.md D51); nothing below mocks the SDK's HTTP layer
         def complete(self, system: str, user: str, schema: dict, config: S2Config) -> S2Raw
 
+    def request_kwargs(system: str, user: str, schema: dict, config: S2Config) -> tuple[str, dict]
+        # pure; returns (route, kwargs) with route "beta" | "messages"
+
     class AnthropicS2Client:                      # implements S2Client
-        def __init__(self, client: "anthropic.Anthropic | None" = None) -> None   # default anthropic.Anthropic()
+        def __init__(self, client: "anthropic.Anthropic | None" = None) -> None
+            # default anthropic.Anthropic() (credentials resolved by the SDK); production never passes http_client
     class StubS2Client:                           # implements S2Client (tests + offline rehearsal)
         def __init__(self, responder: Callable[[dict], dict | str | Exception | S2Raw]) -> None
             # responder receives the parsed s2in.v1 dict; dict -> json text; str -> raw text; Exception -> raised; S2Raw as is
+    class RecordingS2Client:                      # implements S2Client; wraps any client
+        def __init__(self, inner: S2Client) -> None
+        calls: list[S2Raw]                        # every S2Raw returned by inner.complete, in call order
 
     def card_digest(lc: LoadedCard) -> dict
     def build_input(report: dict, subject: LoadedCard, references: list[LoadedCard]) -> dict   # s2in.v1
     def assert_no_weights(obj) -> None                                                          # ValueError on violation
+    def assert_request_no_weights(body: dict) -> None                                           # ValueError on violation
     def run_system2(report: dict, subject: LoadedCard, references: list[LoadedCard], client: S2Client,
                     config: S2Config) -> dict                                                   # s2.v1
     def format_s2(out: dict) -> str
@@ -78,22 +93,34 @@ behavior: |
      {"values", "missing", "alignment", "cka_common"} (the "reasons" dict is dropped), "disclaimers": list(DISCLAIMERS)}.
      Local repo strings inside the analysis are redacted the same way. Then assert_no_weights(result).
   3. assert_no_weights(obj): walk recursively; ValueError if any list has more than 64 elements that are all int/float,
-     any dict key starts with "stat_", or any dict key is one of {"gram", "signature", "sigma", "tensors", "token_ids"}.
-  4. AnthropicS2Client.complete: kwargs = {"model": config.model, "max_tokens": config.max_tokens, "system": system,
+     any dict key starts with "stat_", or any dict key is in FORBIDDEN_KEYS.
+     assert_request_no_weights(body): ValueError if set(body) - REQUEST_BODY_KEYS is non-empty (naming the keys); then
+     assert_no_weights(body); then for every message m in body["messages"]: m["content"] must be a str (else ValueError),
+     parsed = json.loads(m["content"]) (JSONDecodeError -> ValueError), parsed["schema"] == INPUT_SCHEMA, and
+     assert_no_weights(parsed).
+  4. request_kwargs: kwargs = {"model": config.model, "max_tokens": config.max_tokens, "system": system,
      "messages": [{"role": "user", "content": user}], "thinking": {"type": "adaptive"},
      "output_config": {"effort": config.effort, "format": {"type": "json_schema", "schema": schema}}}.
-     If config.server_fallback and config.model in FALLBACK_MODELS: resp = client.beta.messages.create(**kwargs,
-     betas=[FALLBACK_BETA], fallbacks="default") (if the installed SDK rejects the `fallbacks` keyword with TypeError, pass
-     extra_body={"fallbacks": "default"} instead; record which in the task log). Else resp = client.messages.create(**kwargs).
-     No temperature/top_p/top_k, no assistant prefill. Return S2Raw(text = the first content block with type "text" (None if
-     none), served_model = resp.model, stop_reason = resp.stop_reason, usage = {"input_tokens", "output_tokens"}).
-     anthropic.APIError subclasses propagate to run_system2.
+     If config.server_fallback and config.model in FALLBACK_MODELS: route "beta", kwargs += {"betas": [FALLBACK_BETA],
+     "fallbacks": "default"}; else route "messages". No temperature/top_p/top_k, no assistant prefill, no extra_body.
+     AnthropicS2Client.complete: (route, kw) = request_kwargs(...); api = client.beta.messages if route == "beta" else
+     client.messages; raw = api.with_raw_response.create(**kw); msg = raw.parse(). Return S2Raw(text = the first content
+     block with type "text" (None if none), served_model = msg.model, stop_reason = msg.stop_reason, usage =
+     {"input_tokens", "output_tokens"} from msg.usage, request_host = raw.http_request.url.host, request_body =
+     json.loads(raw.http_request.content)). (Verified on anthropic 1.9.0: http_request is the httpx2.Request that was sent;
+     plan.md 3.4.1.) anthropic.APIError subclasses propagate to run_system2.
+     StubS2Client.complete: (_, kw) = request_kwargs(...); body = json.loads(json.dumps({k: v for k, v in kw.items() if
+     k != "betas"})); r = responder(json.loads(user)); Exception -> raise; S2Raw -> returned as is (tests set its fields);
+     dict -> text json.dumps(r); str -> text r; for dict/str: S2Raw(text, served_model=config.model, stop_reason="end_turn",
+     usage={"input_tokens": 0, "output_tokens": 0}, request_host=STUB_HOST, request_body=body).
+     RecordingS2Client.complete: raw = inner.complete(...); calls.append(raw); return raw (exceptions propagate, nothing recorded).
   5. run_system2:
      a. inp = build_input(...); user = json.dumps(inp, sort_keys=True).
      b. try raw = client.complete(SYSTEM_PROMPT, user, S2_LLM_SCHEMA, config) except Exception as e -> unavailable
-        (reason f"error: {type(e).__name__}"). raw.stop_reason == "refusal" -> unavailable "refusal". text None or
-        json.loads fails or the object fails validation against S2_LLM_SCHEMA (hand-written structural validator: required
-        keys, types, enums, no extra keys) -> unavailable "malformed output".
+        (reason f"error:{type(e).__name__}"). Then, in order: raw.stop_reason == "refusal" -> unavailable "refusal";
+        == "max_tokens" -> unavailable "max_tokens"; not in {"end_turn", None} -> unavailable f"stop_reason:{value}";
+        text None or json.loads fails or the object fails validation against S2_LLM_SCHEMA (hand-written structural
+        validator: required keys, types, enums, no extra keys) -> unavailable "malformed output".
      c. When unavailable: every pair final_verdict = system1 verdict, changed False, reason_code "s2_unavailable",
         explanation "", override_blocked False; claims = deterministic claims with comment ""; summary ""; needs_human
         ["System 2 unavailable: <reason>"]; available False.
@@ -103,8 +130,9 @@ behavior: |
         changed = final != s1.
      e. claims: status ALWAYS from report.claims (deterministic); comment from the LLM claim with the same claimed_base (else "").
      f. out = {"schema": OUTPUT_SCHEMA, "prompt_version": PROMPT_VERSION, "requested_model": config.model, "served_model",
-        "available", "unavailable_reason", "pairs", "claims", "summary", "needs_human", "caveats": list(DISCLAIMERS),
-        "usage"}. caveats are set by code regardless of the LLM output.
+        "available", "unavailable_reason", "request_host" (raw.request_host, None when no raw), "pairs", "claims",
+        "summary", "needs_human", "caveats": list(DISCLAIMERS), "usage"}. caveats are set by code regardless of the LLM
+        output. served_model is raw.served_model even when unavailable for a non-exception reason.
   6. format_s2(out): "SYSTEM 2 ({served_model or requested_model}):" then per pair "  pair {k}: {s1} -> {final}
      [{reason_code}]{' (blocked upgrade)' if override_blocked}" and the explanation, the summary, needs_human lines, then the
      3 caveats each prefixed "  NOTE: ".
@@ -112,18 +140,21 @@ behavior: |
 acceptance:
   tests:
     - "Reports come from T211 test helpers (small local Cards + a hand-trained JevModel); StubS2Client for behaviour tests"
-    - "test_prompt_literal: SYSTEM_PROMPT equals the literal of this task; PROMPT_VERSION s2p.v1; DEFAULT_MODEL 'claude-opus-5-5'; CHEAP_MODEL 'claude-sonnet-5'"
-    - "test_config_env: SCOUT_S2_MODEL=claude-sonnet-5 -> from_env().model == 'claude-sonnet-5'; explicit arg wins over env"
-    - "test_input_no_weights: build_input passes assert_no_weights; json size < 64 KiB for 3 references; a planted list of 65 floats, a key 'stat_fro_norm', a key 'gram' each raise ValueError"
+    - "test_prompt_literal: SYSTEM_PROMPT equals the literal of this task; PROMPT_VERSION s2p.v1; DEFAULT_MODEL 'claude-opus-5-5'; CHEAP_MODEL 'claude-sonnet-5-5'; FALLBACK_MODELS == {'claude-opus-5-5', 'claude-sonnet-5-5'}"
+    - "test_config_env: SCOUT_S2_MODEL=claude-sonnet-5-5 -> from_env().model == 'claude-sonnet-5-5'; explicit arg wins over env"
+    - "test_input_no_weights: build_input passes assert_no_weights; json size < 64 KiB for 3 references; a planted list of 65 floats, a key 'stat_fro_norm', a key 'gram', a key 'token_ids' each raise ValueError"
+    - "test_request_no_weights: the StubS2Client request_body for a real build_input passes assert_request_no_weights; each of these raises ValueError: an extra body key 'metadata'; a user content that is not JSON; a user content JSON whose 'schema' is not s2in.v1; a user content with a nested 'stat_fro_norm' key; a system string replaced by a list of 65 floats"
     - "test_local_redaction: a local Card's repo 'local:/home/x/m' appears only as 'local:<8 hex>' anywhere in the input text"
     - "test_keep: stub returns agree for all -> finals == S1; available True; caveats == DISCLAIMERS"
     - "test_soften: S1 derived, stub abstain with weak_evidence -> final abstain, changed True"
     - "test_block_upgrade: S1 abstain, stub derived -> final abstain, override_blocked True; S1 not_derived, stub derived -> final not_derived, blocked"
     - "test_claims_deterministic: stub says a contradicted claim is confirmed (in comment) -> status stays 'contradicted'"
     - "test_caveats_forced: stub output without any caveat text -> out.caveats == DISCLAIMERS; format_s2 contains all three"
-    - "test_unavailable: stub raising RuntimeError; S2Raw(stop_reason='refusal'); text 'not json'; JSON with an extra key -> available False, finals == S1, reason_code s2_unavailable"
+    - "test_unavailable (parametrized, exact unavailable_reason): stub raising RuntimeError -> 'error:RuntimeError'; S2Raw(stop_reason='refusal') -> 'refusal'; S2Raw(text='{\"pairs\": [', stop_reason='max_tokens') -> 'max_tokens'; S2Raw(stop_reason='pause_turn') -> 'stop_reason:pause_turn'; text 'not json' -> 'malformed output'; JSON with an extra key -> 'malformed output'. In every case available False, finals == S1, reason_code s2_unavailable"
+    - "test_recording: RecordingS2Client(StubS2Client(agree)) records one S2Raw per run_system2 call with request_host 'stub.invalid' and a request_body; a raising inner records nothing and the exception reaches run_system2 (unavailable)"
     - "test_missing_pair: stub omits pair 1 -> pair 1 final == S1 with reason s2_missing"
-    - "test_anthropic_request_offline: anthropic.Anthropic(api_key='test', http_client=httpx.Client(transport=httpx.MockTransport(handler))) where handler records the request and returns a canned Messages API JSON response {id, type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{type: 'text', text: <valid S2 JSON>}], stop_reason: 'end_turn', usage: {input_tokens: 10, output_tokens: 20}} -> request path /v1/messages; body has model 'claude-opus-5-5', thinking {'type': 'adaptive'}, output_config.format.type 'json_schema', output_config.effort 'high', max_tokens 16000, no 'temperature'; header anthropic-beta contains 'server-side-fallback-2026-07-01'; body fallbacks == 'default'; S2Raw parsed. With model claude-sonnet-5: no anthropic-beta fallback header and no 'fallbacks' key"
+    - "test_request_kwargs (pure): opus-5-5 -> route 'beta', kwargs keys exactly REQUEST_BODY_KEYS | {'betas'}, betas == [FALLBACK_BETA], fallbacks 'default', thinking {'type': 'adaptive'}, output_config {'effort': 'high', 'format': {'type': 'json_schema', 'schema': S2_LLM_SCHEMA}}, max_tokens 16000, no temperature/top_p/top_k; sonnet-5-5 -> route 'beta' too; 'claude-sonnet-5' or server_fallback False -> route 'messages', no 'betas'/'fallbacks'"
+    - "test_sdk_contract (the ONLY test touching the SDK's HTTP layer; imports httpx2): anthropic.Anthropic(api_key='test', max_retries=0, http_client=httpx2.Client(transport=httpx2.MockTransport(handler))) where handler records the request and returns a canned Messages API JSON {id, type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{type: 'text', text: <valid S2 JSON>}], stop_reason: 'end_turn', stop_sequence: null, usage: {input_tokens: 10, output_tokens: 20}}; AnthropicS2Client(that client).complete(...) -> request URL path '/v1/messages' with query beta=true; header anthropic-beta contains 'server-side-fallback-2026-07-01'; body fallbacks == 'default', thinking adaptive, output_config.effort 'high', no 'temperature'; S2Raw.request_host == 'api.anthropic.com'; S2Raw.request_body == the body the handler saw; served_model 'claude-opus-5-5'; usage parsed. With config model 'claude-sonnet-5': no anthropic-beta header and no 'fallbacks' key. Also: anthropic.Anthropic(api_key='test', http_client=httpx.Client()) raises TypeError (documents the >=1.x httpx2 pin)"
     - "test_no_forbidden_imports: ast check of scout/system2.py"
   commands:
     - pip install -e '.[dev]'
@@ -134,4 +165,4 @@ out_of_scope:
   - UI (P5)
   - persisting S2 output (never)
 invariants_touched: [3, 5]
-decisions: [D42, D43, D44, D50]
+decisions: [D42, D43, D44, D50, D51]

@@ -14,11 +14,13 @@ interface: |
     @dataclass(frozen=True)
     class Example:
         id: str; families: frozenset[str]; y: int; x: dict[str, float | None]   # x keys == JEV_FEATURES
+        hard: bool = False            # labeled hard_negative flag; reporting only, never a feature or a fit input
 
     def fit_logistic(X: numpy.ndarray, y: numpy.ndarray, lam: float, max_iter: int, tol: float) -> tuple[numpy.ndarray, float]
         # standardized X (n, d); returns (w, b); penalty lam/2 * ||w||^2, intercept unpenalized
     def fit_platt(f: numpy.ndarray, y: numpy.ndarray) -> tuple[float, float]       # (A, B); ValueError if A <= 0
-    def thresholds(p: numpy.ndarray, y: numpy.ndarray) -> dict                     # {"hi","lo","max_neg_p","min_pos_p","warnings"}
+    def thresholds(p: numpy.ndarray, y: numpy.ndarray, hard: numpy.ndarray | None = None) -> dict
+        # {"hi","lo","max_neg_p","min_pos_p","n_pool_neg_hard","max_neg_hard_p","warnings"}
 
     @dataclass(frozen=True)
     class JevModel:
@@ -53,14 +55,16 @@ behavior: |
   7. thresholds(p, y): max_neg = max p over y==0; min_pos = min p over y==1;
      hi = min(t_hi_cap, max(t_hi_floor, max_neg + t_margin)); lo = max(t_lo_floor, min(t_lo_cap, min_pos - t_margin));
      lo = min(lo, hi - min_band); warnings: "pool negative at p >= hi" if max_neg >= hi; "pool positive at p <= lo" if
-     min_pos <= lo. Values rounded to 6 decimals.
+     min_pos <= lo. Values rounded to 6 decimals. hard (bool array, None -> all False): n_pool_neg_hard = #(y==0 and hard);
+     max_neg_hard_p = max p over those (None if 0). The hard subset never changes hi/lo (the rule is frozen); it is reported
+     in threshold_inputs and, by T214, in the FREEZE-model line.
   8. predict(feats) -> {"schema": "jev.v1", "p_derived", "verdict", "abstain_reason", "logit", "features": values,
      "missing": missing, "model_sha256", "thresholds": {"hi", "lo"}}:
      a. if values["r_med"] is None and values["cka"] is None -> verdict abstain, reason "no weight evidence", p_derived None, logit None.
      b. z from transform; if any AVAILABLE feature has |z| > ood_abs_z -> abstain "out of training range" (p and logit still reported).
      c. logit = w.z + b; p = sigmoid(A logit + B); p >= hi -> "derived"; p <= lo -> "not_derived"; else abstain "low confidence".
      p_derived and logit rounded to 6 decimals.
-  9. Model doc = plan.md 4.3 exactly (train_pairs = ids of train, oof list, calibration_pool with id/source/logit/p/y, card_keys,
+  9. Model doc = plan.md 4.3 exactly (train_pairs = ids of train, oof list, calibration_pool with id/source/logit/p/y/hard, card_keys,
      labeled_sha256, trained_at UTC Z, scout_version, git_commit). No held-out information is accepted by train() (its
      arguments are only train and calibration examples).
   10. load(): recompute sha256 of the file bytes; params/features must equal the module literals (ValueError otherwise).
@@ -70,6 +74,7 @@ acceptance:
     - "test_fit_logistic_known: a separable 1-D set with lam=1 gives finite w > 0; compare with an independent scipy-free gradient-descent solution in the test within 1e-6"
     - "test_platt_targets: pool of 3 pos / 3 neg well separated -> A > 0; an inverted pool -> ValueError('calibration inverted')"
     - "test_thresholds_rule: max_neg 0.30, min_pos 0.95 -> hi 0.80, lo 0.20; max_neg 0.97 -> hi 0.99 with no warning and lo = min(lo, 0.89); max_neg 0.995 -> hi 0.99 and warning; min_pos 0.03 -> lo 0.01 and warning"
+    - "test_thresholds_hard: p [0.1, 0.5, 0.9, 0.95], y [0, 0, 1, 1], hard [True, False, False, False] -> n_pool_neg_hard 1, max_neg_hard_p 0.1; hi/lo identical to the call with hard=None; the model doc's calibration_pool entries carry 'hard'"
     - "test_oof_family_disjoint: 4 families with synthetic Examples; spy on fit_logistic inputs -> for every OOF fit, no example sharing a family with the scored example is in the fold; examples whose fold lacks a class are skipped with the reason"
     - "test_missing_imputation: a feature missing in one test example is imputed with the train not_derived mean (z equals that mean's standardization); missing in all train -> ValueError"
     - "test_no_evidence_abstains: r_med and cka None -> abstain 'no weight evidence', p None"

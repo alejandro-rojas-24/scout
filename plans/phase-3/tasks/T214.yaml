@@ -1,6 +1,6 @@
 id: T214
-title: Freeze + train scripts - FREEZE lines (labeled, model), p3_train on train+calibration only, null diagnostics (e=1 vs e=2)
-depends_on: [T210, T213]
+title: Freeze + train scripts - FREEZE lines (labeled, model), code-freeze git state, p3_train on train+calibration only, null diagnostics (e=1 vs e=2)
+depends_on: [T210, T211, T213]      # T211: LoadedCard lives in scout/analysis.py
 files:
   - scripts/p3_common.py
   - scripts/p3_freeze.py
@@ -11,18 +11,27 @@ route: opus
 spec_complete: true
 interface: |
   scripts/p3_common.py:
+    from scout.analysis import LoadedCard                                # T211
+    CODE_PATHS: tuple[str, ...] = ("scout", "scripts", "pyproject.toml")
+    def git_code_state(repo_root: Path, since: str | None = None) -> dict
+        # {"commit": str|None, "code_dirty": bool|None, "code_changed_since": list[str]|None}; never raises
+        # commit = `git rev-parse HEAD`; code_dirty = `git status --porcelain -- *CODE_PATHS` non-empty;
+        # code_changed_since = sorted `git diff --name-only <since> HEAD -- *CODE_PATHS` lines when since is given, else None;
+        # any git failure -> the affected field None (subprocess.run with cwd=repo_root, check=False, text=True)
     def load_pair_cards(ls: LabeledSet, pins: dict[str, str], cards_dir: Path) -> dict[str, LoadedCard]
         # repo -> LoadedCard at card_paths(cards_dir, repo, pins[repo], None); missing -> ScoutError naming the repo
     def examples_for(ls: LabeledSet, pairs: list[Pair], cards: dict[str, LoadedCard]) -> tuple[list[Example], dict[str, list[dict]]]
-        # Example(id, frozenset({family_of(ref), family_of(subj)}), y = 1 if derived else 0, x = pair_features(...).values)
+        # Example(id, frozenset({family_of(ref), family_of(subj)}), y = 1 if derived else 0, x = pair_features(...).values,
+        #         hard = pair.hard_negative)
         # and card_keys {pair_id: [ref key, subj key]}
     def git_info(repo_root: Path) -> tuple[str | None, bool | None]     # (commit, dirty); never raises
     def freeze_lines(log_path: Path, what: str) -> list[dict]           # FREEZE lines with that "what", file order
 
   scripts/p3_freeze.py:
-    def main(argv=None) -> int
+    def main(argv=None, *, git_state: Callable[[Path, str | None], dict] = git_code_state) -> int
       # p3_freeze.py labeled --labeled PATH --pins PATH [--allow-synthetic]
-      # p3_freeze.py model --model PATH --labeled PATH
+      # p3_freeze.py model --model PATH --labeled PATH [--ack-warnings TEXT]
+      # git_state is keyword-only for tests (the rehearsal passes a fake clean state)
   scripts/p3_train.py:
     def train_from_files(labeled: Path, pins: Path, cards: Path, out: Path, *, allow_synthetic: bool = False) -> dict
     def diagnostics(ls, cards) -> dict
@@ -36,9 +45,17 @@ behavior: |
      "synthetic": ls.synthetic, "git_commit"}. Return 0. (The operator appends it to log.jsonl; the script never writes it.)
   2. p3_freeze model: m = jev.load(model) (validates params/features); ls = load_labeled(labeled, allow_synthetic=True if
      the file says synthetic else False); m.doc["labeled_sha256"] must equal file_sha256(labeled) (else 1); heldout ids and
-     heldout repos must not occur anywhere in json.dumps(m.doc) (else 1, naming them). Print {"step": "FREEZE", "phase": 3,
-     "what": "model", "ts", "hostname", "sha256": m.sha256, "labeled_sha256", "thresholds": {"hi", "lo"},
-     "warnings": threshold_inputs.warnings, "git_commit"}. Return 0.
+     heldout repos must not occur anywhere in json.dumps(m.doc) (else 1, naming them).
+     g = git_state(repo_root, None) with repo_root = Path(__file__).resolve().parents[1]; g["code_dirty"] is not False -> print "FREEZE REFUSED: commit scout/, scripts/ and
+     pyproject.toml first (plan.md 2.1 step 5)" and return 1.
+     pool_hard = {"n_neg_hard": threshold_inputs.n_pool_neg_hard, "max_neg_hard_p": threshold_inputs.max_neg_hard_p,
+     "n_neg_hard_ge_hi": #(calibration_pool entries with y 0, hard true, p >= thresholds.hi)}.
+     threshold_inputs.warnings non-empty and no --ack-warnings -> print every pool row (id, source, y, hard, p), the
+     warnings and "FREEZE STOPPED: threshold warning; a human decides before the held-out run (re-run with
+     --ack-warnings \"<reason>\")", return 4, no JSON line.
+     Print {"step": "FREEZE", "phase": 3, "what": "model", "ts", "hostname", "sha256": m.sha256, "labeled_sha256",
+     "thresholds": {"hi", "lo"}, "warnings": threshold_inputs.warnings, "pool_hard", "ack_warnings": TEXT or null,
+     "git_commit": g["commit"], "code_dirty": g["code_dirty"]}. Return 0.
   3. train_from_files: ls = load_labeled(...); unresolved(ls) non-empty -> ScoutError (never train on unverified labels).
      cards = load_pair_cards over ls.repos_in("train", "calibration") ONLY (held-out Cards are never loaded here).
      train_ex = examples_for(ls, ls.pairs_in("train"), cards); cal_ex = examples_for(ls, ls.pairs_in("calibration"), cards).
@@ -56,12 +73,17 @@ behavior: |
 acceptance:
   tests:
     - "tests/test_p3_train.py builds Cards with scan(sample, tokenizer, anchors) on LocalSource repos and a tiny labeled.v1 file (synthetic: true) written in the test: 6 families x (base, ft) with 2 train, 2 calibration, 2 heldout families and cross-family not_derived pairs; ByteLevel anchor tokenizer as in T207 tests (T208 is not a dependency)"
+    - "every p3_freeze model call in these tests passes git_state=<fake clean state> unless the test is about git"
     - "test_freeze_labeled_refuses_verify: a file with one verify:true -> exit 1, 'FREEZE REFUSED' printed, no JSON line"
     - "test_freeze_labeled_ok: resolved file -> JSON line with sha256 == file_sha256 and counts per split"
     - "test_train_never_loads_heldout: delete the held-out Cards from the cards dir -> training still succeeds; a spy on load_card sees no held-out repo"
     - "test_train_output: model file loads with jev.load; train_pairs == train ids; calibration_pool sources in {oof, calibration}; no held-out id or repo string in the file"
     - "test_freeze_model_leak: inject a held-out repo string into the model doc (and re-save) -> p3_freeze model returns 1 naming it"
     - "test_freeze_model_sha_mismatch: labeled file edited after training -> p3_freeze model returns 1"
+    - "test_freeze_model_dirty_code: git_state fake returning code_dirty True (and None) -> returns 1, 'FREEZE REFUSED'; clean fake -> 0 and the line has git_commit and code_dirty false"
+    - "test_freeze_model_warning_stops: a model doc whose threshold_inputs.warnings is non-empty (re-saved) -> returns 4, no JSON line, pool rows printed; with --ack-warnings 'reviewed' -> 0 and ack_warnings == 'reviewed'; pool_hard present with the three keys"
+    - "test_examples_hard_flag: examples_for sets Example.hard from the labeled hard_negative flag"
+    - "test_git_code_state (skipped if the git binary is missing): a tmp git repo with scout/a.py committed -> code_dirty False, commit 40-hex; editing scout/a.py -> code_dirty True; committing it -> code_changed_since(first commit) == ['scout/a.py']; editing models/x.json only -> code_dirty False; a non-repo dir -> all None, no exception"
     - "test_diagnostics: runs and prints one row per family pair with r_med_e1 and r_med_e2 keys; the model file is unchanged (sha)"
     - "test_unresolved_blocks_training: train_from_files on a file with verify:true -> ScoutError"
   commands:
@@ -72,4 +94,4 @@ out_of_scope:
   - held-out evaluation (T216/T217)
   - writing log.jsonl (the operator appends the printed lines)
 invariants_touched: [3, 4]
-decisions: [D37, D38, D49]
+decisions: [D37, D38, D49, D52]

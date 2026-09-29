@@ -1,5 +1,5 @@
 id: T215
-title: CLI - `scout scan --anchors`, `scout analyze SUBJECT_CARD [--reference CARD]... [--library DIR --manifest PATH] --model PATH [--s2] [--s2-model ID] [--json]`
+title: CLI - `scout scan --anchors`, `scout analyze SUBJECT_CARD [--reference CARD]... [--library DIR --manifest PATH --pins PATH] --model PATH [--s2] [--s2-model ID] [--json]`
 depends_on: [T112, T207, T211, T212]
 files:
   - scout/cli.py
@@ -10,17 +10,23 @@ interface: |
   scout/cli.py (additions to P2 T112; main signature unchanged):
     scout scan TARGET ... [--anchors]          # passes anchors=True to scan(); requires --sample and --tokenizer, else
                                                # argparse error (exit 2) with message "--anchors requires --sample and --tokenizer"
-    scout analyze SUBJECT_CARD [--reference CARD ...] [--library DIR] [--manifest PATH] --model PATH
+    scout analyze SUBJECT_CARD [--reference CARD ...] [--library DIR] [--manifest PATH] [--pins PATH] --model PATH
                   [--s2] [--s2-model MODEL_ID] [--json]
-      defaults: --library = env SCOUT_LIBRARY_DIR or "cards/p3"; --manifest = "library/manifest.yaml"; --model = env
-      SCOUT_JEV_MODEL or "models/jev_v1.json"
-    def load_library(library_dir: Path, manifest: Path) -> list[LoadedCard]
+      defaults: --library = env SCOUT_LIBRARY_DIR or "cards/p3"; --manifest = "library/manifest.yaml"; --pins =
+      "exit/pins_p3.json"; --model = env SCOUT_JEV_MODEL or "models/jev_v1.json"
+    def load_library(library_dir: Path, manifest: Path, pins: Path) -> tuple[list[LoadedCard], list[str]]
+        # (Cards in manifest order, stderr messages for skipped entries)
     main(..., s2_client_factory: Callable[[], S2Client] | None = None)   # keyword for tests only, like client_factory
 behavior: |
   1. analyze: subject = LoadedCard(*load_card(SUBJECT_CARD)). references = [LoadedCard(*load_card(p)) for p in --reference];
-     if no --reference is given: references = load_library(--library, --manifest): for each manifest entry, the newest
-     directory (lexicographically largest name) under library_dir/repo_slug(repo)/ containing "_model.card.json"; entries
-     without a Card are listed on stderr as "library: no Card for {repo} (scan it with scripts/p3_set.py)" and skipped.
+     if no --reference is given: references = load_library(--library, --manifest, --pins): entries =
+     yaml.safe_load(manifest)["entries"] (scout never imports scripts/, so p3_set.load_manifest is not used), each entry's "repo"; pins = json.load(pins file)
+     (missing or unreadable pins file -> stderr "library: pins file {path} not readable" and exit 1). For each entry in
+     manifest order: sha = pins.get(repo); if sha is None or not re.fullmatch(r"[0-9a-f]{40}", sha) -> message
+     "library: {repo} is not pinned in {pins path}" and skip; else json_path = scout.card.card_paths(library_dir, repo,
+     sha, None).json_path; not json_path.exists() -> message "library: no Card for {repo}@{sha[:12]} (scan it with
+     scripts/p3_set.py)" and skip; else LoadedCard(*load_card(json_path)). The Card revision is therefore always the pinned
+     one; no directory listing or "newest" rule is used. Messages go to stderr, one per line, in manifest order.
      model = jev.load(--model). report = analysis.analyze(subject, references, model).
   2. Without --s2: print format_analysis(report) to stdout (or json.dumps(report, indent=1) with --json). Exit 0.
   3. With --s2: config = S2Config.from_env(--s2-model); client = s2_client_factory() if given else AnthropicS2Client().
@@ -36,7 +42,7 @@ acceptance:
     - "test_scan_anchors_flag: `scout scan DIR --sample --tokenizer --anchors --confirm-plan ID --confirm-bytes CAP` on a local fixture (plan values obtained by a first run without confirmation, as in T112 tests) -> Card with anchor_embedding; `--anchors` without --tokenizer -> exit 2 with the message"
     - "test_analyze_text: output contains 'LINEAGE ANALYSIS', each reference title, and the 3 disclaimers"
     - "test_analyze_json: --json parses; keys == analysis.v1 keys"
-    - "test_analyze_library: --library/--manifest with a manifest of 2 entries (1 Card present) -> 1 pair; stderr names the missing one"
+    - "test_analyze_library: --library/--manifest/--pins with a manifest of 3 entries: one pinned with its Card at card_paths(lib, repo, pin, None), one pinned without a Card, one UNPINNED -> 1 pair; stderr has exactly the 'no Card for' and 'is not pinned' lines; a second Card directory for the first repo at another sha is ignored (the pinned one is used)"
     - "test_analyze_s2_stub: --s2 with s2_client_factory=lambda: StubS2Client(agree) -> output contains 'SYSTEM 2' and the disclaimers; with a stub that raises -> exit 0 and 'System 2 unavailable'"
     - "test_analyze_writes_nothing: tmp dir listing before == after; httpx transport patched to raise -> no call"
   commands:

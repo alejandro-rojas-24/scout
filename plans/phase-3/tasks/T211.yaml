@@ -26,7 +26,8 @@ behavior: |
   1. For each reference (in the given order; a reference with the same card_key as the subject is skipped):
      feats = features.pair_features(ref.card, ref.table, subject.card, subject.table); s1 = model.predict(feats);
      structure from features.structure_alignment summary when the sigma stacks paired, else from align.pair_stacks on
-     stacks[0] of each Card (kind, mode, width_changed, depths; nulls if no stacks); context = {"tokenizer_jaccard":
+     stacks[0] of each Card (kind, mode, width_changed, depths; nulls if no stacks); when feats.alignment
+     ["structure_informative"] is False, format_analysis appends " [structure-uninformative]" to the structure line; context = {"tokenizer_jaccard":
      suggest.tokenizer_jaccard(ref, subj), "config_score": suggest.config_match(...)["score"]}.
   2. claims: for each c in subject.card["model_card"]["base_model"] (in order): ref index = the first reference whose
      key.repo equals c exactly, else case-insensitive equal, else None. status: None -> "no_card"; S1 derived ->

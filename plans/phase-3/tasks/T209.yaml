@@ -16,7 +16,8 @@ interface: |
         values: dict[str, float | None]      # keys == JEV_FEATURES
         missing: list[str]                   # JEV_FEATURES order
         reasons: dict[str, str]              # feature -> why missing
-        alignment: dict                      # {"mode": "structure-only"|"reldepth"|None, "kind": str|None, "n_scored": int}
+        alignment: dict                      # {"mode": "structure-only"|"reldepth"|None, "kind": str|None, "n_scored": int,
+                                             #  "structure_informative": bool|None}
         cka_common: int | None
         def to_dict(self) -> dict            # plan.md 4.5 feat.v1
 
@@ -33,8 +34,10 @@ behavior: |
         "sampled blocks differ from stack blocks".
      c. cmp = layercorr.compare(sr, ss); cmp.R None -> missing with cmp.reason.
      d. structure_alignment: S = align.structural_cost(subj blocks, ref blocks) (align.block_sets on each table, in index
-        order). If (S == 1).all(): a = align.reldepth(nB, nA), mode "reldepth"; else a = align.viterbi(align.combine_cost(S, None)),
-        mode "structure-only". R is NEVER passed to combine_cost (removes the P2 dp-structure+weights selection bias,
+        order). constant = (S.min() == S.max()). If constant and S.max() > 0 (all 1 = incompatible, or any other flat
+        non-zero cost such as all 0.5 = partially matching role sets): a = align.reldepth(nB, nA), mode "reldepth";
+        else a = align.viterbi(align.combine_cost(S, None)), mode "structure-only" (an all-0 S = identical structure keeps
+        Viterbi, as in P2). The returned summary dict gains "structure_informative": not constant. R is NEVER passed to combine_cost (removes the P2 dp-structure+weights selection bias,
         plan.md D41). summary = align.summarize(a, nA, S, False, mode_for_summarize, ref_idx, subj_idx) where
         mode_for_summarize = "reldepth" or "dp-structure".
      e. nul = layercorr.in_run_null(cmp.R, a) (default edge). n_scored < 3 raises ValueError in P2 -> catch -> missing
@@ -59,6 +62,7 @@ acceptance:
     - "test_unrelated_same_arch: seed 1 vs seed 2 (same shapes, shared trend) -> r_med <= 0.40, r_top1 <= 0.40, missing == []"
     - "test_structure_only_alignment: monkeypatch align.combine_cost with a spy -> every call has R None; the upscaled pair base vs upscale(base,16,12,4) gives alignment mode structure-only and n_scored >= 10"
     - "test_incompatible_reldepth: qwen2-style 16 layers vs llama-style hidden 160 -> mode reldepth"
+    - "test_constant_cost_reldepth: monkeypatch align.structural_cost to return numpy.full((nB, nA), 0.5) -> mode reldepth, structure_informative False, and viterbi is never called (spy); returning numpy.zeros -> mode structure-only (Viterbi), structure_informative False"
     - "test_claim_not_a_feature: rewrite the subject card's model_card.base_model, tokenizer_minhash.signature and config.raw.model_type -> identical values"
     - "test_missing_sigma: subject card with stats.sigma_curves None -> the 6 sigma features missing with a reason, cka present"
     - "test_missing_stats_v1: drop stat_spectral_topk/stat_fro_norm values from the subject table -> only log_topk_dist and log_fro_dlog missing"

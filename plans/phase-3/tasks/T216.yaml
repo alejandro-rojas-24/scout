@@ -14,6 +14,8 @@ interface: |
     HELDOUT_MIN_PAIRS = 16; HELDOUT_MIN_DERIVED = 6; HELDOUT_MIN_NOT_DERIVED = 8; HELDOUT_MIN_HARD = 4
     FALSE_DERIVED_MAX = 0; ACC_NONABSTAIN_MIN = 0.90; ABSTAIN_MAX = 0.30
     SWEEP_MIN_PAIRS = 100; SWEEP_FALSE_DERIVED_MAX = 0
+    S2_UNAVAILABLE_MAX = 0
+    CODE_PATHS = ("scout", "scripts", "pyproject.toml")
     ANCHOR_SHA256 = "466fcb0770645851483e61a7c7a72041d80c7155a2f0e24530c2a1099c421516"
     FROZEN_CKA_PARAMS, FROZEN_TSTATS_PARAMS, FROZEN_FEATURE_PARAMS, FROZEN_JEV_PARAMS: dict   # literal copies of plan.md 4.8
     FROZEN_JEV_FEATURES: tuple[str, ...]
@@ -38,9 +40,11 @@ interface: |
         report_texts: list[str]              # format_analysis of each
         s1_requests: int                     # network requests counted during S1 evaluation
         import_violations: list[str]         # from the static AST check
+        git_exit: dict | None = None         # git_code_state(repo_root, since=<FREEZE-model git_commit>) at EXIT
         s2: list[dict] | None = None         # s2.v1 per held-out pair (E7), in heldout order
-        s2_inputs: list[dict] | None = None
-        s2_hosts: list[str] | None = None
+        s2_inputs: list[dict] | None = None  # s2in.v1 per pair (build_input)
+        s2_requests: list[dict | None] | None = None   # request_body actually sent, per recorded call (RecordingS2Client)
+        s2_hosts: list[str | None] | None = None       # request_host per recorded call
 
     def static_import_violations(repo_root: Path) -> list[str]
         # ast-parse scout/analysis.py, scout/features.py, scout/jev.py, scout/system2.py; any import of scout.hub, scout.sources,
@@ -48,7 +52,8 @@ interface: |
     def metrics(rows: list[dict]) -> dict
         # {"n","n_derived","n_not_derived","n_hard","fd","n_nonabstained","correct","acc_nonabstain","abstain_rate","derived_recall"}
     def s1_checks(inp: P3Inputs, sizes: Sizes = Sizes()) -> list[Check]      # C0..C11
-    def s2_checks(inp: P3Inputs) -> list[Check]                            # C12 (several rows)
+    def s2_checks(inp: P3Inputs, expected_hosts: frozenset[str] = S2_HOSTS) -> list[Check]   # C12 (several rows)
+        # expected_hosts is overridden only by the offline rehearsal ({"stub.invalid"}); never a CLI flag
 
   scripts/exit_expectations_p2.py (P2 T115) change: in C8, `schema_version == "card.v1"` becomes
     `schema_version in ("card.v1", "card.v2")`. Nothing else changes (every P2 threshold stays frozen).
@@ -69,11 +74,15 @@ behavior: |
      "tokenizer": True, "anchors": True}; fetch_log.gate has exactly 1 decision, approved, via in {"cli-flag",
      "below-threshold"}, and for cli-flag bytes_confirmed == bytes_cap and (plan_id, bytes_cap) in the union of
      confirm_plans over log lines with step SCAN and mode confirm; bytes_planned <= fetch_log.totals.weight <= bytes_cap;
-     a fetch_log event with event "purge", stage "COMPUTE" and "resident=0" in the note.
+     a fetch_log event with event "purge", stage "COMPUTE" and "resident=0" in the note. A Card whose fetch_log.gate is
+     empty and whose notes contain "sigma: nothing sampleable" gets actual "zero-read plan: replace the repo (plan
+     revision)" (still FAIL).
   6. C4: model loaded; S = last FREEZE "model" line; S.sha256 == model.sha256; S appears after L in log.jsonl and S.ts >= L.ts; model.doc.labeled_sha256 ==
      L.sha256; set(model.doc.train_pairs) ⊆ train pair ids; pool ids ⊆ train ∪ calibration ids; json.dumps(model.doc)
      contains no held-out pair id (as a quoted string, e.g. '"L27"') and no held-out repo string; model.doc.features ==
-     list(FROZEN_JEV_FEATURES).
+     list(FROZEN_JEV_FEATURES). Row "C4 code frozen": S.git_commit is a non-null string and S.code_dirty is False;
+     git_exit is not None, git_exit.code_dirty is False and git_exit.code_changed_since == [] (None counts as FAIL; actual
+     lists the changed paths).
   7. C5: scout.cka.CKA_PARAMS == FROZEN_CKA_PARAMS; scout.tstats.TSTATS_PARAMS == FROZEN_TSTATS_PARAMS;
      scout.features.FEATURE_PARAMS == FROZEN_FEATURE_PARAMS; scout.jev.JEV_PARAMS == FROZEN_JEV_PARAMS;
      scout.features.JEV_FEATURES == FROZEN_JEV_FEATURES; scout.anchors.ANCHOR_SHA256 == ANCHOR_SHA256 and the packaged file
@@ -83,18 +92,23 @@ behavior: |
   9. C9: len(sweep) >= sizes.sweep_min and #derived in sweep <= SWEEP_FALSE_DERIVED_MAX (rows name each offender).
   10. C10: s1_requests == 0 and import_violations == [].
   11. C11: every report has disclaimers == list(DISCLAIMERS); every report text contains all three disclaimer strings.
-  12. C12 (s2_checks; if inp.s2 is None -> one FAIL row "C12 system2 not run"): len(s2) == len(heldout); each out has
-      schema "s2.v1", caveats == DISCLAIMERS, and for each pair final_verdict in ALLOWED_S2[system1_verdict]; for each s2 input
-      system2.assert_no_weights passes; set(s2_hosts) ⊆ S2_HOSTS and s2_hosts non-empty unless every out is unavailable;
-      served_model recorded (non-null) for every available out; metrics over rows with verdict = S2 final:
-      fd <= 0, acc_nonabstain >= 0.90, abstain_rate <= 0.30.
+  12. C12 (s2_checks; if inp.s2 is None -> one FAIL row "C12 system2 not run"): len(s2) == len(heldout);
+      row "C12 available": #(out with available False or served_model None) <= S2_UNAVAILABLE_MAX, plus one FAIL row per
+      such pair naming its unavailable_reason (an unavailable pair is never a pass-through); each out has schema "s2.v1",
+      caveats == DISCLAIMERS, and for each pair final_verdict in ALLOWED_S2[system1_verdict]; for each s2 input
+      system2.assert_no_weights passes; row "C12 request no weights": len(s2_requests) == len(heldout) and
+      system2.assert_request_no_weights passes on every body (None counts as FAIL); row "C12 hosts": len(s2_hosts) ==
+      len(heldout) and every host in expected_hosts; metrics over rows with verdict = S2 final: fd <= 0,
+      acc_nonabstain >= 0.90, abstain_rate <= 0.30.
+  12b. metrics also returns "acc_by_family" ({family of the pair (reference family for derived; "a|b" sorted for
+      not_derived): acc_nonabstain or None}); reported only, no check uses it.
   13. metrics: correct = verdict == label among non-abstained; acc = correct / n_nonabstained (None if 0 -> C7 FAIL);
       abstain_rate = #abstain / n; derived_recall = #(label derived and verdict derived) / #derived (reported only).
 acceptance:
   tests:
     - "tests/test_exit_expectations_p3.py builds hand-written P3Inputs (tiny labeled.v1 dicts via scout.groundtruth.validate, fake LoadedCards with minimal dicts + empty pyarrow tables, log lines, a JevModel from T210 helpers)"
     - "a passing input -> every s1_checks and s2_checks row ok"
-    - "failing inputs (parametrized; each makes at least the named check fail and nothing raises): pins missing a repo (C0); labeled sha differs from FREEZE (C1); FREEZE later than a Card's scanned_at (C1); a verify:true entry (C1); synthetic without allowance (C1); a pair crossing splits (C2); 15 held-out pairs (C2); YAML hard flag disagreeing with hidden sizes (C2); Card v1 (C3); options anchors False (C3); gate via api-confirm (C3); cli-flag pair not in any SCAN line (C3); totals.weight > cap (C3); no COMPUTE purge (C3); model sha differs from FREEZE (C4); model FREEZE before labeled FREEZE (C4); model doc containing '\"L27\"' (C4); CKA_PARAMS min_common changed (C5); JEV_PARAMS l2_lambda changed (C5); one held-out not_derived with verdict derived (C6); acc 0.857 (C7); all abstain (C7 and C8); abstain 6/19 (C8); sweep of 99 (C9); 1 derived in sweep (C9); s1_requests 1 (C10); an import of scout.hub in scout/features.py (C10, via a tmp tree); a report without disclaimers (C11); s2 None (C12); an S2 final derived where S1 abstained (C12); S2 caveats missing (C12); an s2 input with a 65-float list (C12); s2 host 'evil.example' (C12); S2 abstaining on 7/19 (C12)"
+    - "failing inputs (parametrized; each makes at least the named check fail and nothing raises): pins missing a repo (C0); labeled sha differs from FREEZE (C1); FREEZE later than a Card's scanned_at (C1); a verify:true entry (C1); synthetic without allowance (C1); a pair crossing splits (C2); 15 held-out pairs (C2); YAML hard flag disagreeing with hidden sizes (C2); Card v1 (C3); options anchors False (C3); gate via api-confirm (C3); cli-flag pair not in any SCAN line (C3); totals.weight > cap (C3); no COMPUTE purge (C3); model sha differs from FREEZE (C4); model FREEZE before labeled FREEZE (C4); model doc containing '\"L27\"' (C4); CKA_PARAMS min_common changed (C5); JEV_PARAMS l2_lambda changed (C5); one held-out not_derived with verdict derived (C6); acc 0.857 (C7); all abstain (C7 and C8); abstain 6/19 (C8); sweep of 99 (C9); 1 derived in sweep (C9); s1_requests 1 (C10); an import of scout.hub in scout/features.py (C10, via a tmp tree); a report without disclaimers (C11); s2 None (C12); an S2 final derived where S1 abstained (C12); S2 caveats missing (C12); an s2 input with a 65-float list (C12); s2 host 'evil.example' (C12); S2 abstaining on 7/19 (C12); one out with available False and unavailable_reason 'max_tokens' while its final verdicts equal S1 and all S2 metrics pass (C12 available FAIL); every out unavailable (C12 FAIL, not a pass); a sent request body with a 'stat_' key inside the user JSON (C12); s2_requests shorter than heldout (C12); a hosts list with one entry for 19 pairs (C12); a Card with empty gate and note 'sigma: nothing sampleable' (C3, actual mentions zero-read); FREEZE-model line with code_dirty True (C4); git_exit.code_changed_since == ['scout/jev.py'] (C4); git_exit None (C4)"
     - "test_boundaries: acc exactly 0.90 passes; abstain exactly 0.30 passes (e.g. 3/10); fd 0 passes"
     - "test_frozen_literals: every FROZEN_* equals the live module value today"
     - "test_threshold_constants: the constants have exactly the values of this task"
@@ -106,4 +120,4 @@ out_of_scope:
   - loading files, running S1/S2, network (T217)
   - changing any threshold after a real run (human decision + plan revision)
 invariants_touched: [1, 2, 3, 4, 5]
-decisions: [D45]
+decisions: [D45, D51, D52]

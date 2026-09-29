@@ -69,22 +69,28 @@ behavior: |
   5. groundtruth/labeled_v1.yaml: transcribe plan.md section 5 EXACTLY:
      - synthetic: false.
      - evidence: one entry per citation used in section 5. Use ids E_<short> (e.g. E_QWEN25_TR, E_R1, E_QM, E_QC, E_Z, E_S,
-       E_MK_L30, E_MC_<pair id> for model-card text of a pair's subject). url: the arXiv abs URL (https://arxiv.org/abs/<id>)
-       or https://huggingface.co/<subject repo> for model-card text. quote: null, retrieved: null, verify: true for EVERY
-       evidence entry (this container cannot retrieve them; they are filled at E2).
-     - families: the 10 families with their splits and independence evidence as in the section 5 table.
-     - repos: the 40 repos with family; verify true exactly for the entries marked V in section 5.
+       E_G2, E_G3, E_Q3, E_L3, E_L32 (kind org_blog, url https://ai.meta.com/blog/llama-3-2-connect-2024-vision-edge-mobile-devices/),
+       E_MK_L30, E_TL11_MC (TinyLlama_v1.1 model-card text, kind model_card_text), E_MC_<pair id> for model-card text of a
+       pair's subject). url: the arXiv abs URL (https://arxiv.org/abs/<id>) or https://huggingface.co/<subject repo> for
+       model-card text. quote: null, retrieved: null, verify: true for EVERY evidence entry (this container cannot
+       retrieve them; they are filled at E2).
+     - families: the 11 families with their splits and independence evidence as in the section 5 table (tinyllama11 is
+       a separate train family with independence_evidence [E_TL11_MC]; its note repeats the L10 init-evidence rule).
+     - repos: the 40 repos with family; verify true exactly for the entries marked V in section 5 (this includes
+       teknium/OpenHermes-2.5-Mistral-7B and stabilityai/stablelm-2-1_6b).
      - pairs: L01..L45 with reference/subject full repo ids, label, relation (not_derived -> "independent"),
-       hard_negative exactly as the "hard" column (L10, L11, L23, L25, L37, L38, L39, L40, L41, L42, L44 are true),
-       evidence = [family independence evidence of both families] for not_derived pairs and the listed citation(s)
-       for derived pairs, verify true for the entries marked V, note = the section 5 note (or "").
-     The file must pass validate() (with verify flags present) and its counts must be: 45 pairs; train 9/9, calibration
-     4/4, heldout 10/9; heldout hard 7; sweep_pairs("heldout") has 104 entries.
+       hard_negative exactly as the "hard" column (L10, L11, L12, L16, L18, L23, L24, L25, L37, L38, L39, L40, L41, L42,
+       L44 are true), evidence = [family independence evidence of both families] for not_derived pairs and the listed
+       citation(s) for derived pairs (e.g. L06 -> [E_G2, E_MC_L06]; L33 -> [E_L32, E_MC_L33]), verify true for the entries
+       marked V, note = the section 5 note (or "").
+     The file must pass validate() (with verify flags present) and its counts must be: 45 pairs; train 9/9 (hard 5),
+     calibration 4/4 (hard 3), heldout 10/9 (hard 7); 11 families; sweep_pairs("heldout") has 104 entries.
   6. No network, no scout imports beyond stdlib + yaml.
 acceptance:
   tests:
-    - "test_draft_file_valid: load_labeled('groundtruth/labeled_v1.yaml') succeeds; synthetic False; 45 pairs; per split (derived, not_derived) == train (9,9), calibration (4,4), heldout (10,9); heldout hard_negative count 7; len(sweep_pairs('heldout')) == 104; 10 families; 40 repos"
-    - "test_draft_unresolved: unresolved() is non-empty and contains every evidence id (all quotes are pending) and pair:L10, pair:L30, repo:allenai/OLMo-2-0425-1B"
+    - "test_draft_file_valid: load_labeled('groundtruth/labeled_v1.yaml') succeeds; synthetic False; 45 pairs; per split (derived, not_derived) == train (9,9), calibration (4,4), heldout (10,9); hard_negative count per split train 5, calibration 3, heldout 7 (so >= half of every split's negatives); len(sweep_pairs('heldout')) == 104; 11 families; 40 repos; family_of('TinyLlama/TinyLlama_v1.1') == 'tinyllama11' and pair L10 is not_derived across families"
+    - "test_draft_oof_feasible: for each train pair e, the train pairs whose families are disjoint from e's have >= 2 of each label, except exactly {L15, L17}; the same holds after removing L10 and TinyLlama_v1.1 (the plan's fallback)"
+    - "test_draft_unresolved: unresolved() is non-empty and contains every evidence id (all quotes are pending) and pair:L10, pair:L30, repo:allenai/OLMo-2-0425-1B, repo:TinyLlama/TinyLlama_v1.1, repo:teknium/OpenHermes-2.5-Mistral-7B"
     - "test_rules (parametrized, each on a minimal valid dict built in the test, one mutation at a time, asserting the violation text names the id): duplicate pair id; unknown evidence id; derived pair across families; not_derived pair within one family; pair crossing splits; hard_negative on a derived pair; relation independent with label derived; evidence only hub_metadata; fixture kind with synthetic False; synthetic True without allow_synthetic; verify False with null quote; quote of 401 chars; bad retrieved date; extra key in a pair; missing key in a family; repo without pairs; family without repos; the same unordered pair twice (reversed)"
     - "test_all_violations_reported: a dict with 3 independent violations -> one LabeledSetError whose message has 3 lines"
     - "test_sweep_pairs: 2 heldout families with 2 and 3 repos -> 6 pairs, each (min, max), sorted"
