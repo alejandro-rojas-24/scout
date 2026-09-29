@@ -40,6 +40,13 @@ interface: |
     def prune(w: dict[str, Array], n_layers: int, drop: list[int]) -> dict[str, Array]
     def tokenizer_json_bytes(vocab: list[str], added: list[str] = (), model_type: str = "BPE") -> bytes
     def family_vocab(seed: int, size: int = 256, shared: list[str] = ()) -> list[str]
+    # FROZEN fixture seeds (plan.md 2.1 "no hand-tuning" covers these; test_frozen_seeds asserts the literals):
+    NULL_SEED_PAIRS: tuple[tuple[int, int], ...] = tuple((2 * p + 1, 2 * p + 2) for p in range(50))
+    FINETUNE_EPS: float = 0.02
+    FINETUNE_SEED: int = 7
+    REHEARSAL_BASE = FamilySpec(seed=1, n_layers=28)
+    REHEARSAL_OTHER = FamilySpec(seed=2, style="llama", n_layers=32, hidden=160, n_kv_heads=4, head_dim=32)
+
     def write_family_repo(root: pathlib.Path, w: dict[str, Array], config: dict, *, n_shards: int = 2,
                           dtype: str = "BF16", vocab: list[str] | None = None,
                           readme: str | None = None) -> dict
@@ -100,6 +107,7 @@ acceptance:
     - "test_deterministic: the same spec gives identical arrays; a different seed gives different arrays"
     - "test_upscale_prune: upscale(w,16,12,4) has 24 layers and layer 12 == original layer 4; prune(w,16,[5,6,7]) has 13 layers and layer 5 == original layer 8"
     - "test_permute_sigma_equal: singular values of k_proj before and after permute_hidden agree to 1e-4 relative"
+    - "test_frozen_seeds: NULL_SEED_PAIRS == ((1, 2), (3, 4), ..., (99, 100)) (50 pairs, written out as a literal in the test); FINETUNE_EPS == 0.02; FINETUNE_SEED == 7; REHEARSAL_BASE == FamilySpec(seed=1, n_layers=28); REHEARSAL_OTHER == FamilySpec(seed=2, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32)"
     - "test_repo_written: write_family_repo(n_shards=2) -> index + 2 shards + config.json + tokenizer.json; the tokenizer parses as JSON with model.type BPE"
   commands:
     - pytest -q tests/test_weights_fixtures.py

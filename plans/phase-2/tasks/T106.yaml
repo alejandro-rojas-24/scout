@@ -1,5 +1,5 @@
 id: T106
-title: Sample plan (which tensors, which byte ranges) + download gate + confirmers
+title: Sample plan (which tensors, which byte ranges) + download gate (plan always shown, exact-cap confirmation)
 depends_on: [T101, T008, T107]
 files:
   - scout/gate.py
@@ -47,10 +47,12 @@ interface: |
     def plan_sample(repo: str, revision_sha: str, units: list[UnitInput],
                     threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES) -> SamplePlan
     def decision(plan: SamplePlan, *, approved: bool, via: str, bytes_confirmed: int | None) -> GateDecision
-    def flag_confirmer(confirm_bytes: int | None) -> Confirmer
-    def prompt_confirmer(stdin: TextIO, stderr: TextIO) -> Confirmer
+    def flag_confirmer(confirm_plan: str | None, confirm_bytes: int | None) -> Confirmer
     def format_plan(plan: SamplePlan) -> str
-    def run_gate(plan: SamplePlan, log: ByteLog, confirmer: Confirmer | None) -> GateDecision
+    def format_plan_dict(plan: dict) -> str        # same text from SamplePlan.to_dict() output (used by CLI/runner)
+    def run_gate(plan: SamplePlan, log: ByteLog, confirmer: Confirmer | None, *,
+                 display: Callable[[str], None] | None = None) -> GateDecision
+    # there is NO interactive TTY prompt confirmer (cut in revision r1; see plan.md 11)
 behavior: |
   plan_sample:
     1. For each unit (in the given order): tensors = {t.name: t for h in headers for t in h.tensors};
@@ -59,7 +61,11 @@ behavior: |
        skipped += {"component", "reason": f"no stack with >= {min_layers} blocks"}; continue.
     2. roles = []; per_layer = [0]*depth. For role in ROLE_ORDER: find the FIRST pattern p in SIGMA_PARAMS["role_patterns"][role]
        such that f"{prefix}.{idx}.{p}" is in tensors for EVERY idx in stack.indices. None -> skipped reason
-       f"{prefix}: role {role} not found in every block"; continue with the next role.
+       f"{prefix}: role {role} not found in every block" + hint; continue with the next role. hint names the architecture
+       reason, from the rel names of the first block: any rel ending in "kv_a_proj_with_mqa.weight" or "kv_b_proj.weight" ->
+       " (MLA attention: kv_a_proj_with_mqa/kv_b_proj; not sampled in P2)"; else any rel ending in "qkv_proj.weight",
+       "query_key_value.weight" or "c_attn.weight" -> " (fused QKV; not sampled in P2)"; else "".
+       (The role loop stops adding skipped entries for the second role when the first produced the same hint.)
        Eligibility of every such tensor: len(shape) == 2, dtype in SUPPORTED_DTYPES, min(shape) >= SIGMA_PARAMS["min_dim"];
        the first failure -> skipped reason f"{prefix}: role {role} {name}: {what}" and the role is dropped.
        Byte cap: if max_l(per_layer[l] + nbytes_l) > SIGMA_PARAMS["max_bytes_per_layer"] -> skipped reason
@@ -76,11 +82,9 @@ behavior: |
        plan_id = sha256(json.dumps([repo, revision_sha, [[r.path, r.start, r.end_exclusive] for r in reads]],
        separators=(",",":")).encode()).hexdigest()[:16].
   decision(): decided_at = UTC now ISO-8601 with "Z"; the other fields are copied from the plan (n_reads = len(reads)).
-  flag_confirmer(n): approved iff n is not None and n >= plan.bytes_cap; via "cli-flag"; bytes_confirmed = n.
-  prompt_confirmer(stdin, stderr): write format_plan(plan) and then
-    f'Type "yes" to read up to {plan.bytes_cap} bytes of weights into memory (planned {plan.bytes_planned}): '
-    to stderr and flush; answer = stdin.readline().strip(); approved iff answer == "yes"; via "cli-prompt";
-    bytes_confirmed = plan.bytes_cap if approved else None.
+  flag_confirmer(confirm_plan, confirm_bytes): approved iff confirm_plan == plan.plan_id AND confirm_bytes == plan.bytes_cap
+    (EXACT equality: both numbers can only come from a plan that was displayed; a larger blanket number declines);
+    via "cli-flag"; bytes_confirmed = confirm_bytes.
   format_plan(plan): exact line format:
     "DOWNLOAD GATE: {repo}@{sha[:12]}"
     "  reason: {reason}"
@@ -88,13 +92,17 @@ behavior: |
     "  bytes planned: {bytes_planned:,} B ({mib:.1f} MiB)   hard cap incl. retries: {bytes_cap:,} B"
     "  disk: 0 B (held in memory, released after COMPUTE); memory peak <= {memory_peak_bytes:,} B"
     "  threshold: {threshold_bytes:,} B"
+    "  plan_id: {plan_id}"
     then one line per file "    {path}  {n_reads} reads  {bytes:,} B", then one line per skipped entry "  skipped: {component or '-'}: {reason}".
-  run_gate(plan, log, confirmer):
-    1. log.note("gate", f"plan {plan_id}: planned={bytes_planned} cap={bytes_cap} disk=0 memory={memory_peak_bytes} reads={n} reason={reason}").
+  format_plan_dict(d) produces exactly format_plan(plan) when d == plan.to_dict() (tested).
+  run_gate(plan, log, confirmer, display):
+    1. text = format_plan(plan). log.note("gate", text) (the FULL plan text goes into the live log, so the server's live log,
+       the UI and the Card's fetch_log carry it), then, if display is not None, display(text). Both happen BEFORE any decision
+       and before the confirmer is called, on every path (below-threshold, no-confirmer, confirmer).
     2. If plan.bytes_cap <= plan.threshold_bytes -> d = decision(approved=True, via="below-threshold", bytes_confirmed=None).
        Elif confirmer is None -> d = decision(approved=False, via="no-confirmer", bytes_confirmed=None).
-       Else d = confirmer(plan). If d.plan_id != plan.plan_id, or (d.approved and (d.bytes_confirmed is None or
-       d.bytes_confirmed < plan.bytes_cap)), then replace d with decision(approved=False, via=d.via, bytes_confirmed=d.bytes_confirmed).
+       Else d = confirmer(plan). If d.plan_id != plan.plan_id, or (d.approved and d.bytes_confirmed != plan.bytes_cap),
+       then replace d with decision(approved=False, via=d.via, bytes_confirmed=d.bytes_confirmed).
        A confirmer exception -> declined via "error".
     3. log.add_gate_decision(d.to_dict()); log.note("gate", f"plan {plan_id} {'approved' if d.approved else 'declined'} via {d.via}").
     4. Return d. run_gate never grants and never reads; the caller (T108) grants on approval or raises GateDeclined.
@@ -108,9 +116,11 @@ acceptance:
     - "test_plan_moe: P1 st_fixtures moe_tensors with hidden=64, head_dim=16, kv_heads=2, n_layers=8 (k/v 32x64, BF16) -> reads only for attention k/v, none for experts"
     - "test_plan_pipeline: two UnitInputs (text_encoder with a family, vae with a P1 vae fixture) -> reads only for text_encoder; vae is in skipped"
     - "test_run_gate_below_threshold: threshold >= cap -> approved via below-threshold, confirmer NOT called (spy); 2 gate events + 1 decision in log"
-    - "test_run_gate_flag: flag_confirmer(cap) approves; flag_confirmer(cap-1) and flag_confirmer(None) decline"
-    - "test_run_gate_bad_confirmer: a confirmer returning approved with another plan_id -> declined; one returning approved with bytes_confirmed < cap -> declined; one raising -> declined via 'error'"
-    - "test_prompt: io.StringIO('yes\\n') approves; 'y\\n' declines; stderr contains 'DOWNLOAD GATE' and the exact bytes_planned with thousands separators"
+    - "test_run_gate_flag: flag_confirmer(plan_id, cap) approves; flag_confirmer(plan_id, cap-1), flag_confirmer(plan_id, cap+1), flag_confirmer(plan_id, 10**15) (blanket number larger than the cap), flag_confirmer('0'*16, cap) (another plan_id), flag_confirmer(None, None) all decline"
+    - "test_run_gate_bad_confirmer: a confirmer returning approved with another plan_id -> declined; approved with bytes_confirmed cap-1 or cap+1 -> declined; one raising -> declined via 'error'"
+    - "test_plan_shown_first: display = a list-append spy, confirmer = a spy that records (len(display_calls), the log events so far) when called -> at confirmer time display was called exactly once with format_plan(plan) and the log already has a 'gate' event whose note == format_plan(plan); for the below-threshold and no-confirmer paths display is also called once"
+    - "test_format_plan: the text contains 'DOWNLOAD GATE', the exact bytes_planned and bytes_cap with thousands separators, 'disk: 0 B', the plan_id and one line per file; format_plan_dict(plan.to_dict()) == format_plan(plan)"
+    - "test_skip_hint: a hand-built header with model.layers.#.self_attn.kv_a_proj_with_mqa.weight / kv_b_proj.weight and no k/v_proj -> skipped reason contains 'MLA attention'; one with qkv_proj.weight -> 'fused QKV'"
     - "test_no_bytes: run_gate never changes log.totals and never creates a grant (grant_active False)"
   commands:
     - pytest -q tests/test_gate.py

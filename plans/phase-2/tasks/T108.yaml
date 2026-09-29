@@ -17,7 +17,8 @@ interface: |
     def scan(target: str, out_dir: pathlib.Path, log: ByteLog, *, client: httpx.Client | None = None,
              endpoint: str | None = None, token: str | None = None, max_workers: int = 8,
              tokenizer: bool = False, sample: bool = False, confirmer: Confirmer | None = None,
-             gate_threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES) -> ScanResult
+             gate_threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES,
+             gate_display: Callable[[str], None] | None = None) -> ScanResult
 behavior: |
   P1 steps 1-6 are unchanged. Additions, in order:
   A. (META, right after the P1 config reads) if tokenizer:
@@ -30,8 +31,9 @@ behavior: |
      plan = plan_sample(source.repo, source.revision_sha, [UnitInput(component, structure_u, headers_u) ...],
      gate_threshold_bytes). For each skipped entry: notes.append(f"sigma: {component or 'model'}: {reason}").
      If plan.reads is empty: notes.append("sigma: nothing sampleable"); skip C-E (no SAMPLED_READ/COMPUTE stages).
-  C. log.stage(SAMPLED_READ); d = run_gate(plan, log, confirmer).
-     If not d.approved: raise GateDeclined(f"weight sample declined ({d.via}); rerun with --confirm-bytes {plan.bytes_cap}",
+  C. log.stage(SAMPLED_READ); d = run_gate(plan, log, confirmer, display=gate_display) (the plan text is logged and
+     displayed before the decision; T106).
+     If not d.approved: raise GateDeclined(f"weight sample declined ({d.via}); plan {plan.plan_id}, cap {plan.bytes_cap} B",
      plan=plan.to_dict()). This goes through the P1 error path: error note, no Card, re-raise.
      log.grant(plan.plan_id, [(r.path, r.start, r.end_exclusive) for r in plan.reads], plan.bytes_cap).
      buffers = SampleBuffers(). Use ThreadPoolExecutor(max_workers) and submit, per read,
@@ -50,16 +52,20 @@ behavior: |
   F. (REPORT) build_card(..., options={"sample": sample, "tokenizer": tokenizer}, notes=list(notes),
      sigma_curves=sigma_curves_u or None, sigma_by_tensor=sigma_by_tensor_u or None, tokenizer_minhash=tok.get(unit)).
      The P1 write/rollback logic is unchanged.
-  G. After all Cards are written, if C-E ran: log.stage(PURGE); log.note("purge", "resident=0 verified").
+  G. After all Cards are written, if C-E ran: log.stage(PURGE). The SampleBuffers object is deliberately kept (empty) until
+     here so this is a real check, not a copy of the COMPUTE note: n = buffers.resident_bytes; k = len(buffers.names).
+     If n != 0 or k != 0: buffers.clear(); roll back the written Cards with the P1 rollback path; raise
+     SigmaError(f"PURGE: {n} weight bytes in {k} buffers still resident"). Else log.note("purge", f"PURGE check:
+     resident={n} names={k}"). Then del buffers. (No "verified" wording: the note states what was checked.)
   H. Return ScanResult(..., gate=log.gate_decisions, plan=plan.to_dict() if sample else None).
   I. Invariants: weight bytes exist only inside SampleBuffers; nothing is written except Cards; an exception at any
      point after C leaves resident_bytes == 0 and out_dir empty.
 acceptance:
   tests:
     - "all hub tests use FakeHub (endpoint=HUB, client=hub.client()) with repos from tests/helpers/weights_fixtures.write_family_repo(FamilySpec(seed=1), vocab=family_vocab(1))"
-    - "test_sample_approved_hub: scan(sample=True, tokenizer=True, gate_threshold_bytes=0, confirmer=flag_confirmer(10**9)) -> 1 card; stats.sigma_curves.tensors has 32 entries; parquet stat_sigma_curve non-null for exactly those 32 rows, each of length 64 (min(64,128)); totals.weight == plan.bytes_planned; every fakehub.cdn_reads entry whose range starts >= 8+N equals 'bytes={start}-{end-1}' of a planned read, and each planned read appears once; stage_start order RESOLVE,HEADERS,META,SAMPLED_READ,COMPUTE,REPORT,PURGE; a purge event (COMPUTE, note contains 'resident=0') precedes REPORT; card fetch_log.gate == [1 approved decision via cli-flag]"
+    - "test_sample_approved_hub: scan(sample=True, tokenizer=True, gate_threshold_bytes=0, confirmer=approve_exact) -> 1 card (approve_exact = a test helper in tests/test_scan_p2.py: lambda plan: gate.decision(plan, approved=True, via='cli-flag', bytes_confirmed=plan.bytes_cap)); stats.sigma_curves.tensors has 32 entries; parquet stat_sigma_curve non-null for exactly those 32 rows, each of length 64 (min(64,128)); totals.weight == plan.bytes_planned; every fakehub.cdn_reads entry whose range starts >= 8+N equals 'bytes={start}-{end-1}' of a planned read, and each planned read appears once; stage_start order RESOLVE,HEADERS,META,SAMPLED_READ,COMPUTE,REPORT,PURGE; a purge event (COMPUTE, note contains 'resident=0') precedes REPORT; card fetch_log.gate == [1 approved decision via cli-flag]"
     - "test_sigma_matches_local_svd: the stored sigma of one tensor equals sigma_values(decode(bytes read directly from the fixture file)) within 1e-12"
-    - "test_sample_declined: confirmer=flag_confirmer(None), gate_threshold_bytes=0 -> GateDeclined whose .plan has bytes_planned > 0; out_dir empty; totals.weight == 0; no cdn_reads range starts at >= 8+N; the log has a declined gate decision"
+    - "test_sample_declined: confirmer=flag_confirmer(None, None), gate_threshold_bytes=0 -> GateDeclined whose .plan has bytes_planned > 0; out_dir empty; totals.weight == 0; no cdn_reads range starts at >= 8+N; the log has a declined gate decision"
     - "test_sample_below_threshold: default threshold (64 MiB) and confirmer=None -> approved via below-threshold (the fixture cap is about 16.5 MiB)"
     - "test_sample_local: the same repo as a local folder -> sigma equal (1e-12) to the hub scan's; revision_kind local-stat-hash"
     - "test_sample_pipeline: write_pipeline_repo(root), replace root/text_encoder with write_family_repo(FamilySpec(seed=1)) (no tokenizer there) and write root/tokenizer/tokenizer.json -> 3 cards; text_encoder has sigma_curves and tokenizer_minhash (source_file 'tokenizer/tokenizer.json'); transformer and vae have both null and notes mention 'sigma:'"
@@ -69,6 +75,8 @@ acceptance:
     - "test_tokenizer_only: tokenizer=True, sample=False -> tokenizer_minhash present, meta totals include len(tokenizer.json), weight 0, no SAMPLED_READ stage"
     - "test_plain_unchanged: default flags -> the P1 stage order, all stats null, options both False, gate []"
     - "test_nothing_sampleable: P1 write_dense_repo (hidden 8) with sample=True -> the card is written, sigma null, notes contain 'sigma:', no SAMPLED_READ stage"
+    - "test_purge_check_real: monkeypatch compute_all to return without popping one buffer (and without its own final check) -> SigmaError mentioning 'PURGE'; out_dir empty (rollback); resident 0 after the exception"
+    - "test_gate_display_called: gate_display spy is called once with text containing 'DOWNLOAD GATE' and plan_id, before the first cdn_reads weight range (spy records len(cdn_reads weight ranges) == 0 at call time)"
     - "test_no_extra_files_sampled: HOME and TMPDIR monkeypatched to empty dirs stay empty after an approved sampled scan; out_dir holds only *.card.json/*.tensors.parquet"
     - "P1 tests/test_scan.py passes unchanged"
   commands:

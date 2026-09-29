@@ -7,13 +7,12 @@
   calibrate them on the labelled set.
 - Hard negatives: same architecture, trained independently (e.g. two 7B Llama-shaped
   models from different orgs). The P2 null argument assumes independent runs share only
-  smooth depth structure. Measure that on the labelled set, and report the null median r
-  per architecture family.
+  smooth depth structure. P2 tests it per run (C14 `z_shift`, C18 off-diagonal gap) and
+  reports the participation ratio, but only on the one unrelated exit pair. Measure it on the
+  labelled set, and report the null median r and PR per architecture family.
 - CKA, spectral top-k, norm/std tools, and claimed-vs-detected `base_model` checks. P2
   records `claimed_base_match` but does not verify claims.
 - Base reference library. P2 suggests only from Cards already in the out dir.
-- An off-diagonal null in the DiffView: the median of R over non-aligned layer pairs, as an
-  in-run baseline. It is omitted in P2 to keep the view minimal.
 
 ## Phase 4
 - Content-addressed Card store. `GET /api/cards` is a plain glob; it neither skips rescans
@@ -27,6 +26,9 @@
   column block is not contiguous in row-major storage, and a row block is not
   permutation-invariant, so both need a new invariance argument.
 - GGUF/quantized sampled reads (dequantization before SVD).
+- Retry slack scaled with the plan (e.g. `max(16 MiB, 4 × largest read)`), so two mid-tensor
+  resets on 8 MiB reads do not fail a target. P2 accepts rerunning E3 whole (validation r1,
+  minor 4; plan §11 deferred minors).
 
 ## Unscheduled
 - Hub-side candidate search (`/api/models?search=`, model tree `base_model:` filters) for
@@ -35,6 +37,10 @@
   `tokenizer.json` / `vocab.json` and records a note otherwise.
 - Fused-QKV roles (`qkv_proj`, `query_key_value`, `c_attn`): split by config head counts
   before the SVD.
+- MLA attention (DeepSeek-V2/V3 style: `kv_a_proj_with_mqa`, `kv_b_proj`, `q_a_proj`/`q_b_proj`).
+  There are no k/v_proj tensors. The low-rank `kv_b_proj` (or the product `kv_b_proj ·
+  kv_a_proj`) is the candidate role, and it needs its own invariance argument. P2 skips it,
+  and the skip note names "MLA attention".
 - Sampling more than one stack per unit (e.g. a vision tower of a VL text encoder), and MoE
   expert sampling.
 - Width-pruned models (Minitron-style): the grid on relative rank makes the curves

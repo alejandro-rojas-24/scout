@@ -1,5 +1,5 @@
 id: T115
-title: P2 exit expectations - C1..C17 as pure functions, frozen params, fixed thresholds, target set and pairs
+title: P2 exit expectations - C1..C18 as pure functions, frozen params, fixed thresholds, target set and pairs
 depends_on: [T111]
 files:
   - scripts/exit_expectations_p2.py
@@ -13,7 +13,10 @@ interface: |
     PAIRS: tuple[tuple[str, str, str], ...] = (("related", "Qwen/Qwen2.5-7B", "Qwen/Qwen2.5-7B-Instruct"),
                                                ("unrelated", "Qwen/Qwen2.5-7B", "meta-llama/Llama-3.1-8B"))
     SUGGEST_SUBJECT = "Qwen/Qwen2.5-7B-Instruct"; SUGGEST_EXPECTED = "Qwen/Qwen2.5-7B"
-    RELATED_MEDIAN_MIN = 0.80; UNRELATED_MEDIAN_MAX = 0.40; SEPARATION_MIN = 0.40
+    RELATED_MEDIAN_MIN = 0.80; RELATED_Q10_MIN = 0.50
+    UNRELATED_MEDIAN_MAX = 0.40; UNRELATED_Z_MAX = 3.0
+    SEPARATION_MIN = 0.40
+    OFFDIAG_GAP_MIN = 0.40; TOP1_MIN = 0.80
     SUGGEST_JACCARD_MIN = 0.90; SUGGEST_CONFIG_MIN = 0.80
     MAX_BYTES_PER_LAYER = 16 * 1024 * 1024
     FROZEN_SIGMA_PARAMS: dict = <literal copy of plan.md 4.6 SIGMA_PARAMS>
@@ -24,6 +27,7 @@ interface: |
         target: str; pin: str; status: str; final: dict; events: list[dict]
         pre_confirm: dict              # {"totals": {...}, "events": [...], "wire": [records up to the confirm POST]}
         plan: dict | None; cards: list[dict]; tables: list[pyarrow.Table]
+        confirm_plans: dict[str, int]  # plan_id -> bytes_cap, exactly the --confirm-plans the human passed ({} in plan mode)
         json_paths: list[pathlib.Path]; parquet_paths: list[pathlib.Path]; out_files: list[pathlib.Path]
         wire: list[dict]               # CountingTransport records for the whole target
 
@@ -40,7 +44,7 @@ interface: |
                       stack_prefix: str = "model.layers") -> list[Check]                 # C1..C9
     def params_check() -> list[Check]                                                   # C10
     def pair_checks(res: P2Results, pairs=PAIRS, suggest_subject=SUGGEST_SUBJECT,
-                    suggest_expected=SUGGEST_EXPECTED) -> list[Check]                     # C11..C17
+                    suggest_expected=SUGGEST_EXPECTED) -> list[Check]                     # C11..C18
 behavior: |
   1. Checks never raise (the P1 T016 convention: an exception becomes ok=False with actual "error: ...").
      Each assertion is its own Check. Names are "C<n> <short name>".
@@ -63,32 +67,41 @@ behavior: |
      C7 hosts/endpoint: all wire hosts pass host_allowed; card.source.endpoint == expected_endpoint; len(wire) >= 1.
      C8 card v1: schema_version == "card.v1"; len(stats.sigma_curves.tensors) == 2*L; the parquet stat_sigma_curve is
         non-null for exactly those names, each of length min(shape) and non-increasing; fetch_log.gate has exactly 1 entry with
-        approved True, via "api-confirm", bytes_confirmed >= bytes_cap, plan_id == plan.plan_id; tokenizer_minhash.num_perm == 256
+        approved True, via "api-confirm", bytes_confirmed == plan.bytes_cap (exact), plan_id == plan.plan_id, and
+        r.confirm_plans.get(plan_id) == plan.bytes_cap (the approved plan is one the human listed); tokenizer_minhash.num_perm == 256
         and source_file == "tokenizer.json".
      C9 purge: in card.fetch_log.events there is an event with event "purge", stage "COMPUTE" and "resident=0" in the note, whose
-        seq < the seq of the REPORT stage_start; every path in out_files ends with ".card.json" or ".tensors.parquet".
+        seq < the seq of the REPORT stage_start; the live log (final.events) has a "purge" event with stage "PURGE" and note
+        "PURGE check: resident=0 names=0"; every path in out_files ends with ".card.json" or ".tensors.parquet".
   4. params_check: C10: scout.sigma.SIGMA_PARAMS == FROZEN_SIGMA_PARAMS and scout.align.ALIGN_PARAMS == FROZEN_ALIGN_PARAMS
      (2 Checks).
   5. pair_checks (d = diffs[label]; sp = the stack pair with reference_prefix == subject_prefix == stack_prefix):
      C11 related structure: exactly 1 such pair; kind "same"; reference_depth == subject_depth == len(layers); every layer op
          "match" and reference_index == subject_index; jumps == [].
-     C12 related weight: weight.n_with_r == subject_depth and weight.median_r >= RELATED_MEDIAN_MIN.
+     C12 related weight: weight.n_with_r == subject_depth and weight.median_r >= RELATED_MEDIAN_MIN and
+         weight.q10_r >= RELATED_Q10_MIN (no broken band of layers hides behind the median).
      C13 unrelated structure: the pair with reference_prefix == stack_prefix has kind "incompatible" and mode "reldepth";
          {f"{stack_prefix}.#.self_attn.{x}_proj.bias" for x in "qkv"} is a subset of tensor_diff.only_in_reference.
-     C14 unrelated weight: weight.n_with_r == subject_depth and weight.median_r <= UNRELATED_MEDIAN_MAX.
+     C14 unrelated weight: weight.n_with_r == subject_depth and weight.median_r <= UNRELATED_MEDIAN_MAX and
+         weight.z_shift is not None and weight.z_shift <= UNRELATED_Z_MAX (the aligned median does not stand out from the
+         in-run cyclic-shift null).
      C15 separation: related.median_r - unrelated.median_r >= SEPARATION_MIN.
      C16 suggestion: suggestions[0].card_key.repo == suggest_expected and revision_sha == the pin of suggest_expected;
          tokenizer_jaccard >= SUGGEST_JACCARD_MIN; config_score >= SUGGEST_CONFIG_MIN; claimed_base_match is True.
-     C17 compare offline: len(compare_wire) == 0; every diff's disclaimers == list(scout.view.DISCLAIMERS).
+     C17 compare offline: len(compare_wire) == 0; every diff's disclaimers == list(scout.view.DISCLAIMERS); the suggestion's
+         disclaimers == list(scout.view.DISCLAIMERS).
+     C18 related in-run null: related weight.median_r - weight.offdiag_median_r >= OFFDIAG_GAP_MIN and
+         weight.diag_top1_frac >= TOP1_MIN (lineage is layer-specific: shape- or architecture-common structure would raise every
+         R entry and fail the gap; a low-dimensional residual would fail top-1).
   6. The thresholds are module constants, not parameters. The offline rehearsal (T116) uses the same constants.
 acceptance:
   tests:
     - "tests/test_exit_expectations_p2.py builds hand-written P2TargetResult/P2Results (small dicts + tiny pyarrow tables)"
     - "a passing input for target_checks and pair_checks -> all ok"
-    - "failing inputs (parametrized), each makes at least the named check fail and nothing raises: pre-confirm weight 1 byte (C1); a header-range record that ends past 8+N before confirm (C1); plan bytes off by 2 (C2); a read range shifted by 1 (C3); a per-layer 16 MiB + 1 (C3); fetch weight != planned (C4); totals.weight > cap (C4); a wire range not planned (C5); a planned range never served (C5); a wire total +1 (C6); host mirror.example.com (C7); card.v0 (C8); gate via 'cli-flag' (C8); no purge event (C9); a purge after REPORT (C9); an extra file 'x.bin' in out_files (C9); median 0.79 (C12); median 0.41 (C14); a separation of 0.39 (C15); top-1 is Llama (C16); compare_wire non-empty (C17); a jump in the related pair (C11); kind 'upscaled' for the unrelated pair (C13)"
+    - "failing inputs (parametrized), each makes at least the named check fail and nothing raises: pre-confirm weight 1 byte (C1); a header-range record that ends past 8+N before confirm (C1); plan bytes off by 2 (C2); a read range shifted by 1 (C3); a per-layer 16 MiB + 1 (C3); fetch weight != planned (C4); totals.weight > cap (C4); a wire range not planned (C5); a planned range never served (C5); a wire total +1 (C6); host mirror.example.com (C7); card.v0 (C8); gate via 'cli-flag' (C8); no purge event (C9); a purge after REPORT (C9); an extra file 'x.bin' in out_files (C9); median 0.79 (C12); q10_r 0.49 (C12); median 0.41 (C14); z_shift 3.01 (C14); z_shift None (C14); offdiag 0.45 with median 0.84 (C18); top1 0.79 (C18); gate bytes_confirmed == cap + 1 (C8); an approved plan_id missing from confirm_plans (C8); suggestion without disclaimers (C17); no PURGE-stage purge event (C9); a separation of 0.39 (C15); top-1 is Llama (C16); compare_wire non-empty (C17); a jump in the related pair (C11); kind 'upscaled' for the unrelated pair (C13)"
     - "test_c0: pins missing one repo, an extra repo, or a wrong case -> not ok"
     - "test_frozen_literals: FROZEN_SIGMA_PARAMS == scout.sigma.SIGMA_PARAMS and FROZEN_ALIGN_PARAMS == scout.align.ALIGN_PARAMS today (guards against drift)"
-    - "test_threshold_constants: the constants equal 0.80, 0.40, 0.40, 0.90, 0.80 exactly"
+    - "test_threshold_constants: RELATED_MEDIAN_MIN 0.80, RELATED_Q10_MIN 0.50, UNRELATED_MEDIAN_MAX 0.40, UNRELATED_Z_MAX 3.0, SEPARATION_MIN 0.40, OFFDIAG_GAP_MIN 0.40, TOP1_MIN 0.80, SUGGEST_JACCARD_MIN 0.90, SUGGEST_CONFIG_MIN 0.80 exactly"
   commands:
     - pytest -q tests/test_exit_expectations_p2.py
     - pytest -q

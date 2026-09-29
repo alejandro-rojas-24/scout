@@ -35,7 +35,8 @@ behavior: |
        - answer {"approved": False} -> decision(approved=False, via="api-decline", bytes_confirmed=None)
      run_gate (T106) re-validates plan_id and bytes.
   3. POST confirm: 404 for an unknown id. 409 {"error": ...} if status != "awaiting_confirmation", or plan_id != state.plan.plan_id,
-     or bytes_confirmed is not an int (bool rejected) or < state.plan.bytes_cap. Else set gate_answer
+     or bytes_confirmed is not an int (bool rejected) or != state.plan.bytes_cap (EXACT equality; the UI and the exit runner send
+     the bytes_cap of the plan they displayed). Else set gate_answer
      {"approved": True, "bytes_confirmed": n}, set the event, return 200. POST decline: same checks except the bytes;
      answer {"approved": False}.
   4. GET /api/scans/{id}: plan = state.plan (stays set after the decision); gate = state.log.gate_decisions. On an exception
@@ -54,11 +55,13 @@ acceptance:
   tests:
     - "make_server(port=0, out_dir=tmp, client_factory=lambda: hub.client(), endpoint=HUB, gate_threshold_bytes=0) on FakeHub family repos"
     - "test_gate_confirm_flow: POST {target, sample: true, tokenizer: true} -> poll until awaiting_confirmation (10 s timeout); at that moment totals.weight == 0 and no fakehub cdn_reads range starts at >= 8+N; the plan has bytes_planned/bytes_cap/per_file; POST confirm with bytes_confirmed = bytes_cap -> 200; poll until done; views[0].summary.weight_bytes_read == bytes_planned; gate[0].via == 'api-confirm'"
-    - "test_gate_confirm_rejects: a wrong plan_id -> 409; bytes_cap-1 -> 409; true (bool) -> 409; confirm when not awaiting -> 409; unknown id -> 404"
+    - "test_gate_confirm_rejects: a wrong plan_id -> 409; bytes_cap-1 -> 409; bytes_cap+1 -> 409; 10**15 -> 409; true (bool) -> 409; confirm when not awaiting -> 409; unknown id -> 404"
     - "test_gate_decline: POST decline -> status error, error.type GateDeclined, error.plan present; totals.weight == 0; out_dir empty"
     - "test_gate_timeout: monkeypatch GATE_WAIT_S = 0.2 -> error GateDeclined; gate[0].via == 'timeout'"
     - "test_cards_diff_suggest: after 2 confirmed scans (base, finetune), GET /api/cards lists 2 with has_sigma true; POST /api/diff -> 200 with kind same; GET /api/suggest for the finetune -> top-1 base; the FakeHub request count does not change during these 3 calls"
     - "test_diff_bad_key: revision_sha '../../etc' -> 400; a component with '/' -> 400; an unknown sha -> 404"
+    - "test_plan_in_live_log: at awaiting_confirmation the events (since=0) contain a 'gate' event whose note starts with 'DOWNLOAD GATE' and contains plan.plan_id and the exact bytes_cap (the plan is in the live log before any decision)"
+    - "test_suggest_disclaimers: GET /api/suggest result has disclaimers == list(DISCLAIMERS)"
     - "test_plain_scan_unchanged: POST {target} only -> no awaiting state, plan null, gate []"
     - "P1 tests/test_server.py passes unchanged"
   commands:

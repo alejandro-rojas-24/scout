@@ -1,6 +1,6 @@
 # Phase 2 plan: Diff view + first weight signal
 
-Status: DRAFT (planner round 1), 2026-09-28. This plan builds on the Phase 1 plan
+Status: DRAFT (planner revision r1, answering validation round 1), 2026-09-29. This plan builds on the Phase 1 plan
 (`plans/phase-1/plan.md`, tasks T001–T016) and treats it as a contract. Section 9 lists every
 Phase 1 interface that changes, and the task that makes each change.
 
@@ -10,7 +10,7 @@ scout compares two Cards side by side. It shows a structural diff whose block al
 handles depth-upscaled and pruned models, suggests a reference by config match and
 tokenizer MinHash, and colours each aligned layer by a sigma-curve correlation computed
 from full k/v projection matrices read with gated, logged Range requests. A weight read is
-issued only after a human has confirmed the exact byte count. Weights live only in
+issued only after the plan has been displayed and a human has confirmed that plan's id and exact byte cap. Weights live only in
 memory and are released before the Card is written, so the Card (now `card.v1`) remains
 the only persisted artifact.
 
@@ -50,7 +50,9 @@ only: implementation and the offline suite never need the token.
 **No hand-tuning.** The following are fixed by this plan before any real-model run:
 - every constant in `SIGMA_PARAMS` and `ALIGN_PARAMS` (§4.6)
 - the roles sampled
-- the thresholds in §2.3
+- the thresholds in §2.3 (including the in-run null thresholds of C12, C14 and C18)
+- the synthetic fixture seeds (`weights_fixtures.NULL_SEED_PAIRS`, `FINETUNE_EPS/SEED`, `REHEARSAL_BASE/OTHER`, T103).
+  Changing a seed to make an offline test pass is hand-tuning by another route and is forbidden.
 
 Check C10 asserts that the code's params equal the frozen literals in
 `scripts/exit_expectations_p2.py`. A FAIL goes to the human. Constants are never changed
@@ -72,18 +74,20 @@ pytest -q                                   # expect exit 0, 0 failures; network
 python scripts/pin_exit.py --phase 2 --pins exit/pins_p2.json
 # expect exit 0; last stdout line {"step":"PIN","phase":2,"hostname":...,"repos":{...}}
 
-# E2 plan only: gate plans are shown, confirmation declined, 0 weight bytes
+# E2 plan only: every gate plan is displayed in full (stderr), confirmation declined, 0 weight bytes
 python scripts/exit_check_p2.py --pins exit/pins_p2.json --plan-only
-# expect exit 0. Prints 3 plans and "CONFIRM WITH: --confirm-bytes <N>".
+# expect exit 0. Prints 3 full plans (format_plan: plan_id, bytes planned, cap, disk 0 B, memory, reason, per-file table),
+# then "CONFIRM WITH: --confirm-plans <id1>:<cap1>,<id2>:<cap2>,<id3>:<cap3>" and "TOTAL CAP: <N> B".
 # At plan time (published configs):
-#   Qwen2.5-7B           bytes_planned 205520896  (28 layers x 2 x 512x3584 x 2 B)
-#   Qwen2.5-7B-Instruct  bytes_planned 205520896
-#   Llama-3.1-8B         bytes_planned 536870912  (32 x 2 x 1024x4096 x 2 B)
+#   Qwen2.5-7B           bytes_planned 205520896  cap 222298112  (28 layers x 2 x 512x3584 x 2 B, + 16 MiB)
+#   Qwen2.5-7B-Instruct  bytes_planned 205520896  cap 222298112
+#   Llama-3.1-8B         bytes_planned 536870912  cap 553648128  (32 x 2 x 1024x4096 x 2 B, + 16 MiB)
 #   N = sum(bytes_cap) = 947912704 + 3 x 16777216 = 998244352
 
-# E3 the confirmed run (the human copies N from E2; this is the human confirmation)
-python scripts/exit_check_p2.py --pins exit/pins_p2.json --confirm-bytes 998244352 --out /tmp/p2cards
-# expect exit 0; the table shows C0..C17 all PASS; the last line is the JSON evidence
+# E3 the confirmed run. The human reads the three plans and copies the CONFIRM WITH line; that is the confirmation.
+python scripts/exit_check_p2.py --pins exit/pins_p2.json --confirm-plans <id1>:<cap1>,<id2>:<cap2>,<id3>:<cap3> --out /tmp/p2cards
+# expect exit 0; each plan is displayed again before its confirm POST; the table shows C0..C18 all PASS;
+# the last line is the JSON evidence
 
 # E4 CLI path, same Cards
 scout diff /tmp/p2cards/Qwen__Qwen2.5-7B/<sha>/_model.card.json \
@@ -93,10 +97,18 @@ scout diff /tmp/p2cards/Qwen__Qwen2.5-7B/<sha>/_model.card.json \
 # E5 human visual check (recorded in log.jsonl): see 2.4
 ```
 
-`--plan-only` and `--confirm-bytes` are mutually exclusive, and exactly one is required.
-With `--confirm-bytes N`, the runner confirms each plan through
-`POST /api/scans/{id}/confirm` only while the running sum of `bytes_cap` stays `<= N`.
-Otherwise it declines, and the affected checks FAIL.
+`--plan-only` and `--confirm-plans` are mutually exclusive, and exactly one is required.
+With `--confirm-plans`, the runner displays each plan (stderr) as soon as its scan reaches
+`awaiting_confirmation`, then confirms it through `POST /api/scans/{id}/confirm` with
+`bytes_confirmed = bytes_cap` only if that exact `(plan_id, bytes_cap)` pair is in the list. Otherwise it
+displays `NOT CONFIRMED` and declines, and the affected checks FAIL. There is no running byte sum: a
+plan that was never displayed cannot be approved, even if its total is smaller. Plan ids are
+deterministic at a pin (§4.4), so E2 and E3 produce the same ids.
+
+**Mid-read network faults.** `RETRY_SLACK_BYTES` stays 16 MiB per plan. Two mid-tensor resets on
+Llama's 8 MiB reads can exhaust it; the target then fails with `WeightReadRefused` and no Card. The
+accepted remedy is to rerun E3 as a whole with the same `--confirm-plans` line; the rerun is a fresh
+human invocation of the confirmed plans (validation r1, minor 4; scaling the slack is deferred, §11).
 
 ### 2.3 Checks (P2 namespace; each is one row `target | check | expected | actual | PASS/FAIL`)
 
@@ -112,42 +124,86 @@ The per-target checks C1–C10 run for each of the 3 targets.
 | C5 | wire: each `.safetensors` request has a `Range` that lies in `[0, 8+N)` or equals a planned range exactly; each planned range has ≥ 1 2xx record with `body_bytes == end-start` | true |
 | C6 | wire total: Σ body bytes `==` ByteLog `meta+header+weight` | equal |
 | C7 | wire hosts are `huggingface.co` or `*.hf.co`; `card.source.endpoint == "https://huggingface.co"` | true |
-| C8 | Card v1 content: `schema_version == "card.v1"`; `stats.sigma_curves.tensors` has 2L entries; Parquet `stat_sigma_curve` is non-null for exactly those 2L rows, each of length `min(shape)` and non-increasing; `fetch_log.gate` has exactly 1 decision with `approved`, `via == "api-confirm"`, `bytes_confirmed >= bytes_cap` and the plan_id of C2; `stats.tokenizer_minhash.num_perm == 256` and `source_file == "tokenizer.json"` | true |
-| C9 | purge: a `purge` event with stage `COMPUTE` and note containing `resident=0` precedes the `REPORT` `stage_start` in `fetch_log.events`; out dir holds only `*.card.json` / `*.tensors.parquet` | true |
+| C8 | Card v1 content: `schema_version == "card.v1"`; `stats.sigma_curves.tensors` has 2L entries; Parquet `stat_sigma_curve` is non-null for exactly those 2L rows, each of length `min(shape)` and non-increasing; `fetch_log.gate` has exactly 1 decision with `approved`, `via == "api-confirm"`, `bytes_confirmed == bytes_cap` (exact) and the plan_id of C2, and that `(plan_id, bytes_cap)` pair is in `--confirm-plans`; `stats.tokenizer_minhash.num_perm == 256` and `source_file == "tokenizer.json"` | true |
+| C9 | purge: a `purge` event with stage `COMPUTE` and note containing `resident=0` precedes the `REPORT` `stage_start` in `fetch_log.events`; the live log has a `purge` event with stage `PURGE` and note `PURGE check: resident=0 names=0`; out dir holds only `*.card.json` / `*.tensors.parquet` | true |
 | C10 | frozen params: `scout.sigma.SIGMA_PARAMS == FROZEN_SIGMA_PARAMS` and `scout.align.ALIGN_PARAMS == FROZEN_ALIGN_PARAMS` | equal |
 | C11 | related structure: exactly 1 stack pair `model.layers`↔`model.layers`, `kind == "same"`, 28 layers, each `op == "match"` with `reference_index == subject_index`, `jumps == []` | true |
-| C12 | related weight: `weight.n_with_r == 28` and **`weight.median_r >= 0.80`** | true |
+| C12 | related weight: `weight.n_with_r == 28`, **`weight.median_r >= 0.80`** and **`weight.q10_r >= 0.50`** | true |
 | C13 | unrelated structure: `kind == "incompatible"`, `mode == "reldepth"`, and `tensor_diff.only_in_reference ⊇ {model.layers.#.self_attn.{q,k,v}_proj.bias}` | true |
-| C14 | unrelated weight: `weight.n_with_r == 32` and **`weight.median_r <= 0.40`** | true |
+| C14 | unrelated weight: `weight.n_with_r == 32`, **`weight.median_r <= 0.40`** and **`weight.z_shift <= 3.0`** (not null) | true |
 | C15 | separation: `median_r(related) - median_r(unrelated) >= 0.40` | true |
 | C16 | suggestion for the Instruct Card with pool = the other two Cards in the out dir: top-1 is `Qwen/Qwen2.5-7B@pin`, with `tokenizer_jaccard >= 0.90`, `config_score >= 0.80` and `claimed_base_match == true` | true |
-| C17 | the diffs and suggestions are computed by a separate server whose CountingTransport records 0 requests; both DiffViews carry `disclaimers == DISCLAIMERS` | true |
+| C17 | the diffs and suggestions are computed by a separate server whose CountingTransport records 0 requests; both DiffViews and the suggestion result carry `disclaimers == DISCLAIMERS` | true |
+| C18 | related in-run null: **`weight.median_r − weight.offdiag_median_r >= 0.40`** and **`weight.diag_top1_frac >= 0.80`** | true |
 
-`--plan-only` (E2) writes no Card. It evaluates only C0, C1 and a `P plan` check (`bytes_planned > 0` and `bytes_cap == bytes_planned + 16 MiB`). C2–C17 are evaluated in E3.
+`--plan-only` (E2) writes no Card. It evaluates only C0, C1 and a `P plan` check (`bytes_planned > 0` and `bytes_cap == bytes_planned + 16 MiB`). C2–C18 are evaluated in E3.
+
+The EXIT evidence line records, per pair, `median_r`, `q10_r`, `offdiag_median_r`, `diag_top1_frac`,
+`z_shift`, the shift-null SD and both participation ratios, whether or not a check uses them.
 
 C15 follows from C12 and C14. It is kept as its own row so the evidence line states the margin.
 
-**Why these thresholds (first principles, not fitted; see §5 D20 for the statistic).** For
-each layer, the statistic is the Pearson r between two vectors. Each vector holds the
-*depth-detrended, per-layer-centred log singular values of the top half of the spectrum* of
-that layer's `v_proj` and `k_proj`.
+**Why these thresholds (first principles plus fixture measurements; never fitted to the targets; see §5 D20
+for the statistic and D32 for the in-run null).** For each layer, the statistic is the Pearson r between two
+vectors. Each vector holds the *depth-detrended, per-layer-centred log singular values of the top half of the
+spectrum* of that layer's `v_proj` and `k_proj`.
 
-- **Related pair.** A fine-tune changes W by ΔW. By Weyl, `|Δσ_k| ≤ ‖ΔW‖₂`, so on the top
-  half of the spectrum (σ_k ≥ σ_median) each log σ_k moves by at most `‖ΔW‖₂/σ_median`. Write
-  s for the RMS of a layer's residual vector (its layer-specific spectral structure) and ε
-  for the RMS of the fine-tune perturbation in the same space. If the perturbation is
-  uncorrelated with the structure, then `r ≈ s²/(s²+ε²)`. **X = 0.80** therefore tolerates a
-  perturbation up to half of the layer-specific structure (`ε ≤ 0.5 s`). Below that we
-  would no longer call the signal "high".
-- **Unrelated pair.** Independent training runs share only generic structure: the matrix
-  shape, a smooth dependence on depth, and a per-layer scale. The statistic removes each of
-  these (grid on relative rank, cubic detrend over relative depth, per-layer centring), so
-  under independence `E[r] = 0`. The residual curves are smooth along rank, so take a
-  conservative effective dimension `d_eff ≥ 5`. The per-layer null SD is then at most
-  `1/√(d_eff−1) = 0.5`. The median of `n ≥ 28` layers has SD `≤ 1.2533·0.5/√28 = 0.118`.
-  **Y = 0.40** sits more than 3.3 SD above the null mean, which absorbs some residual generic
-  structure without letting an unrelated pair pass as related.
-- **Margin.** `X − Y = 0.40`, so the two regimes cannot overlap.
+- **Related pair, median (X = 0.80).** A fine-tune changes W by ΔW. By Weyl, `|Δσ_k| ≤ ‖ΔW‖₂`, so on the top
+  half of the spectrum (σ_k ≥ σ_median) each log σ_k moves by at most `‖ΔW‖₂/σ_median`. Write s for the RMS of a
+  layer's residual vector (its layer-specific spectral structure) and ε for the RMS of the fine-tune perturbation
+  in the same space. If the perturbation is uncorrelated with the structure, then `r ≈ s²/(s²+ε²)`. X = 0.80
+  tolerates a perturbation up to half of the layer-specific structure (`ε ≤ 0.5 s`).
+- **Related pair, lower tail (q10 ≥ 0.50).** r = 0.50 is `ε = s`: the perturbation is as large as the structure.
+  Requiring the 10th percentile to reach it means at most 10 % of layers (2 of 28) may be dominated by the
+  perturbation, so a broken role or depth band cannot hide behind the median (validation r1, minor 3).
+- **Unrelated pair, absolute (Y = 0.40), with a measured d_eff.** The statistic removes the generic structure
+  (relative-rank grid, per-layer centring, cubic depth detrend), so under independence `E[r] = 0`. The round-0
+  plan then *assumed* `d_eff ≥ 5`. That was wrong: smooth residuals have a low effective dimension. The per-layer
+  null r of a d-dimensional residual has SD ≈ `1/√(d−1)`, and the median of n layers has SD ≈ `1.2533·SD_r/√n`.
+  d_eff is now measured as the participation ratio `PR = (Σλ)²/Σλ²` of the residual layer vectors, reported in
+  every DiffView and in the evidence line (never thresholded). With the fixture's PR (below), the formula gives
+  a median SD of 0.21 at L = 16 and 0.13 at L = 32; the measured SDs are 0.167 and 0.114, so the formula is
+  conservative. At exit depths Y = 0.40 sits 3.2 formula-SD (3.6 measured SD) above the null mean. At L = 16 it
+  sits only 2.0 formula-SD above it, which is why the round-0 test "≤ 0.40 for every seed pair" was on the edge.
+  The offline tests now use a 95th percentile, and the rehearsal uses the exit depths (28 vs 32).
+- **Unrelated pair, relative (z_shift ≤ 3.0).** Y assumes that real independent models are as independent at
+  matched relative depth as the fixture. That assumption is now tested in the run itself. The cyclic-shift null
+  takes the same median over the n−1 deliberately misaligned pairings `i ↦ a((i+k) mod n)` of the same two
+  models, so its spread reflects the run's actual d_eff. `z_shift = (median_r − mean)/sd` ≤ 3 is one-sided,
+  because the failure mode is a spuriously high r. If real unrelated models have a PR near 2, the absolute Y is
+  only about 1.8 SD from the null. C14 may then FAIL, and the FAIL goes to the human with the PR in the
+  evidence. It is never answered by retuning.
+- **Related pair, in-run null (C18: gap ≥ 0.40, top-1 ≥ 0.80).** This closes validation r1 major 1. The
+  related pair shares architecture, so a high diagonal r alone cannot separate lineage from structure shared
+  by the architecture. Structure common to every layer raises `R[i, j]` for all j, not only `j = a(i)`, so it
+  shrinks `median_r − offdiag_median_r`. A gap of 0.40 requires the layer-specific part of r alone to be as
+  large as the whole unrelated bound. `diag_top1_frac ≥ 0.80` requires that 80 % of subject layers find their
+  own aligned partner as the best of all reference layers. The 20 % allowance covers real neighbouring layers
+  that resemble each other. A low-dimensional residual, where many layers correlate at ±1, fails top-1.
+- **Margin.** `X − Y = 0.40` (C15).
+
+**Measured on the fixture design (planner, revision r1).** These values come from an independent numpy
+reimplementation of the T103 generator and the T109 statistic (scratch code under /tmp, not in the repo). The
+rng stream differs slightly from T103's tensor order, so the values are distributional:
+
+| Quantity | Setting | Value |
+|---|---|---|
+| residual PR (d_eff) | L = 16 / 28 / 32 (hidden 160); 20 families each | mean 3.25 / 3.82 / 3.90 (range 2.48–4.86) |
+| null median_r, D20 statistic | 200 same-architecture, same-trend pairs, L = 16 | mean −0.009, SD 0.167, q05/q95 −0.28/+0.25, max 0.41 (1/200 > 0.40) |
+| same, without depth detrend | 50 pairs | mean 0.92 |
+| option (a): D20 + per-layer linear detrend on log-rank | 200 pairs, L = 16 | PR 3.97, SD 0.158, q95 0.28, max 0.53 (4/200 > 0.40): rejected |
+| option (a), quadratic in log-rank | 200 pairs, L = 16 | PR 3.75, SD 0.160, max 0.57 (3/200 > 0.40): rejected |
+| null, exit geometry (28 qwen2-style vs 32 llama-style, hidden 160, reldepth) | 200 pairs | median mean −0.015, SD 0.114, q95 0.16, max 0.32; z_shift SD 1.02, max 2.85 (0/200 > 3); offdiag \|median\| ≤ 0.035; top-1 mean 0.04, max 0.16; q10 mean −0.56 |
+| null, same architecture, L = 16 | 200 pairs | z_shift max 2.38 (0/200 > 3); top-1 max 0.25; first 50 pairs (`NULL_SEED_PAIRS`): q95 0.28, max 0.32 |
+| null, old rehearsal geometry (16 vs 20) | 200 pairs | SD 0.154, max 0.39, z_shift max 2.72 (0/200 > 3) |
+| related, ε = 0.02 / 0.05, L = 16 | 50 seeds each | median ≥ 0.9999 / ≥ 0.9992; q10 ≥ 0.9997 / ≥ 0.9978; offdiag −0.157…−0.029; top-1 = 1.0 in all; z_shift ≥ 3.29 |
+| related, ε = 0.05, L = 28 | 50 seeds | offdiag −0.10…−0.008; top-1 = 1.0; z_shift ≥ 5.03 |
+
+Option (a) was measured and rejected. Removing the log-rank mode does not raise d_eff, because the residual is
+low-dimensional in several directions (slope, sinusoid frequency, phase), not in one. The in-run nulls (option
+b) are adopted instead. The off-diagonal median of a related pair is slightly negative because the depth
+detrend makes each grid column sum to zero over layers. The fixture's fine-tunes are easy (r ≈ 1), so the
+fixture cannot validate X. X rests on the Weyl argument above, and a real-run C12 FAIL goes to the human.
 
 The product UI shows r on a continuous colour scale. These thresholds exist only in the
 exit check. P2 renders no verdict, because the calibrated verdict belongs to System 1 in P3.
@@ -158,17 +214,17 @@ exit check. P2 renders no verdict, because the calibrated verdict belongs to Sys
    "tokenizer" ticked.
 2. Record per target:
    - The gate panel appears before any weight byte, and the counter shows `weight 0 B`.
-   - The panel shows the planned bytes (exact and human-readable), the hard cap, `disk 0 B`,
-     peak memory, the reason and a per-file table.
+   - The panel shows the plan_id, the planned bytes (exact and human-readable), the hard cap,
+     `disk 0 B`, peak memory, the reason and a per-file table.
    - After Confirm, the weight counter rises to exactly the planned bytes.
    - Decline on a fourth scan of the Instruct repo ends in an error card with 0 weight bytes.
 3. In the Diff panel, pick reference Qwen2.5-7B.
 4. Click "Suggest" for subject Qwen2.5-7B-Instruct. The top suggestion must be
-   Qwen2.5-7B.
+   Qwen2.5-7B, and the three disclaimers are shown under the list.
 5. Diff Qwen2.5-7B vs the Instruct model:
    - two strips of 28 cells, with straight alignment lines
    - the subject cells in the high-r colour
-   - the median shown
+   - the median shown, with the in-run null line (q10, off-diagonal median, top-1, z_shift, PR)
 6. Diff Qwen2.5-7B vs Llama:
    - the header reads "incompatible (relative-depth pairing)"
    - the cells are in the low-r colour
@@ -202,8 +258,11 @@ The scan runs RESOLVE > HEADERS > META > SAMPLED_READ > COMPUTE > REPORT > PURGE
 - **COMPUTE** decodes each buffer, runs the SVD, and pops and releases the buffer
   immediately. It ends with a `purge` event noting `resident=0`.
 - **REPORT** writes the Cards.
-- **PURGE** follows REPORT and emits a second `purge` event (`resident=0 verified`) in the
-  live log only.
+- **PURGE** follows REPORT. It checks the live `SampleBuffers` object, which is deliberately kept
+  (empty) until then: if `resident_bytes != 0` or any name remains, it clears the buffers, rolls
+  back the Cards and raises `SigmaError`. Otherwise it emits `purge` with the note
+  `PURGE check: resident=0 names=0` in the live log. The note states what was checked; there is
+  no "verified" wording (validation r1, minor 2).
 
 Nothing weight-bearing exists after COMPUTE (invariant 1). FULL_DOWNLOAD is never entered
 in P2, because full downloads belong to P4. COMPARE is not a scan stage: a diff reads two
@@ -218,11 +277,17 @@ The gate protects weight reads. Four definitions:
 - **`memory_peak_bytes`** is `bytes_planned + 8 × max numel` (the float64 working copy).
 
 The flow:
-1. The plan is logged as a `gate` event.
+1. The **full plan text** (`format_plan`: plan_id, reason, bytes planned, hard cap, `disk: 0 B`,
+   memory peak, threshold, per-file table, skipped units) is logged as a `gate` event, and it is
+   passed to the interface's display (stderr for the CLI and the exit runner). This happens before
+   any decision, on every path. The server's live log and `plan` field carry the same plan, and the
+   UI renders it (validation r1 blocker, part a).
 2. If `bytes_cap <= gate_threshold_bytes` (default 64 MiB), the plan is auto-approved
    (`via "below-threshold"`, logged).
 3. Otherwise a `Confirmer` must return an approval with `plan_id == plan.plan_id` and
-   `bytes_confirmed >= bytes_cap`. Anything else is a decline.
+   `bytes_confirmed == bytes_cap` **exactly**. Anything else is a decline. A blanket number larger
+   than the cap declines, so the number can only come from a plan that was displayed (blocker,
+   part b).
 4. On approval, `ByteLog.grant(plan_id, ranges, cap)` opens the grant.
    `ByteLog.preflight` then allows a weight range only if all of these hold:
    - the stage is SAMPLED_READ
@@ -238,12 +303,15 @@ The flow:
 
 Confirmers by interface:
 
-| Interface | Confirmation |
-|---|---|
-| CLI flag | `--confirm-bytes N` (`via "cli-flag"`) |
-| CLI prompt | TTY only; the user types `yes` after the plan is printed (`via "cli-prompt"`) |
-| UI | `POST /api/scans/{id}/confirm` with `plan_id` and `bytes_confirmed` (`via "api-confirm"`) |
-| UI decline | `POST .../decline`, or a 900 s timeout (`via "api-decline"` / `"timeout"`) |
+| Interface | Display | Confirmation |
+|---|---|---|
+| CLI | `format_plan` on stderr before the decision | `--confirm-plan PLAN_ID --confirm-bytes CAP`, both exact (`via "cli-flag"`). Without them the scan prints the plan, declines and prints the two values to rerun with. There is no interactive prompt. |
+| UI / API | gate panel from `GET /api/scans/{id}` `plan`; plan text in the live log | `POST /api/scans/{id}/confirm` with `plan_id` and `bytes_confirmed == bytes_cap` (`via "api-confirm"`) |
+| UI decline | as above | `POST .../decline`, or a 900 s timeout (`via "api-decline"` / `"timeout"`) |
+| Exit runner | `format_plan_dict` on stderr for every plan | `--confirm-plans ID:CAP,...`: a plan is confirmed only if its exact pair is listed (blocker, part c) |
+
+The TTY prompt of round 0 was cut: it was a third confirmation path that had to stay consistent
+with the other two (validation r1, minor 8).
 
 Every decision is stored in `fetch_log.gate` of the Card(s) when a Card is written. It is
 always in the live log.
@@ -254,7 +322,10 @@ The sample covers the largest stack (`structure.stacks[0]`, depth ≥ 8) of each
 - **Roles.** Roles are taken in the order `attn.v`, then `attn.k`. A role matches rel name
   `self_attn.v_proj.weight` or `attn.v_proj.weight` or `attention.v_proj.weight`, and
   likewise for k. The rel name must exist in every block, be 2-D, have dtype BF16/F16/F32
-  and have `min(shape) >= 16`.
+  and have `min(shape) >= 16`. When a role is not found, the skip note names the architecture
+  reason if it can be seen in the rel names: `MLA attention` (`kv_a_proj_with_mqa` / `kv_b_proj`,
+  DeepSeek-style) or `fused QKV` (`qkv_proj`, `query_key_value`, `c_attn`). Both are listed in
+  later.md.
 - **Per-layer cap.** A role is included only while the per-layer total stays `<=
   MAX_SAMPLE_BYTES_PER_LAYER = 16 MiB`.
 - **Reads.** Each tensor is read **whole**, with one Range request
@@ -293,6 +364,12 @@ Comparing two Cards on their sampled stack (T109):
    zero-variance vector gives r = 0.
 6. **Per-layer r.** Per-layer r is `R[i, a(i)]` under the displayed alignment `a` (§3.5).
    `median_r` is the median over subject layers with an r.
+7. **In-run null (D32, T109 `in_run_null`).** On the same R and the same displayed alignment:
+   `q10_r` (10th percentile of the per-layer r), `offdiag_median_r` (median of `R[i, j]`,
+   `j != a(i)`), `diag_top1_frac` (share of i with `argmax_j R[i, j] == a(i)`), the cyclic-shift
+   null (`m_k = median_i R[i, a((i+k) mod n)]` for k = 1..n−1; mean, SD with ddof 1, max) and
+   `z_shift = (median_r − mean)/SD`, plus the participation ratio of each side's residual layer
+   vectors. None of these is a verdict; only the exit check applies thresholds to them.
 
 No raw cosine is computed anywhere in P2 (invariant 4).
 
@@ -371,8 +448,10 @@ Merges are excluded, because for byte-level BPE they are implied by the vocabula
 - The pool is every Card under the out dir except the subject.
 - The result is the top 5, with ties broken by repo, then sha.
 - The model card's claimed `base_model` never changes the score. It is shown as
-  `claimed_base_match`. Claimed repos that are not in the pool are listed as
-  `unscanned_claims`.
+  `claimed_base_match`. (`unscanned_claims` was cut in r1, minor 8.)
+- The result carries `disclaimers == DISCLAIMERS`, and every interface renders all three next to
+  the ranking (invariant 5; validation r1, minor 6). The result is
+  `{subject: card_key, suggestions: [...], disclaimers: [str, str, str]}`.
 
 ## 4. Data structures (exact field names)
 
@@ -380,7 +459,7 @@ Merges are excluded, because for byte-level BPE they are implied by the vocabula
 New `event` values:
 - `gate`: 0 bytes. The note is the plan summary or the decision.
 - `purge`: 0 bytes. The note is `released <n> weight bytes; resident=0` in COMPUTE, and
-  `resident=0 verified` in PURGE.
+  `PURGE check: resident=0 names=0` in PURGE.
 
 `ByteLog.note()` accepts `error`, `refused`, `card_written`, `gate` and `purge`.
 
@@ -404,8 +483,8 @@ TokenizerMinHash = {version: "minhash.v1", source_file: str, source_bytes: int, 
   tokenizer_type: "BPE"|"Unigram"|"WordPiece"|"WordLevel"|"vocab.json", n_vocab: int, n_added: int,
   n_elements: int, num_perm: 256, element_scheme: "v:<token>|a:<added content>",
   hash: "blake2b-32;(a*x+b) mod 2^61-1", signature: [str]}   # 256 lowercase 16-hex strings
-GateDecision = {plan_id: str, approved: bool, via: "below-threshold"|"cli-flag"|"cli-prompt"|
-  "api-confirm"|"api-decline"|"timeout"|"no-confirmer", bytes_planned: int, bytes_cap: int,
+GateDecision = {plan_id: str, approved: bool, via: "below-threshold"|"cli-flag"|
+  "api-confirm"|"api-decline"|"timeout"|"no-confirmer"|"error", bytes_planned: int, bytes_cap: int,
   bytes_confirmed: int|null, threshold_bytes: int, disk_bytes: 0, memory_peak_bytes: int,
   n_reads: int, reason: str, decided_at: str (ISO-8601 Z)}
 ```
@@ -450,7 +529,13 @@ The columns are unchanged from P1 §4.3.
                           struct_cost: float, r: float|null}]}],
  unpaired_stacks: {reference: [str], subject: [str]},
  weight: {available: bool, reason: str|null, roles: [str], pair_index: int|null,
-          median_r: float|null, n_layers: int, n_with_r: int},
+          n_layers: int, n_with_r: int,
+          median_r: float|null, q10_r: float|null,                  # over the displayed alignment a
+          offdiag_median_r: float|null,                             # median of R[i, j], j != a(i)
+          diag_top1_frac: float|null,                               # share of i with argmax_j R[i, j] == a(i)
+          shift_null: {n: int, mean: float, sd: float, max: float}|null,   # medians over i -> a((i+k) mod n), k = 1..n-1
+          z_shift: float|null,                                      # (median_r - shift_null.mean) / shift_null.sd
+          participation_ratio: {reference: float, subject: float}|null},   # d_eff of the residual layer vectors
  tokenizer: {available: bool, reason: str|null, jaccard: float|null},
  disclaimers: [str, str, str]}                       # == scout.view.DISCLAIMERS
 ```
@@ -471,17 +556,17 @@ ALIGN_PARAMS = {"version": "align.v1", "lambda_jump": 2.0, "end_cost": 2.0,
 
 ### 4.7 API and CLI surface added
 - **CLI flags:**
-  - `scout scan TARGET [--sample] [--tokenizer] [--confirm-bytes N] [--gate-threshold-bytes N]`
+  - `scout scan TARGET [--sample] [--tokenizer] [--confirm-plan PLAN_ID --confirm-bytes N] [--gate-threshold-bytes N]`
   - `scout diff REF_CARD SUBJ_CARD [--json]`
   - `scout suggest CARD [--out DIR] [--top 5] [--json]`
 - **HTTP routes** (T113):
   - `POST /api/scans` now also accepts `{"sample": bool, "tokenizer": bool}`.
   - `GET /api/scans/{id}` adds `plan` and `gate`, and `status` may be `awaiting_confirmation`.
-  - `POST /api/scans/{id}/confirm` takes `{plan_id, bytes_confirmed}`.
+  - `POST /api/scans/{id}/confirm` takes `{plan_id, bytes_confirmed}`; 409 unless `bytes_confirmed == bytes_cap`.
   - `POST /api/scans/{id}/decline`.
   - `GET /api/cards`.
   - `POST /api/diff` takes `{reference: card_key, subject: card_key}`.
-  - `GET /api/suggest?repo=&revision_sha=&component=`.
+  - `GET /api/suggest?repo=&revision_sha=&component=` (the result includes `disclaimers`).
   - `GET /diff.js`.
 
 ## 5. Assumptions and open decisions (each with a recommended default)
@@ -497,24 +582,26 @@ Assumptions:
 
 | # | Decision | Default (recommended) | Rationale |
 |---|---|---|---|
-| D14 | Candidate pool for suggestion | Cards under the out dir (glob `*/*/*.card.json`, JSON only) plus `unscanned_claims` from the subject's `base_model` claims. No Hub search. | "Picked manually, tool suggests candidates". A local glob is not a Card store: no content addressing, no cache and no rescan skipping, all of which are P4. |
+| D14 | Candidate pool for suggestion | Cards under the out dir (glob `*/*/*.card.json`, JSON only). No Hub search. The result carries the 3 disclaimers. | "Picked manually, tool suggests candidates". A local glob is not a Card store: no content addressing, no cache and no rescan skipping, all of which are P4. |
 | D15 | Tokenizer MinHash scheme | As §3.6: whole-token shingles, 256 permutations, blake2b-32 + Mersenne-61 universal hash, fixed coefficients derived by blake2b (no RNG, so stable across numpy versions) | SE ≤ 0.031. It is deterministic and portable. |
 | D16 | Tokenizer fetch | Opt-in (`--tokenizer` / `"tokenizer": true`). One file of about 7–9 MB, class meta. | This keeps the P1 10 s exit path byte-identical. |
 | D17 | Config score and ranking | 13 keys: `model_type, hidden_size, num_hidden_layers, intermediate_size, num_attention_heads, num_key_value_heads, head_dim, vocab_size, rope_theta, tie_word_embeddings, max_position_embeddings, hidden_act, rms_norm_eps`. Score `0.5·J + 0.5·config`. Claims never score. | A lying `base_model` cannot steer the ranking. Invariant 5 requires stating that tokenizer reuse alone is not proof, so the UI shows both components separately. |
 | D18 | What is sampled | Whole `v_proj` and `k_proj` of every block of the largest stack. One Range read per tensor. | Their σ are exactly permutation- and rotation-invariant, and they are the smallest 2-D matrices per block, 7–16 MiB per layer for 7–8B models. |
-| D19 | Byte budget | 16 MiB per layer; slack 16 MiB per plan; gate threshold 64 MiB (`--gate-threshold-bytes`) | Llama-3.1-8B fits both roles exactly at 16 MiB. 70B models keep `v_proj` only. |
-| D20 | Statistic | As §3.4: top half of the spectrum, 128-point log grid, per-layer centring, cubic depth detrend, Pearson, L ≥ 8 | See the §2.3 justification. Without the detrend and the centring, every trained spectrum correlates at ≈ 0.9 with every other, because all are monotone and heavy-tailed. |
+| D19 | Byte budget | 16 MiB per layer; slack 16 MiB per plan; gate threshold 64 MiB (`--gate-threshold-bytes`). On a slack overrun, E3 is rerun whole with the same `--confirm-plans` line. | Llama-3.1-8B fits both roles exactly at 16 MiB. 70B models keep `v_proj` only. Scaling the slack with the largest read is deferred (§11). |
+| D20 | Statistic | As §3.4: top half of the spectrum, 128-point log grid, per-layer centring, cubic depth detrend, Pearson, L ≥ 8. **Unchanged in r1.** An extra per-layer log-rank detrend was measured and rejected (§2.3 table). | See the §2.3 justification. Without the detrend, the fixture's null median is 0.92 (measured). |
 | D21 | Raw cosine | Not computed in P2 | Invariant 4. Nothing needs triage yet. |
 | D22 | Alignment algorithm | Viterbi over reference positions (§3.5), λ = 2, end cost 2; relative-depth mapping for incompatible pairs | The segment-copy model covers SOLAR-style duplication (backward jump) and layer pruning (forward jump or end cost). A jump must be justified by ≥ 2 fully mismatched layers of evidence. An incompatible pair is never weight-optimised, so r cannot be inflated by the choice of alignment. |
-| D23 | Gate confirmation | `bytes_confirmed >= bytes_cap`. On decline: `GateDeclined` (exit 6), no Card. The CLI prompt appears only on a TTY; non-TTY without `--confirm-bytes` declines and prints the flag to use. The server waits 900 s, then treats it as a decline. | `--sample` means "I want weight evidence". A header-only Card is what plain `scout scan` gives. |
-| D24 | Where weights live | In RAM only, in `SampleBuffers`. Each buffer is popped right after its SVD. A `purge` event with `resident=0` is written at the end of COMPUTE, and a verification event in PURGE. Disk is 0. | Invariant 1. Peak RAM ≈ bytes_planned (544 MiB for Llama), which is acceptable for a self-use tool. Streaming per-tensor compute is listed in later.md. |
+| D23 | Gate confirmation | The plan is always displayed and logged before the decision. Approval needs `plan_id` equal and `bytes_confirmed == bytes_cap` exactly (CLI `--confirm-plan` + `--confirm-bytes`; API confirm; runner `--confirm-plans ID:CAP,...`). There is no interactive prompt. On decline: `GateDeclined` (exit 6), no Card, and the CLI prints the two values to rerun with. The server waits 900 s, then treats it as a decline. | Invariant 2: "confirmation with bytes, disk and reason shown". A number can approve only the plan it was copied from. |
+| D24 | Where weights live | In RAM only, in `SampleBuffers`. Each buffer is popped right after its SVD. A `purge` event with `resident=0` is written at the end of COMPUTE. PURGE re-checks the live (empty) buffers object and fails the scan if anything is resident. Disk is 0. | Invariant 1. Peak RAM ≈ bytes_planned (544 MiB for Llama), which is acceptable for a self-use tool. Streaming per-tensor compute is listed in later.md. |
 | D25 | Diff persistence | Not persisted. DiffView is a pure function of two Cards, so the per-layer r values live nowhere but are reproducible from `stat_sigma_curve`. | Invariant 1: the Card is the only persisted artifact. |
 | D26 | Card version | `card.v1` (§4.2). v0 stays loadable. | New fields `scan.options`, `scan.notes` and `fetch_log.gate`, plus the filled slots. |
 | D27 | Frontend (D1 revisit) | Stay no-build vanilla. Add `scout/web/diff.js`. | The diff is two SVG strips plus lines and tables, so no framework is needed. |
-| D28 | Exit thresholds | X = 0.80 (related median ≥), Y = 0.40 (unrelated median ≤), margin 0.40 | §2.3 |
+| D28 | Exit thresholds | X = 0.80 (related median ≥), related q10 ≥ 0.50, Y = 0.40 (unrelated median ≤), unrelated z_shift ≤ 3.0, margin 0.40, related gap to off-diagonal ≥ 0.40, related top-1 ≥ 0.80. Frozen in T115 before any real run. | §2.3; the fixture measurements are recorded there, and none of the values was fitted to the targets |
 | D29 | P2 pins | `exit/pins_p2.json`; `pin_exit.py --phase 2`; HF_TOKEN passed to git via `GIT_CONFIG_COUNT/KEY_0/VALUE_0 = http.extraHeader` | The token never appears in argv. The P1 pins file is untouched. |
 | D30 | Stacks sampled | One per unit (`stacks[0]`) | This keeps bytes minimal. A text encoder's vision tower is not sampled (noted in `scan.notes`). |
 | D31 | `GET /api/cards` | Lists Card keys found in the out dir, for the manual reference picker | This is the minimum needed for "picked manually". |
+| D32 | In-run null (new in r1) | For the weight pair, DiffView reports `offdiag_median_r`, `diag_top1_frac`, a cyclic-shift null of the median (`shift_null`, `z_shift`) and the residual participation ratios. They are computed from the R already built (0 bytes), and they are deterministic (no RNG, no bootstrap). | Validation r1 majors 1 and 2. The shift null measures the run's own d_eff, and the off-diagonal gap separates lineage from shared architecture. A bootstrap SD was the validator's alternative; the shift null was chosen because it needs no RNG and reuses the median statistic exactly. |
+| D33 | Frozen fixture seeds (new in r1) | `NULL_SEED_PAIRS` (50 pairs), `FINETUNE_EPS/SEED`, `REHEARSAL_BASE/OTHER` are constants in `weights_fixtures` (T103), asserted literally by a test, and imported by T109/T111/T116. The rehearsal uses the exit depths (28 vs 32). | Changing seeds to pass a test would be hand-tuning. Exit depths shrink the null SD from 0.167 to 0.114 (measured). |
 
 ## 6. Architecture (files)
 
@@ -553,16 +640,20 @@ scripts/exit_check_p2.py, scripts/pin_exit.py (P1, extended), exit/pins_p2.json 
 | Decline / timeout | `GateDeclined`, 0 weight bytes, no Card | T106, T108, T112, T113 |
 | Upscaled (SOLAR-like) / pruned | Alignment with and without weights | T110, T111 |
 | Unsupported dtype (F8) / shallow stack | Role or stack skipped with a note; weight evidence unavailable | T106, T109 |
+| MLA attention (DeepSeek `kv_a_proj_with_mqa`/`kv_b_proj`), fused QKV | Role skipped; the note names the architecture reason; weight evidence unavailable (later.md) | T106 `test_skip_hint` |
 
 ## 8. Risks and how each is tested
 
 | Risk | Mitigation / test |
 |---|---|
 | A weight byte is read without confirmation | The gate sits in ByteLog preflight and is independent of callers (T101 tests: no grant, wrong stage, mixed range, outside grant, over the cap, after revoke). T108 asserts `fakehub.cdn_reads` has no weight range when declined. Exit C1 and C5 check the wire independently. |
+| A plan is approved that nobody saw (validation r1 blocker) | run_gate logs and displays `format_plan` before the confirmer runs (T106 `test_plan_shown_first`). Approval needs the exact cap and plan_id: a blanket larger number, a wrong cap or a wrong plan_id declines (T106 `test_run_gate_flag`, T112 `test_confirm_blanket_number`, T113 `test_gate_confirm_rejects`). The CLI and runner show the plan on stderr before any weight read (T112 `test_plan_printed_before_read`, T116 `test_rehearsal_plan_displayed_first`). A plan missing from `--confirm-plans` is declined (T116 `test_rehearsal_missing_plan`, `test_rehearsal_wrong_cap`). C8 checks that the approved pair was listed. |
 | Retries exceed the confirmed bytes | `recheck` before each retry (T101 `test_recheck_cap`); exit C4 |
 | Unlogged weight bytes | All weight reads go through `Source.read_range`. Exit C6 compares the wire total with the ByteLog. T116 rehearsal includes a CountingTransport. |
 | Weights persisted or kept | `SampleBuffers.resident_bytes == 0` after COMPUTE, and the purge event precedes REPORT (T108). `test_no_extra_files` extends to sampled scans (HOME/TMPDIR empty, out dir holds only Cards). Exit C9. |
-| The statistic correlates everything, like a raw σ-curve would | T109 synthetic tests: independent families with a **shared** linear+U-shaped depth trend give median r ≤ 0.40 for every seed pair; without the depth detrend (`residuals(degree=None)` test hook) the mean median is ≥ 0.60, which proves the detrend matters. Exit C14. |
+| The statistic correlates everything, like a raw σ-curve would | T109 synthetic tests over the 50 frozen `NULL_SEED_PAIRS` (same architecture and a **shared** depth trend): 95th percentile of median r ≤ 0.40 (measured 0.28), z_shift ≤ 3 for ≥ 49/50 (measured max 1.89), top-1 ≤ 0.40 (measured max 0.19). Without the depth detrend (`residuals(degree=None)`) the mean median is ≥ 0.60 (measured 0.92). Exit C14 (absolute and in-run). |
+| Shared architecture passes as lineage (validation r1 major 1) | C18 in the exit: related gap to the off-diagonal median ≥ 0.40 and top-1 ≥ 0.80, computed in-run at 0 bytes. T109 `test_in_run_null_math` shows that uniformly inflated R fails the gap. The true hard negative (same architecture, independent real training) remains a P3 labelled-set item (later.md). |
+| The null is wider than assumed (validation r1 major 2) | d_eff is measured (participation ratio in every DiffView and the evidence line). The shift null adapts to the run. The derivation in §2.3 uses the measured PR (3.3–3.9 on fixtures, not ≥ 5). |
 | The statistic misses real fine-tunes (RL-heavy Instruct moves weights more) | Top-half grid (Weyl), synthetic fine-tunes at ε = 0.02 / 0.05 give ≥ 0.95 / ≥ 0.80, and permuted and rotated copies give r = 1 ± 1e-9 (T109). A real-run FAIL of C12 goes to the human; no retuning (C10). |
 | Hand-tuning after the first real run | C10 frozen params; the evidence line records git commit + dirty flag; §2.1 rule |
 | Alignment inflates r for unrelated models | Incompatible pairs use the fixed reldepth mapping (D22). T110 `test_no_jump_on_noise`: random R with no structure → identity or reldepth path with 0 jumps for nA == nB. |
@@ -578,11 +669,11 @@ scripts/exit_check_p2.py, scripts/pin_exit.py (P1, extended), exit/pins_p2.json 
 | P1 contract | Change | Task |
 |---|---|---|
 | `pyproject.toml` (T001) | add `numpy>=1.26` to dependencies | T101 |
-| `scout/errors.py` (T002) | add `GateDeclined(ScoutError)` exit_code 6, attr `plan: dict | None`; add `SigmaError(ScoutError)` | T101 |
-| `ByteLog` (T002) | new `grant`, `revoke_grant`, `grant_active`, `recheck`, `add_gate_decision`, `gate_decisions`; weight preflight allowed only under a grant in SAMPLED_READ; weight reservations tracked separately from the non-weight threshold; `note()` accepts `gate`, `purge`; `to_card_dict()` adds `"gate"`; `stage()` revokes an active grant when leaving SAMPLED_READ. **Without a grant, behaviour is byte-identical to P1.** | T101 |
+| `scout/errors.py` (T002) | add `GateDeclined(ScoutError)` exit_code 6, attr `plan: dict | None`; add `SigmaError(ScoutError)`; `WeightReadRefused` gains optional keyword `reason` (message text unchanged) | T101 |
+| `ByteLog` (T002) | new `grant`, `revoke_grant`, `grant_active`, `recheck`, `add_gate_decision`, `gate_decisions`; weight preflight allowed only under a grant in SAMPLED_READ; weight reservations tracked separately from the non-weight threshold; `note()` accepts `gate`, `purge`; `to_card_dict()` adds `"gate"`; `stage()` revokes an active grant when leaving SAMPLED_READ. **Without a grant, behaviour and refusal text are byte-identical to P1; the P1 test files are not edited.** | T101 |
 | `HubSource._get` (T005) | calls `log.recheck(reservation)` before every attempt ≥ 2 | T101 |
 | Card v0 → v1 (T009, plan P1 §4.2) | `SCHEMA_VERSION = "card.v1"`; `build_card` gains kwargs `options`, `notes`, `sigma_curves`, `sigma_by_tensor`, `tokenizer_minhash`; `load_card` accepts v0 and v1; Parquet metadata `card.v1`; the P1 tests asserting `card.v0` are updated | T102 |
-| `scan()` / `ScanResult` (T010) | kwargs `tokenizer=False, sample=False, confirmer=None, gate_threshold_bytes=DEFAULT_GATE_THRESHOLD_BYTES`; `ScanResult.gate: list[dict]`; new stages SAMPLED_READ, COMPUTE, PURGE when sampling | T108 |
+| `scan()` / `ScanResult` (T010) | kwargs `tokenizer=False, sample=False, confirmer=None, gate_threshold_bytes=DEFAULT_GATE_THRESHOLD_BYTES, gate_display=None`; `ScanResult.gate: list[dict]`; new stages SAMPLED_READ, COMPUTE, PURGE when sampling | T108 |
 | CLI (T012) | new flags and subcommands (§4.7); exit code 6 | T112 |
 | Server (T013) | new routes and status (§4.7); `ScanState.plan`, `ScanState.gate`; `/diff.js` static | T113 |
 | Frontend (T014) | options checkboxes, gate panel, diff panel (new `diff.js`) | T114 |
@@ -597,23 +688,23 @@ scripts/exit_check_p2.py, scripts/pin_exit.py (P1, extended), exit/pins_p2.json 
 | T102 | Card v1 schema (options, notes, gate log, filled slots), v0 compatibility | opus | T009, T101 |
 | T103 | Real-valued safetensors fixtures, synthetic model families, tokenizer fixtures | sonnet | T001, T101 |
 | T104 | Tokenizer file resolution, parsing, MinHash, Jaccard | opus | T103 |
-| T105 | Config match + reference suggestion over the out-dir pool | opus | T102, T104 |
-| T106 | Sample plan + download gate + confirmers | opus | T008, T101, T107 |
+| T105 | Config match + reference suggestion over the out-dir pool (with disclaimers) | opus | T011, T102, T104 |
+| T106 | Sample plan + download gate (plan always displayed, exact-cap confirmation) | opus | T008, T101, T107 |
 | T107 | Sigma compute: dtype decode, SVD, SIGMA_PARAMS | opus | T101, T103 |
 | T108 | Scan integration: tokenizer, SAMPLED_READ/COMPUTE/PURGE, Card stats fill | opus | T010, T102, T104, T106, T107 |
-| T109 | Per-layer statistic: log grid, centring, cubic depth detrend, Pearson matrix | opus | T107 |
-| T110 | Structural cost, stack pairing, Viterbi segment alignment, reldepth | opus | T101, T009 |
+| T109 | Per-layer statistic: log grid, centring, cubic depth detrend, Pearson matrix, in-run nulls | opus | T102, T103, T107 |
+| T110 | Structural cost, stack pairing, Viterbi segment alignment, reldepth | opus | T009, T101, T102 |
 | T111 | Diff builder (DiffView) | opus | T011, T105, T108, T109, T110 |
-| T112 | CLI: scan gate flags, prompt confirmer, `diff`, `suggest` | opus | T012, T108, T111 |
+| T112 | CLI: scan gate flags (`--confirm-plan` + `--confirm-bytes`, plan printed first), `diff`, `suggest` | opus | T012, T108, T111 |
 | T113 | Server: gate wait/confirm/decline, cards/diff/suggest routes | opus | T013, T108, T111 |
 | T114 | Frontend: options, gate panel, diff view (strips + alignment + r colours) | opus | T014, T113 |
-| T115 | P2 exit expectations (C1–C17 pure checks, frozen params, thresholds) | opus | T111 |
-| T116 | P2 exit runner, pins_p2, `pin_exit --phase 2`, offline rehearsal | opus | T015, T112, T113, T115 |
+| T115 | P2 exit expectations (C1–C18 pure checks, frozen params, thresholds) | opus | T111 |
+| T116 | P2 exit runner (`--confirm-plans`), pins_p2, `pin_exit --phase 2`, offline rehearsal | opus | T015, T112, T113, T115 |
 
 Parallel waves (no shared files within a wave):
 1. {T101}
-2. {T102, T103, T110}
-3. {T104, T107}
+2. {T102, T103}
+3. {T104, T107, T110}
 4. {T105, T106, T109}
 5. T108
 6. T111
@@ -624,7 +715,31 @@ Most tasks are opus because they touch download gating, Card schema, similarity 
 exit evidence (routing rule). T103 is the only sonnet task, since it is fully specified test
 scaffolding.
 
-## 11. Out of scope for Phase 2
+## 11. Validation responses — round 1
+
+Validator round 1 (`validation.md`, 2026-09-28): verdict REVISE, with 1 blocker, 3 majors and 8 minors.
+The environment limits (no Hub access in this container, gated Llama) were not findings. They stay
+documented in §2.5.
+
+| # | Severity | Finding (short) | Response | Where |
+|---|---|---|---|---|
+| B1 | blocker | `--confirm-bytes N` approves plans nobody saw; runner confirms by running sum | **Fixed.** (a) `run_gate` logs and displays `format_plan` before any decision, on every path. (b) Approval requires `plan_id` equal and `bytes_confirmed == bytes_cap` exactly, everywhere (CLI flag pair, API confirm, runner). (c) E2 prints `CONFIRM WITH: --confirm-plans ID:CAP,...`. E3 confirms a plan only if its exact pair is listed, and C8 asserts that. The TTY prompt was removed. Tests: blanket number declines, wrong cap or plan_id declines, a plan missing from the list declines, and the plan is on stderr before any weight read. | §2.2, §2.3 C8, §3.2, D23; T106, T108, T112, T113, T114, T115, T116 |
+| M1 | major | Exit cannot tell lineage from shared architecture | **Fixed.** The off-diagonal null was moved from later.md into P2. DiffView.weight gains `offdiag_median_r` and `diag_top1_frac` (plus `q10_r`, `shift_null`, `z_shift`, `participation_ratio`). New exit **C18**, frozen: related `median_r − offdiag_median_r ≥ 0.40` and `diag_top1_frac ≥ 0.80`. Both values are in the EXIT evidence line. The true same-architecture hard negative stays a P3 item. | §2.3, §4.5, D32; T109, T111, T114, T115, T116; later.md |
+| M2 | major | d_eff ≥ 5 is wrong; the null test sits on the edge; seeds could be hand-tuned | **Fixed.** Re-measured in numpy (§2.3 table). PR is 3.25 (L = 16) to 3.90 (L = 32). The null median SD is 0.167 (L = 16) and 0.114 (exit geometry), with max 0.41 in 200 pairs at L = 16. Option (a), a log-rank detrend, was measured and rejected (PR 3.97, max 0.53). Option (b) was adopted: C14 adds `z_shift ≤ 3.0` against the in-run cyclic-shift null (measured 0/600 null pairs above 3; max 2.85). The derivation is rewritten with the measured PR, and PR is reported in DiffView and the evidence line. The seeds are frozen as literals (D33). T109 uses 50 frozen pairs and a 95th percentile ≤ 0.40 (measured 0.28). The rehearsal moves to the exit depths 28 vs 32. Y = 0.40 is unchanged: the measurement did not require changing it, and nothing was fitted to the targets. | §2.1, §2.3, D20, D28, D33; T103, T109, T111, T115, T116 |
+| M3 | major | T109 acceptance needs a T108 scan but runs a wave earlier | **Fixed.** `test_sigma_set_from_card` uses a hand-built minimal Card dict and a pyarrow table. The scan-based variant moved to T111 (`test_sigma_set_from_scan`). T109.depends_on += T102, T103. | T109, T111, §10 |
+| m1 | minor | T101 edits P1 test files not in `files` | **Fixed.** Without a grant, the refusal text stays exactly P1's. The reason goes in a new `WeightReadRefused.reason` attribute. The P1 test files are untouched. | T101, §9 |
+| m2 | minor | PURGE "resident=0 verified" checks nothing | **Fixed.** PURGE checks the live `SampleBuffers` (bytes and names) and fails with rollback if anything is resident. The note is `PURGE check: resident=0 names=0`; C9 checks it. | §3.1, §4.1, D24; T108, T115 |
+| m3 | minor | C12 only checks the median | **Fixed.** C12 adds `q10_r ≥ 0.50`, frozen and justified as `ε ≤ s` (§2.3). | §2.3; T111, T115 |
+| m4 | minor | 16 MiB retry slack can fail E3 under network faults | **Accepted and documented.** E3 is rerun whole with the same `--confirm-plans` line; that is a fresh human invocation. Slack scaling is deferred (below). | §2.2, D19 |
+| m5 | minor | MLA and fused QKV silently fall out | **Fixed.** The skip note names `MLA attention` or `fused QKV`, and a T106 test covers it. MLA was added to later.md. | §3.3, §7; T106; later.md |
+| m6 | minor | Suggestion list carries 1 or 0 disclaimers | **Fixed.** `suggest()` returns `disclaimers`; the CLI, API and UI render all three; C17 checks them. | §3.6, §4.7; T105, T112, T113, T114, T115 |
+| m7 | minor | T110 test depends on T102's in-flight card.py | **Fixed.** T110.depends_on += T102, and T110 moved to wave 3. | T110, §10 |
+| m8 | minor | Simplicity: TTY prompt, `unscanned_claims`, kind `rearranged` | **Fixed in part.** The TTY prompt and `unscanned_claims` were cut. `rearranged` is kept: it is the label for the remaining case `nB == nA` and non-identity, and it has no dedicated test or code path beyond that label. | §3.2, §3.6; T105, T106, T112 |
+
+**Deferred minors**
+- m4: scale `RETRY_SLACK_BYTES` with the plan (for example `max(16 MiB, 4 × largest read)`). Deferred to P4 together with streaming COMPUTE, which changes the read loop anyway. P2 accepts rerunning E3 whole (D19).
+
+## 12. Out of scope for Phase 2
 - CKA, spectral top-k, norm/std tools, JEV, System 2, the labelled set, the base library,
   and verdict wording (P3)
 - full downloads, the FULL_DOWNLOAD stage, the Card store, GGUF/quantized inputs and

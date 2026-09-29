@@ -20,21 +20,25 @@ interface: |
   diff.js: plain ES2020 IIFE, no imports, no external URLs; GET /api/cards, GET /api/suggest, POST /api/diff.
 behavior: |
   1. Gate panel (app.js): when a poll returns status "awaiting_confirmation" with a plan, show #gate with:
-     - the repo@sha12 and the reason
+     - the repo@sha12, the plan_id and the reason
      - bytes planned (exact, with thousands separators, plus MiB with 1 decimal), the hard cap incl. retries, "disk 0 B",
        memory peak, the threshold and the read count
      - a per-file table
      - the skipped units
-     The confirm button's label includes the exact bytes_cap. On click it POSTs {plan_id, bytes_confirmed: plan.bytes_cap};
+     The confirm button's label includes the exact bytes_cap. On click it POSTs {plan_id, bytes_confirmed: plan.bytes_cap}
+     (the server accepts only the exact cap of the displayed plan);
      decline POSTs /decline. The panel hides once the status leaves awaiting_confirmation. The weight counter keeps its
      P1 behaviour: it stays "weight 0 B" green until confirmation, then shows the bytes read. When the value is > 0 it
      uses a neutral (not red) class "weight-gated" if gate[0].approved is true, and red "nonzero" otherwise.
   2. Diff panel (diff.js): on load and after every scan reaches done, refresh GET /api/cards into both selects (label =
      title + badges "σ" if has_sigma, "tok" if has_tokenizer). "Suggest" -> GET /api/suggest for the subject; render up to
-     5 rows (title, score, tokenizer J, config score, "claimed base" badge); clicking a row sets #diff-ref. "Diff" -> POST
+     5 rows (title, score, tokenizer J, config score, "claimed base" badge) followed by the result's 3 disclaimers
+     (invariant 5); clicking a row sets #diff-ref. "Diff" -> POST
      /api/diff and render into #diff-out:
      a. the header: the reference and subject titles; per stack pair the kind, mode, and "location unresolved" in amber when
-        location_resolved is false; the median r and n_with_r/n_layers; the tokenizer J; config mismatches
+        location_resolved is false; the median r and n_with_r/n_layers; an "in-run null" line with q10_r, offdiag_median_r,
+        diag_top1_frac, z_shift (vs cyclic-shift null) and the participation ratios (numbers only, no pass/fail wording);
+        the tokenizer J; config mismatches
      b. an SVG with the reference strip on top (reference_depth cells) and the subject strip below (subject_depth cells), and
         one line per subject layer from its cell to the reference cell reference_index; jump lines dashed; reldepth lines
         dotted and grey
@@ -47,7 +51,7 @@ behavior: |
      horizontal scroll (the SVG scrolls inside its container).
 acceptance:
   tests:
-    - "tests/test_web_static_p2.py: index.html contains every new id and a script tag for /diff.js; app.js contains '/confirm', '/decline', 'awaiting_confirmation', 'bytes_cap'; diff.js contains '/api/diff', '/api/suggest', '/api/cards', 'disclaimers', 'median_r'; no file contains 'innerHTML'; there are no 'http://'/'https://' except the SVG namespace"
+    - "tests/test_web_static_p2.py: index.html contains every new id and a script tag for /diff.js; app.js contains '/confirm', '/decline', 'awaiting_confirmation', 'bytes_cap'; diff.js contains '/api/diff', '/api/suggest', '/api/cards', 'disclaimers', 'median_r', 'offdiag_median_r', 'diag_top1_frac', 'z_shift'; no file contains 'innerHTML'; there are no 'http://'/'https://' except the SVG namespace"
     - "served through make_server: GET /diff.js -> 200 application/javascript"
     - "P1 tests/test_web_static.py passes unchanged"
   commands:

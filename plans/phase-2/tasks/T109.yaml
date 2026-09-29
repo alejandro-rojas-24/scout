@@ -1,6 +1,6 @@
 id: T109
-title: Per-layer sigma-curve statistic - top-half log grid, per-layer centring, cubic depth detrend, Pearson matrix (from Cards)
-depends_on: [T107]
+title: Per-layer sigma-curve statistic - top-half log grid, per-layer centring, cubic depth detrend, Pearson matrix, in-run nulls (off-diagonal, cyclic shift, participation ratio)
+depends_on: [T102, T103, T107]
 files:
   - scout/layercorr.py
   - tests/test_layercorr.py
@@ -21,8 +21,22 @@ interface: |
         stack_prefix: str; indices: list[int]; curves: dict[str, dict[int, list[float]]]   # role -> block index -> sigma
 
     def sigma_set(card: dict, table: pyarrow.Table) -> SigmaSet | None          # None if the card has no sigma_curves
-    def compare(ref: SigmaSet, subj: SigmaSet) -> tuple[numpy.ndarray | None, list[str], str | None]
-        # (R of shape (n_subj, n_ref) or None, roles used, reason if None)
+    def participation_ratio(V: numpy.ndarray) -> float                                     # V: (L, d) layer vectors
+
+    @dataclass(frozen=True)
+    class Comparison:
+        R: numpy.ndarray | None          # (n_subj, n_ref)
+        roles: list[str]
+        reason: str | None               # set iff R is None
+        pr_reference: float | None       # participation_ratio of the reference layer vectors
+        pr_subject: float | None
+
+    def compare(ref: SigmaSet, subj: SigmaSet) -> Comparison
+
+    def in_run_null(R: numpy.ndarray, a: list[int]) -> dict
+        # a: displayed alignment, subject position -> reference position (len == R.shape[0])
+        # {"median_r", "q10_r", "offdiag_median_r", "diag_top1_frac",
+        #  "shift_null": {"n", "mean", "sd", "max"}, "z_shift": float | None}   all floats rounded to 6 decimals
 behavior: |
   1. grid_curve(sigma): s = numpy.asarray(sigma, float64) (descending, K >= 1); floor = SIGMA_PARAMS["log_floor_rel"] * s[0]
      (if s[0] <= 0: return zeros(G)); y = log(maximum(s, floor)); u_k = (arange(K) + 0.5)/K;
@@ -40,27 +54,42 @@ behavior: |
   6. sigma_set(card, table): sc = (card.get("stats") or {}).get("sigma_curves"); None if absent. rows = the table's
      name -> stat_sigma_curve (only non-null). curves[role][block_index] = rows[name] for each entry in sc["tensors"]
      (missing row -> skip that entry). indices = sorted distinct block_index over all entries.
-  7. compare(ref, subj):
+  7. compare(ref, subj) -> Comparison:
      roles = [r for r in ROLE_ORDER if r in ref.curves and r in subj.curves and set(ref.curves[r]) == set(ref.indices)
               and set(subj.curves[r]) == set(subj.indices)].
-     If no roles -> (None, [], "no common sampled roles"). If len(ref.indices) or len(subj.indices) < min_layers ->
-     (None, roles, "stack shallower than min_layers").
+     If no roles -> Comparison(None, [], "no common sampled roles", None, None). If len(ref.indices) or len(subj.indices) <
+     min_layers -> Comparison(None, roles, "stack shallower than min_layers", None, None).
      Per side: res[r] = residuals(role_matrix(curves[r], indices)); V = layer_vectors(res, roles).
-     R = pearson_matrix(V_subj, V_ref). Return (R, roles, None).
-  8. Pure; no IO; no raw cosine; no thresholds (verdicts are not produced here).
+     R = pearson_matrix(V_subj, V_ref). Return Comparison(R, roles, None, participation_ratio(V_ref), participation_ratio(V_subj)).
+  8. participation_ratio(V): Vc = V - V.mean(axis=1, keepdims=True); lam = numpy.linalg.svd(Vc, compute_uv=False)**2;
+     return float(lam.sum()**2 / (lam**2).sum()) if lam.sum() > 0 else 0.0. (The effective number of modes of the residual
+     layer vectors; it is REPORTED, never thresholded. plan.md 2.3 uses it to state the implied null SD.)
+  9. in_run_null(R, a) (nB = R.shape[0] >= 3; computed on the unrounded R; outputs rounded to 6 decimals):
+     - diag = [R[i, a[i]] for i in range(nB)]; median_r = numpy.median(diag); q10_r = numpy.quantile(diag, 0.10) (numpy
+       default linear interpolation).
+     - offdiag_median_r = numpy.median of all R[i, j] with j != a[i] (every row, every other column).
+     - diag_top1_frac = mean over i of (int(numpy.argmax(R[i])) == a[i]) (numpy.argmax takes the first maximum on ties).
+     - shift null: for k in 1..nB-1: m_k = numpy.median([R[i, a[(i + k) % nB]] for i in range(nB)]). shift_null = {"n": nB-1,
+       "mean": mean(m), "sd": std(m, ddof=1), "max": max(m)}. z_shift = (median_r - mean)/sd if sd > 0 else None.
+       Rationale: each m_k is the same median statistic on a deliberately misaligned pairing of the SAME two models, so the
+       spread of m_k measures the null with the actual effective dimension of this run (no d_eff assumption).
+  10. Pure; no IO; no raw cosine; no thresholds (verdicts are not produced here).
 acceptance:
   tests:
-    - "Math tests build SigmaSets directly from arrays made by tests/helpers/weights_fixtures (family_weights, finetune, permute_hidden, rotate_kv_inputs), taking sigma via scout.sigma.sigma_values of the float32 arrays cast to float64 (no files needed)"
+    - "Math tests build SigmaSets directly from arrays made by tests/helpers/weights_fixtures (family_weights, finetune, permute_hidden, rotate_kv_inputs), taking sigma via scout.sigma.sigma_values of the float32 arrays cast to float64 (no files needed). Families are generated once per module (module-scoped fixture); the null tests generate about 140 families and take about 60 s on one core"
     - "test_grid_curve: sigma = [4,2,1,0.5] -> length 128, first value log(4), non-increasing"
     - "test_residuals_remove_poly: Y whose columns are cubic polynomials in t plus a per-row constant -> residuals ~ 0 (1e-10)"
     - "test_invariance: family A vs permute_hidden(A) and vs rotate_kv_inputs(A) -> diag(R) all >= 0.999999"
     - "test_finetune: A vs finetune(A, eps=0.02, seed=9) -> median diag r >= 0.95; eps=0.05 -> median >= 0.80"
-    - "test_independent_null: for seed pairs (1,2),(3,4),(5,6),(7,8),(9,10) with the SAME trend_seed=0 (shared linear + U-shaped depth trend): median diag r <= 0.40 for every pair and the mean of the 5 medians <= 0.20"
-    - "test_detrend_matters: the same pairs with residuals(degree=None) (no depth detrend) -> the mean of the medians >= 0.60 (proves the generic structure the detrend removes is real in the fixture)"
-    - "test_layer_specific: for A vs finetune(A): the median of the off-diagonal R entries <= 0.40 while the diagonal median >= 0.95"
+    - "test_independent_null: over weights_fixtures.NULL_SEED_PAIRS (the FROZEN 50 pairs (2p+1, 2p+2), p = 0..49, all with trend_seed=0, i.e. a shared linear + U-shaped depth trend; same architecture, so this is a synthetic same-architecture hard negative), identity alignment, L=16: the 95th percentile (numpy default) of the 50 median_r values <= 0.40; abs(mean of the 50 medians) <= 0.10; z_shift <= 3.0 for at least 49 of 50 pairs; diag_top1_frac <= 0.40 for every pair. Measured by the planner in a numpy reimplementation (plan.md 2.3): q95 0.28, mean 0.02, max z 1.89, max top1 0.19. No seed may be changed to make this pass (plan.md 2.1 no hand-tuning); a failure goes to the human"
+    - "test_detrend_matters: the first 10 of NULL_SEED_PAIRS with residuals(degree=None) (no depth detrend) -> the mean of the medians >= 0.60 (measured 0.92; proves the generic structure the detrend removes is real in the fixture)"
+    - "test_layer_specific: A = family_weights(FamilySpec(seed=1)) vs finetune(A, 0.02, 7): in_run_null -> median_r >= 0.95, q10_r >= 0.90, offdiag_median_r <= 0.20, median_r - offdiag_median_r >= 0.40, diag_top1_frac == 1.0, z_shift is not None and > 0 (measured over 50 seeds: median >= 0.9999, offdiag in [-0.16, -0.03], top1 1.0, z >= 3.29; the related z is reported, not thresholded, because real neighbouring layers can widen the shift null)"
+    - "test_in_run_null_math: R = 0.9*I + 0.0 elsewhere (16x16), a = identity -> median 0.9, offdiag 0.0, top1 1.0; R with 0.9 on the diagonal and 0.6 elsewhere -> median 0.9, offdiag 0.6, gap 0.30 < 0.40 although top1 is 1.0 (a shared-structure inflation of every entry fails C18); R constant 0.7 -> top1 == 1/16 (argmax takes column 0) and shift sd 0 -> z_shift None; a non-injective reldepth a (20 subject x 16 ref) works and excludes exactly R[i, a[i]] per row from offdiag"
+    - "test_participation_ratio: V[i] = c_i * v with v = arange(10) and c = arange(1, 9) (rank 1 after row centring) -> 1.0 within 1e-9; V = numpy.eye(8) (row-centred it is I - 1/8, eigenvalues 1 x7 and 0) -> 7.0 within 1e-9; a zero matrix -> 0.0"
+    - "test_null_geometry_rehearsal: over the first 20 of NULL_SEED_PAIRS, reference FamilySpec(seed=a, n_layers=28) vs subject FamilySpec(seed=b, style='llama', n_layers=32, hidden=160, n_kv_heads=4, head_dim=32), reldepth(32, 28) alignment: the 95th percentile of median_r <= 0.40 and z_shift <= 3.0 for all 20 (measured over 200 pairs: q95 0.16, max 0.32, max z 2.85)"
     - "test_different_shapes: llama-style family with hidden=160, n_kv_heads=4 (k 128x160) vs a qwen2-style family -> compare works (grid makes the lengths equal); returns R of shape (nB, nA)"
     - "test_shallow_and_missing: 6-layer sets -> R None with a reason; roles missing on one side -> reason 'no common sampled roles'"
-    - "test_sigma_set_from_card: using a card+table produced by T108's scan on a family repo -> the SigmaSet has 16 indices and 2 roles"
+    - "test_sigma_set_from_card: a hand-built minimal Card dict {'stats': {'sigma_curves': {... 32 tensor entries for 16 blocks x 2 roles ...}}} (the card.v1 field names of plan.md 4.2 / T102) and a pyarrow table with the P1 columns name (string) and stat_sigma_curve (list<float64>), rows from sigma_values of family arrays -> the SigmaSet has 16 indices and 2 roles; an entry whose row is missing is skipped; a card without sigma_curves -> None. (The end-to-end variant from a real scan lives in T111 test_sigma_set_from_scan; T109 does not depend on T108.)"
   commands:
     - pytest -q tests/test_layercorr.py
     - pytest -q

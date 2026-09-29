@@ -1,6 +1,6 @@
 id: T110
 title: Structural block cost, stack pairing, Viterbi segment alignment (upscaled/pruned), relative-depth mapping
-depends_on: [T101, T009]
+depends_on: [T009, T101, T102]   # T102: test_block_sets_from_parquet builds its table via build_fixture_card -> scout/card.py (validation r1 minor 7)
 files:
   - scout/align.py
   - tests/test_align.py

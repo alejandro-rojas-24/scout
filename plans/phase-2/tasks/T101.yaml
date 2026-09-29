@@ -15,6 +15,7 @@ interface: |
 
   scout/errors.py (additions):
     class GateDeclined(ScoutError)        # exit_code 6; __init__(self, message: str, plan: dict | None = None); attr plan
+    WeightReadRefused.__init__ gains keyword `reason: str | None = None` (attr reason); message and exit_code unchanged
     class SigmaError(ScoutError)          # exit_code 1; decode/SVD failure of a sampled tensor
 
   scout/bytelog.py (additions; everything in P1 T002 stays):
@@ -52,8 +53,10 @@ behavior: |
        d. (totals.weight - weight_at_grant) + reserved_weight + (end - start) <= cap_bytes.
      Everything is evaluated under the lock. If allowed, create a WEIGHT reservation (tracked separately) and return
      its id. If not allowed, emit "refused" with note f"weight bytes {c['weight']} in {path}[{start}:{end}]: {why}", where
-     why is one of "no grant", "stage", "mixed range", "outside grant", "over cap". Then raise WeightReadRefused with that
-     text. Without a grant, the note and behaviour match P1 apart from the ": no grant" suffix.
+     why is one of "stage", "mixed range", "outside grant", "over cap". Then raise WeightReadRefused with that text.
+     WITHOUT an active grant the refusal note and the exception message are exactly the P1 T002 text (no suffix), so P1
+     tests and P1 behaviour stay byte-identical; the reason is recorded separately as the exception attribute
+     `reason = "no grant"` (WeightReadRefused gains an optional keyword `reason: str | None = None`, default None).
   4. recheck(reservation): if the id is an open weight reservation, then under the lock, if not grant_active, or if
      (totals.weight - weight_at_grant) + reserved_weight > cap_bytes (the reserved amount already includes this
      reservation), emit "refused" (note f"retry over cap: ...") and raise WeightReadRefused. Otherwise do nothing.
@@ -64,15 +67,14 @@ behavior: |
   8. hub.py: in _get's attempt loop, before sending attempt k >= 2, call self.log.recheck(reservation). A
      WeightReadRefused raised there propagates. The reservation is released in the existing finally block, and no
      further attempts are made.
-  9. No other P1 behaviour changes. All P1 tests (tests/test_bytelog.py, tests/test_hub_source.py) must still pass
-     unmodified, except where an assertion compares the exact WeightReadRefused message text. Those may be updated
-     to allow the ": no grant" suffix.
+  9. No other P1 behaviour changes. All P1 tests (tests/test_bytelog.py, tests/test_hub_source.py) must pass
+     UNMODIFIED; this task does not edit them (they are not in `files`).
 acceptance:
   tests:
-    - "test_no_grant_unchanged: set_header_len(p, 100); preflight(p, 108, 120) raises WeightReadRefused; note contains 'no grant'; totals unchanged"
+    - "test_no_grant_unchanged: set_header_len(p, 100); preflight(p, 108, 120) raises WeightReadRefused whose str() and refused note equal the P1 text exactly (no suffix) and whose .reason == 'no grant'; totals unchanged"
     - "test_grant_allows_exact: stage up to SAMPLED_READ; grant('x', [(p,108,208)], cap=100); preflight(p,108,208) returns an id; record(fetch, start=108, nbytes=100, release=id) -> totals.weight == 100"
     - "test_grant_subrange_ok_and_outside_refused: (p,150,160) is allowed; (p,100,160) is refused as 'mixed range' (header bytes); (p,200,300) is refused as 'outside grant'; another path is refused"
-    - "test_grant_wrong_stage: grant() in HEADERS raises StageOrderError; after grant, stage(COMPUTE) revokes it (a 'gate' event with 'revoked') and a later weight preflight is refused with 'no grant'"
+    - "test_grant_wrong_stage: grant() in HEADERS raises StageOrderError; after grant, stage(COMPUTE) revokes it (a 'gate' event with 'revoked') and a later weight preflight is refused with .reason == 'no grant'"
     - "test_cap: grant cap=150 over two 100-byte ranges: the first is allowed; the second is refused 'over cap' while the first reservation is open; after record(release) of 100 bytes, the second is still refused (100+100 > 150)"
     - "test_recheck_cap: grant cap=150, range 100 bytes; r = preflight; record(event='retry', nbytes=60, start=108) (no release) -> recheck(r) raises WeightReadRefused (60 + 100 > 150); with cap=160, recheck passes"
     - "test_weight_reservation_not_in_nonweight_threshold: ByteLog(threshold_bytes=50); an open 100-byte weight reservation does not make a 10-byte meta preflight fail"

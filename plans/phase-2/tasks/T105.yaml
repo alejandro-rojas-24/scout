@@ -1,6 +1,6 @@
 id: T105
 title: Config match + reference suggestion over the out-dir Card pool
-depends_on: [T102, T104]
+depends_on: [T011, T102, T104]
 files:
   - scout/suggest.py
   - tests/test_suggest.py
@@ -22,7 +22,7 @@ interface: |
     def list_cards(out_dir: pathlib.Path) -> list[tuple[pathlib.Path, dict]]
     def tokenizer_jaccard(card_a: dict, card_b: dict) -> float | None
     def suggest(subject: dict, pool: list[dict], top_n: int = TOP_N) -> dict
-        # {"subject": card_key, "suggestions": [Suggestion], "unscanned_claims": [str]}
+        # {"subject": card_key, "suggestions": [Suggestion], "disclaimers": list(scout.view.DISCLAIMERS)}
         # Suggestion = {"card_key", "title", "score", "tokenizer_jaccard": float|None, "config_score": float|None,
         #               "config_mismatches": [str], "architectures_equal": bool, "claimed_base_match": bool}
 behavior: |
@@ -46,7 +46,8 @@ behavior: |
        claimed_base_match = cand.key.repo in subject.model_card.base_model (exact string; a missing model_card -> False).
        The claim never enters score.
      - sort by (-score, repo, revision_sha, component or ""); keep top_n. score and J are rounded to 6 decimals in the output.
-     - unscanned_claims = [b for b in subject.model_card.base_model if b not in {c.key.repo for c in pool}], in claim order.
+     - disclaimers = list(scout.view.DISCLAIMERS) (invariant 5: a ranked candidate list reads like a report).
+       (unscanned_claims was cut in revision r1: not needed by the exit or the roadmap line.)
      - title = f"{repo}@{sha[:12]}" + (f" / {component}" if component).
   6. Pure except list_cards, which reads only *.card.json.
 acceptance:
@@ -54,7 +55,7 @@ acceptance:
     - "test_config_match: two Qwen-like raws differing only in max_position_embeddings -> compared 12 (head_dim absent in both), score 11/12; text_config lookup works; fewer than 3 compared -> None"
     - "test_rank: subject = the fine-tune Card, pool = {base, independent} (cards built from weights_fixtures repos via tests/helpers/cards.build_fixture_card, with tokenizer_minhash added by tokenizer.tokenizer_stat) -> top-1 is base, J == 1.0"
     - "test_claim_does_not_score: subject claims base_model ['org/independent']; ranking unchanged; the independent card has claimed_base_match True but is still ranked 2nd"
-    - "test_unscanned_claims: a claim of a repo not in the pool is listed"
+    - "test_disclaimers: suggest(...)['disclaimers'] == list(DISCLAIMERS), also for an empty pool"
     - "test_missing_tokenizer: a v0 card / no tokenizer_minhash -> J None; the score uses config only"
     - "test_list_cards: a corrupt JSON and a card.v9 file are skipped; order is sorted by path"
     - "test_excludes_self"

@@ -17,14 +17,20 @@ interface: |
     from scripts.exit_check import CountingTransport, _client_for      # P1 T015
     POLL_S = 0.1; SCAN_TIMEOUT_S = 3600.0
     def run_p2(pins: dict[str, str], out_dir: Path, *, mode: str,              # "plan" | "confirm"
-               confirm_bytes: int | None = None, endpoint: str = HF_ENDPOINT_URL,
+               confirm_plans: dict[str, int] | None = None, endpoint: str = HF_ENDPOINT_URL,
+               display: Callable[[str], None] = <print to sys.stderr, flush>,
                allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
                inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
                pairs=PAIRS, suggest_subject=SUGGEST_SUBJECT, suggest_expected=SUGGEST_EXPECTED,
                gate_threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES) -> tuple[list[Check], dict]
-        # returns (checks, summary) ; summary = {"plans": {repo: plan}, "medians": {label: float|None}, "weight": {repo: int}}
+        # returns (checks, summary) ; summary = {"plans": {repo: plan}, "medians": {label: float|None}, "weight": {repo: int},
+        #   "in_run": {label: {"q10_r", "offdiag_median_r", "diag_top1_frac", "z_shift", "shift_null_sd", "participation_ratio"}}}
+    def parse_confirm_plans(text: str) -> dict[str, int]
+        # "ID:CAP,ID:CAP,..." ; ID = 16 lowercase hex, CAP = decimal int > 0; duplicates, empty items or bad syntax -> ValueError
+    def format_confirm_plans(plans: list[dict]) -> str        # "ID:CAP,..." in P2_TARGETS order
     def main(argv: list[str] | None = None) -> int
-      # flags: --pins PATH (default <repo>/exit/pins_p2.json); exactly one of --plan-only | --confirm-bytes INT;
+      # flags: --pins PATH (default <repo>/exit/pins_p2.json); exactly one of --plan-only | --confirm-plans ID:CAP,...;
+      # a --confirm-plans value that parse_confirm_plans rejects -> argparse exit 2;
       # --out DIR (default tempfile.mkdtemp()). No endpoint/threshold/budget flags.
   scripts/pin_exit.py (P1 T015, extended):
     def main(argv=None, *, run_cmd=None) -> int      # new flag --phase {1,2} (default 1)
@@ -32,13 +38,14 @@ interface: |
     # P1 calls stay run_cmd(cmd) (env None), so P1 fakes keep working; phase 2 calls run_cmd(cmd, env).
     # The default run_cmd becomes def _run(cmd, env=None): subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
   tests/test_exit_p2_network.py:
-    @pytest.mark.network test: requires env SCOUT_P2_CONFIRM_BYTES; runs exit_check_p2.py --confirm-bytes $SCOUT_P2_CONFIRM_BYTES; returncode 0
+    @pytest.mark.network test: requires env SCOUT_P2_CONFIRM_PLANS (copied by the human from the E2 output); runs
+    exit_check_p2.py --confirm-plans $SCOUT_P2_CONFIRM_PLANS; returncode 0
 behavior: |
   1. main: (a) if HF_ENDPOINT is set and != HF_ENDPOINT_URL -> print the P1 message, return 1. (b) If HF_TOKEN is unset or empty
      -> print "meta-llama/Llama-3.1-8B is gated: set HF_TOKEN for an account that accepted the Llama 3.1 licence" and return 3.
      (c) load pins; c0 = check_target_set_p2(pins); not ok -> print the C0 row and "EXIT CHECK: FAIL (target set must be
      exactly: ...)", return 1. (d) any pin not 40-hex -> print "pins not set: run `python scripts/pin_exit.py --phase 2`",
-     return 2. (e) run_p2(mode="plan" if --plan-only else "confirm", confirm_bytes=...).
+     return 2. (e) run_p2(mode="plan" if --plan-only else "confirm", confirm_plans=parse_confirm_plans(...)).
   2. run_p2: checks = [c0]; if not ok return. Targets are scanned STRICTLY SEQUENTIALLY in P2_TARGETS order (pins order is
      irrelevant). Each target gets its own CountingTransport(inner_transport_factory()) and its own
      make_server(port=0, out_dir=out_dir, endpoint=endpoint, client_factory=partial(_client_for, counting),
@@ -46,26 +53,32 @@ behavior: |
      target (P1 T015 rule). Control requests use a separate plain httpx.Client.
      Per target: POST /api/scans {"target": f"{repo}@{sha}", "sample": true, "tokenizer": true}; poll every POLL_S.
        - On the FIRST poll with status "awaiting_confirmation": snapshot pre_confirm = {"totals": resp.totals, "events": all
-         events since 0, "wire": list(counting.records)} and plan = resp.plan.
+         events since 0, "wire": list(counting.records)} and plan = resp.plan. Then display(gate.format_plan_dict(plan))
+         ALWAYS, in both modes, before any confirm/decline POST (the human sees every plan the runner acts on).
          mode "plan": POST /decline; record the plan; continue polling until error (GateDeclined expected).
-         mode "confirm": if spent + plan.bytes_cap <= confirm_bytes: spent += bytes_cap; POST /confirm {plan_id,
-         bytes_confirmed: plan.bytes_cap}; else POST /decline (the target will FAIL its checks).
+         mode "confirm": if confirm_plans.get(plan["plan_id"]) == plan["bytes_cap"]: POST /confirm {plan_id,
+         bytes_confirmed: plan["bytes_cap"]}; else display(f"NOT CONFIRMED: plan {plan_id} (cap {bytes_cap}) is not in
+         --confirm-plans") and POST /decline (the target will FAIL its checks). There is no running byte sum: each plan is
+         approved only by its own (plan_id, bytes_cap) pair, which the human copied from E2's display of that plan. Plan ids
+         are deterministic at a pin (sha256 over repo, sha and the planned ranges), so E2 and E3 produce the same ids.
        - Poll until done/error or SCAN_TIMEOUT_S.
      mode "plan": no Card is written (every scan ends in GateDeclined). After all targets, checks += per target:
      the C1 rows of target_checks computed from pre_confirm (the other C-checks need a Card and are not evaluated), plus
      Check "P plan" = plan is not None and plan.bytes_planned > 0 and plan.bytes_cap == plan.bytes_planned + 16 MiB.
      Print one row per plan (repo, bytes_planned, bytes_cap, n_reads, memory_peak_bytes), then
-     "CONFIRM WITH: --confirm-bytes {sum of bytes_cap}". The exit code is 0 iff C0, C1 and "P plan" pass for every target.
+     "CONFIRM WITH: --confirm-plans " + format_confirm_plans(plans) and "TOTAL CAP: {sum of bytes_cap} B". The exit code is 0
+     iff C0, C1 and "P plan" pass for every target.
      mode "confirm": after each target, load its card(s) under out_dir/repo_slug/sha/ (load_card), list out_files
-     (all files under out_dir/repo_slug/sha/), build P2TargetResult and extend checks with target_checks(...).
+     (all files under out_dir/repo_slug/sha/), build P2TargetResult (confirm_plans = the parsed --confirm-plans) and extend checks with target_checks(...).
      After all targets: checks += params_check(). Then start ONE more make_server (a fresh CountingTransport, no scans)
      for the comparisons: POST /api/diff per pair with the card keys of (reference, subject); GET /api/suggest for
      suggest_subject; shut it down; compare_wire = its counting.records. checks += pair_checks(P2Results(...)).
   3. Output (both modes): a table `target | check | expected | actual | PASS/FAIL`, then "EXIT CHECK: PASS"/"FAIL", then one
      JSON line {"step": "EXIT", "phase": 2, "mode", "hostname", "pins", "passed", "failed", "endpoint", "hosts": the sorted
-     wire hosts over all targets, "git_commit", "git_dirty", "confirm_bytes", "bytes_planned": {repo: n},
-     "weight_bytes": {repo: totals.weight}, "medians": {label: median_r}, "thresholds": {"related_min": 0.80,
-     "unrelated_max": 0.40, "separation_min": 0.40}}. git_commit = `git rev-parse HEAD` and git_dirty =
+     wire hosts over all targets, "git_commit", "git_dirty", "confirm_plans": {plan_id: cap}, "bytes_planned": {repo: n},
+     "weight_bytes": {repo: totals.weight}, "medians": {label: median_r}, "in_run": summary.in_run,
+     "thresholds": {"related_min": 0.80, "related_q10_min": 0.50, "unrelated_max": 0.40, "unrelated_z_max": 3.0,
+     "separation_min": 0.40, "offdiag_gap_min": 0.40, "top1_min": 0.80}}. git_commit = `git rev-parse HEAD` and git_dirty =
      bool(`git status --porcelain`), both run with subprocess in the repo root; any failure gives "unknown"/null, never an
      exception (the same rule as P1 T015). Return 0 iff every check is ok.
   4. pin_exit --phase 2: targets = P2_TARGETS; pins path default exit/pins_p2.json. HF_TOKEN is required (return 3 if
@@ -77,31 +90,35 @@ behavior: |
   5. Offline rehearsal (tests/test_exit_check_p2_offline.py) calls run_p2 directly with FakeHub
      (inner_transport_factory=hub.transport, endpoint=HUB, allowed_hosts={"hub.test","cdn.test"}, gate_threshold_bytes=0) and
      rehearsal repos written with weights_fixtures:
-       "org/base"      FamilySpec(seed=1)                          vocab=family_vocab(1)
-       "org/base-ft"   finetune(base, eps=0.02, seed=7)            vocab=family_vocab(1), README base_model: [org/base]
-       "org/other"     FamilySpec(seed=2, style="llama", n_layers=20, hidden=160, n_kv_heads=4, head_dim=32)
-                       vocab=family_vocab(2, shared=family_vocab(1)[:100])
+       "org/base"      weights_fixtures.REHEARSAL_BASE (seed 1, 28 layers)                  vocab=family_vocab(1)
+       "org/base-ft"   finetune(base, FINETUNE_EPS, FINETUNE_SEED)                            vocab=family_vocab(1), README base_model: [org/base]
+       "org/other"     weights_fixtures.REHEARSAL_OTHER (seed 2, llama, 32 layers, hidden 160) vocab=family_vocab(2, shared=family_vocab(1)[:100])
+     (the rehearsal mirrors the exit depths 28 vs 32; the constants are frozen in T103 and may not be changed to make the
+     rehearsal pass: a failure goes to the human)
      pairs=(("related","org/base","org/base-ft"), ("unrelated","org/base","org/other")), suggest_subject="org/base-ft",
      suggest_expected="org/base"; pins {repo: sha} with distinct shas ("a"*40, "b"*40, "c"*40). The same threshold constants
      apply. P2_TARGETS order is replaced by the order of the repos in `pairs` (reference first, then subjects) when pairs is
      not the default.
 acceptance:
   tests:
-    - "test_rehearsal_pass: mode confirm, confirm_bytes = sum of caps -> every check C0..C17 ok; summary medians related >= 0.80, unrelated <= 0.40"
-    - "test_rehearsal_plan_only: mode plan -> C0, C1 and 'P plan' ok for 3 targets; totals.weight == 0 for every target; no FakeHub cdn_reads range starts at >= 8+N; the last stdout line (via main-like printing helper) contains 'CONFIRM WITH: --confirm-bytes <sum>' before the JSON line"
-    - "test_rehearsal_insufficient_confirm: confirm_bytes = sum - 1 -> the last target is declined -> its C4/C8 fail -> overall FAIL; the first two targets' checks still ok"
+    - "test_rehearsal_pass: run mode plan first, then mode confirm with confirm_plans = the {plan_id: bytes_cap} of the plan-mode plans (the same ids) -> every check C0..C18 ok; summary medians related >= 0.80, unrelated <= 0.40"
+    - "test_rehearsal_plan_only: mode plan -> C0, C1 and 'P plan' ok for 3 targets; totals.weight == 0 for every target; no FakeHub cdn_reads range starts at >= 8+N; the output contains 'CONFIRM WITH: --confirm-plans <id>:<cap>,<id>:<cap>,<id>:<cap>' before the JSON line"
+    - "test_rehearsal_plan_displayed_first: display = a spy that records, at each call, the number of CountingTransport records whose range starts at >= 8+N -> 3 calls, each with 'DOWNLOAD GATE' and that target's plan_id, each recorded count == 0"
+    - "test_rehearsal_missing_plan: confirm_plans without the last target's plan_id -> the last target is declined ('NOT CONFIRMED' displayed) -> its C4/C8 fail -> overall FAIL; the first two targets' checks still ok"
+    - "test_rehearsal_wrong_cap: confirm_plans with the right ids but one cap + 1 (and one cap = 10**15) -> those targets are declined; C8 fails for them"
+    - "test_parse_confirm_plans: 'abcdef0123456789:100' ok; duplicate id, 15-hex id, cap 0, cap '1e9', empty item -> ValueError"
     - "test_rehearsal_swapped_pair: the related pair declared as (org/base, org/other) -> C11/C12 FAIL (proves the checks are not vacuous)"
     - "test_rehearsal_unlogged_weight_read: monkeypatch HubSource.read_range to also do an unlogged client.get of one planned range -> C6 FAIL"
     - "test_main_requires_token: monkeypatch.delenv HF_TOKEN -> main([...]) == 3 and make_server is never called (spy)"
     - "test_main_endpoint_refused: HF_ENDPOINT=https://mirror.example.com -> 1"
-    - "test_main_flags: neither or both of --plan-only/--confirm-bytes -> argparse exit 2; unpinned -> 2; a wrong target set -> 1"
+    - "test_main_flags: neither or both of --plan-only/--confirm-plans -> argparse exit 2; a malformed --confirm-plans -> 2; unpinned -> 2; a wrong target set -> 1"
     - "tests/test_pin_exit_p2.py: fake run_cmd(cmd, env): (1) agree -> 0, file written with the 3 P2 repos, the PIN line has phase 2; (2) the git env contains GIT_CONFIG_VALUE_0 'Authorization: Bearer hf_x' and no argv element contains 'hf_x'; (3) mismatch -> 1, file unchanged; (4) HF_TOKEN unset -> 3, run_cmd never called; (5) --phase 1 still uses the P1 targets and needs no token"
     - "P1 tests/test_pin_exit.py passes unchanged"
     - "tests/test_exit_p2_network.py is deselected by default"
   commands:
     - pytest -q tests/test_exit_check_p2_offline.py tests/test_pin_exit_p2.py tests/test_pin_exit.py
     - pytest -q
-    - "at EXIT only (network, HF_TOKEN): python scripts/pin_exit.py --phase 2 --pins exit/pins_p2.json -> python scripts/exit_check_p2.py --pins exit/pins_p2.json --plan-only -> (human reads N) python scripts/exit_check_p2.py --pins exit/pins_p2.json --confirm-bytes N --out /tmp/p2cards -> append the evidence to plans/phase-2/log.jsonl"
+    - "at EXIT only (network, HF_TOKEN): python scripts/pin_exit.py --phase 2 --pins exit/pins_p2.json -> python scripts/exit_check_p2.py --pins exit/pins_p2.json --plan-only -> (human reads the 3 displayed plans and copies the CONFIRM WITH line) python scripts/exit_check_p2.py --pins exit/pins_p2.json --confirm-plans <ID:CAP,ID:CAP,ID:CAP> --out /tmp/p2cards -> append the evidence to plans/phase-2/log.jsonl"
 out_of_scope:
   - changing thresholds or params (T115 constants; human decision)
   - browser automation (E5 manual)
