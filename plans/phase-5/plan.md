@@ -1,6 +1,6 @@
 # Phase 5 plan: Product refinement (retrain loop, report export, polish)
 
-Status: DRAFT r0 (planner), 2026-09-29.
+Status: DRAFT r0 complete (planner), 2026-10-01. Ready for VALIDATE.
 
 This plan builds on the Phase 1–4 plans (`plans/phase-{1,2,3,4}/plan.md`, tasks T001–T321) and treats them as
 contracts: Card v3 and its stats, the ByteLog and the download gates (P2 exact `(plan_id, cap)`, P4 full-download batch
@@ -106,8 +106,8 @@ a Card v0–v3, a statistic or a gate (`card.v4` is written only by the retrain 
 ```bash
 # E0 offline (no network, no Spark, no GPU, no API key): P1-P5 suites incl. the P5 rehearsal (T419): a real worker
 # subprocess runs the whole retrain loop on a tiny CPU Llama family (8 blocks, hidden 128, trained on Markov text), the
-# exit runner writes and
-# lints the three kinds of report, and the stub LLM reader and a fixture human answer file are scored
+# exit runner writes and lints the three kinds of report, and the stub LLM reader and a fixture human answer file are
+# scored
 pip install -e '.[dev]'          # dev now includes the retrain extra (torch, transformers, tokenizers)
 pytest -q                        # expect exit 0, 0 failures; network tests deselected
 
@@ -124,7 +124,9 @@ python scripts/exit_check_p5.py plan --backend "ssh:$SCOUT_SPARK_HOST" --store c
 # expect exit 0; the store is populated first (import cards/p3; export/import the P4 te Cards; idempotent);
 # rows C0, C1, C2, C3 and the plan half of C4 PASS; the retrain plan is printed (format_retrain_plan: plan_id, bytes
 # planned, hard cap, disk on <host>:<scratch_root>, memory, reason, per-model and per-file tables, the data files and
-# the recipe) followed by "CONFIRM WITH: --confirm-plans <id>:<cap>"; client totals.weight == 0; ledger gains
+# the recipe) followed by "CONFIRM WITH: --confirm-plans <id>:<cap>" (the runner's line, the one to copy; the client
+# display above it also shows the `scout retrain` form "--confirm-plan <id> --confirm-bytes <cap>" for the same pair);
+# client totals.weight == 0; ledger gains
 # P5_PREFLIGHT and P5_PLAN.
 # At plan time (published configs; exact values come from the E3 plan):
 #   bytes_planned about 2,087,765,760   cap about 2,356,201,216   (slack 4 x 64 MiB)   data (meta) about 7.1 MB
@@ -233,7 +235,28 @@ string, `git_commit`, `code_id`.
   | 1000 | 1.003 | 0.921 | 1.74, 1.66 | 0.995 | 0.948 | 2.40, 0.78 |
   | 1500 | 0.999 | 0.925 | 2.01, 0.42 | 0.992 | 0.951 | 2.00, 0.28 |
 
-  M1024_SECTION_PLACEHOLDER
+  A second, harder toy (same text and statistic, hidden 128, GLU intermediate 1024, control intermediate 768, m = 1023
+  probes; base and derivative trained as above) re-initialised **4 of 8** blocks (1, 3, 5, 6; 50 % of the MLPs) and
+  ran the same recipe for 1000 steps (planner scratch logs `ce4.log`, `kd4.log`; the baseline z of this pair was not
+  logged):
+
+  | step | CE ppl ratio | CE top-1 | KD ppl ratio | KD top-1 | max flagged z_adj (CE / KD) |
+  |---|---|---|---|---|---|
+  | 0 (re-init) | 2.811 | 0.576 | 2.811 | 0.576 | 0.39 / 0.39 |
+  | 250 | 1.102 | 0.833 | 1.063 | 0.868 | 0.81 / 2.49 |
+  | 500 | 1.047 | 0.847 | 1.019 | 0.886 | 0.78 / 0.99 |
+  | 1000 | 1.005 | 0.849 | 0.983 | 0.901 | 1.99 / 0.90 |
+
+  What the two toys say for the exit: (1) the signal drops at the first eval point in every run (no flagged block
+  attributed at any step; crit 5.20); (2) perplexity recovers in both; (3) **top-1 agreement is the binding
+  criterion**, and it depends on how much of the MLP stack is removed: 2 of 8 blocks reach 0.91 by step 250, 4 of 8
+  plateau at 0.85 under CE. The exit flags 3 of 24 blocks (12.5 %, half the smaller toy's fraction), which favours
+  C12; but its whole budget presents only about 0.42 training tokens per trainable parameter (16.4M / 39.2M), against
+  3.5 at the smaller toy's step 250 and 1.3 at the harder toy's step 1000. The toys therefore do not establish C12 at
+  exit scale: **C12 is the exit's main risk** (§8). A C12 FAIL is a finding; the 0.90 bound and the budget are not
+  changed after a run. (4) Under CE the flagged z drifts upward with training (max z_adj about 2 by step 1000, still
+  far below crit); see later.md. The KD objective recovers agreement faster but is rejected for the product (§3.4: it
+  pulls the new neurons towards the old function) and is not used.
 
 ### 2.5 Environment, access, bytes, time
 
@@ -276,9 +299,9 @@ bound: the backward pass stops below the first flagged block); at an assumed 25�
 which is why C1 requires CUDA. Each eval point costs about
 2 s of evaluation and about 30 s of re-fingerprinting on the CPU (48 matchings of 2048 × 4864 or 2048 × 2560). With 8
 eval points and the baseline, COMPUTE is at most about 45 min; the C9 bound is 5400 s (1.5 h), the job bound 7200 s.
-Memory: the model in fp32 about 2 GB (bf16 autocast for compute), trainable fp32 state for 3 × 3 × 896 × 4864 = 39.2M parameters ≈ 0.63 GB, activations and
-logits for 16 × 512 tokens ≈ 8 GB; the worker's host RSS stays below the 48 GiB of C9 (the attribution side is the P4
-estimate for this size, under 3 GiB).
+Memory: the model in fp32 about 2 GB (bf16 autocast for compute), trainable fp32 state for 3 × 3 × 896 × 4864 =
+39.2M parameters ≈ 0.63 GB, activations and logits for 16 × 512 tokens ≈ 8 GB; the worker's host RSS stays below the
+48 GiB of C9 (the attribution side is the P4 estimate for this size, under 3 GiB).
 
 ## 3. Definitions
 
@@ -466,9 +489,10 @@ instead of its body):
 3. `caveats`: the three `DISCLAIMERS`, verbatim, always.
 4. `subject`: repo and pinned revision, component, the model-card claims (`base_model`, relation, licence, labelled as
    claims), the architecture summary (stacks and depths, parameter count, dtypes).
-5. `system1`: `VERDICT_SEMANTICS`; one row per reference with the calibrated verdict, `p_derived` (2 decimals), the
-   abstain reason, the structure alignment; the claims table (claimed vs detected); unclaimed detections; the JEV
-   calibration note. "Not run" when the subject Card has neither σ-sample nor anchor evidence.
+5. `system1`: `VERDICT_SEMANTICS`; the JEV decision thresholds `hi`/`lo` (2 decimals) and calibration note from the
+   model mirror; one row per reference with the calibrated verdict, `p_derived` (2 decimals), the abstain reason, the
+   structure alignment; the claims table (claimed vs detected); unclaimed detections. "Not run" when the subject Card
+   has neither σ-sample nor anchor evidence, or no JEV model is given.
 6. `system2` (optional, `--s2`): the S2 final verdicts, reason codes and explanations, headed "System 2 commentary
    (an LLM reading Cards and System 1 output; it can only keep or soften a verdict)".
 7. `attribution`: the depth strip (SVG), one row per reference (role, status, `n_attributed/n_tested`, null summary,
@@ -485,7 +509,11 @@ instead of its body):
 **Traceability mechanism.** Every value that comes from data is rendered as
 `<data value="RAW" data-src="SOURCE" data-fmt="FMT">TEXT</data>`, where `TEXT == format(RAW, FMT)`. `SOURCE` is one of:
 - `card:<object_id>#<json-pointer>` into the Card JSON of that store object;
-- `model:<sha256>#<json-pointer>` into the JEV model file;
+- `model:<sha256>#<json-pointer>` into the JEV model file whose sha256 is `<sha256>` (64 lowercase hex, equal to
+  `inputs.model.sha256`). The bundle carries a mirror of the parts the report shows, `data.models[<sha256>]`, with the
+  file's own key paths (`/params/calibration_note`, `/thresholds/hi`, `/thresholds/lo`), so one pointer resolves to
+  the same value in the mirror (render) and in the file (lint). Only these three pointers are allowed (L2b). The
+  linter resolves the pointer in the file given to it, and only if that file's sha256 equals `<sha256>`;
 - `ledger:<p3|p4|p5>:<seq>#<json-pointer>` into that ledger entry;
 - `analysis:<i>#<json-pointer>` into `analysis.v1` recomputed by the linter from the cited Cards and the model file
   (`inputs.analysis[i]` names them): the numbers are a deterministic function of Cards and the frozen model;
@@ -510,14 +538,14 @@ count and a threshold. Every threshold is a count that must be 0, except where s
 | id | what | counted | pass |
 |---|---|---|---|
 | L1 | caveats | the three `DISCLAIMERS` each exactly once inside `#caveats`; `ATTRIBUTION_CAVEAT` exactly once inside `#attribution` when it is run; `RETRAIN_CAVEAT` exactly once inside `#retrain` when run; `LICENSE_QUESTION` exactly once inside `#license`; count = missing or duplicated texts | 0 |
-| L2 | traceability | (a) digits in visible text outside `data` elements and outside `#system2`; (b) `data` elements whose source does not resolve, or whose `format(resolved, fmt) != TEXT`, or whose `value` differs from the resolved value; (c) numbers in `#system2` prose that equal no numeric leaf of the `s2in.v1` input at the printed precision | 0 each |
+| L2 | traceability | (a) digits in visible text outside `data` elements and outside `#system2`; (b) `data` elements whose source is malformed or not allowed (`bundle:` outside the metadata pointers, `model:` outside the three mirrored pointers, `s2:`/`s2in:` outside `#system2`), does not resolve, or whose `format(resolved, fmt) != TEXT`, or whose `value` differs from the resolved value; (c) numbers in `#system2` prose that equal no numeric leaf of the `s2in.v1` input at the printed precision | 0 each |
 | L3 | raw cosine | case-insensitive matches of `cosine` or `cos sim` in visible text and in bundle keys | 0 |
-| L4 | calibrated verdicts only | (a) `.verdict` elements whose source is not `analysis:<i>#/pairs/<j>/system1/verdict` with a model whose sha256 equals the P3 ledger's last `FREEZE_MODEL` sha256; (b) the words `derived`, `not derived`, `not_derived`, `abstain` (any case, word-bounded) in visible text outside `.verdict`, `.semantics`, `.caveat`, `#system2` and `#license` | 0 each |
-| L5 | abstentions shown | S1 abstentions in the recomputed analysis minus rendered `#system1 .verdict[data-verdict=abstain]` rows that carry a non-empty `.reason`; attribution references with status `abstain`/`untestable` minus rendered rows with a reason; `untestable` blocks minus rendered block rows with a reason; "not run" sections without a reason | 0 each |
+| L4 | calibrated verdicts only | (a) `.verdict` elements whose source is not `analysis:<i>#/pairs/<j>/system1/verdict` with a model whose sha256 equals the P3 ledger's last `FREEZE_MODEL` sha256; (b) the words `derived`, `not derived`, `not_derived`, `abstain` (any case, word-bounded) in visible text outside `.verdict`, `.semantics`, `.caveat`, `.attrib-status` (a block-attribution reference status, which can be `abstain`), `#system2` and `#license` | 0 each |
+| L5 | abstentions shown | one row whose count is the sum of four absolute differences: (a) S1 abstentions in the recomputed analysis vs `.verdict[data-verdict=abstain]` elements **inside `#system1` only** whose table row carries a non-empty `.reason` (the `#summary` repeats each verdict, so counting it would double-count; summary verdicts are still subject to L4a); (b) attribution references with status `abstain`/`untestable` vs rendered reference rows with a reason; (c) `untestable` blocks vs rendered block rows with a reason; (d) "not run" sections without a reason | 0 |
 | L6 | provenance | Cards used without repo@40-hex, component, object id (existing in the store, and equal to the id recomputed from its files) or (with `--require-ledger`) a verifying ledger citation; missing model sha or `FREEZE_MODEL` citation; missing `code_id` (64 hex), scout version or regenerate command | 0 |
 | L7 | self-contained | `src=`, `<link`, `@import`, `url(` with an `http:`/`https:` target; `<script>` elements other than the one bundle | 0 |
 | L8 | licence left open | matches of the frozen deny-list (§4.8) in visible text outside `.license-question` and `.caveat`; `#license` missing | 0 |
-| L9 | precision | `p_derived` values rendered with other than `f2`; attribution `z_adj`/`z_pair` with other than `f1`; p-values with other than `e1` | 0 |
+| L9 | precision | `p_derived` values and the JEV thresholds (`/thresholds/hi`, `/thresholds/lo`) rendered with other than `f2`; attribution `z_adj`/`z_pair` with other than `f1`; p-values with other than `e1` | 0 |
 | L10 | unedited and reproducible | (a) `render(bundle) != file bytes`; (b) the bundle rebuilt from the store, model and ledgers (with the file's `generated_at`) differs from the embedded bundle | 0 each |
 
 L10 is what makes "without editing" mechanical: any hand edit of the HTML breaks (a), and any edit of the bundle breaks
@@ -710,7 +738,8 @@ by value; `scout/caveats.py` imports nothing from scout, and a test asserts equa
  data: {cards: {object_id: {key, model_card, config: {model_type, architectures}, structure: {stacks: [{prefix, depth}]},
                             weights: {params_total, n_tensors, params_by_dtype, format}, stats: {attribution, retrain}}},
         analysis: [analysis.v1], s2: s2.v1|null, s2in: s2in.v1|null,
-        model: {params: {calibration_note}, thresholds}|null,   # subset of the model file, same key paths
+        models: {"<model sha256>": {params: {calibration_note: str}, thresholds: {hi: float, lo: float}}},
+                # mirror of the JEV model file, keyed by its sha256, same key paths; {} when System 1 is not run
         ledger_entries: {"<ledger>:<seq>": entry}},
  summary: [{template: str, slots: {name: SOURCE}}],
  regenerate: str}
@@ -723,7 +752,8 @@ against the store and the ledgers (§3.6). `answer_key(bundle)` (T412) derives t
 {schema: "lint.v1", file_sha256: str, ok: bool,
  rows: [{id: "L1".."L10", name: str, count: int, threshold: 0, ok: bool, details: [str]}]}   # details <= 20 lines
 ```
-L2 and L4 report their sub-counts as `L2a`, `L2b`, `L2c`, `L4a`, `L4b` rows (same shape).
+L2, L4 and L10 report their sub-counts as `L2a`, `L2b`, `L2c`, `L4a`, `L4b`, `L10a`, `L10b` rows (same shape), so a
+result has 14 rows in this order: L1, L2a, L2b, L2c, L3, L4a, L4b, L5, L6, L7, L8, L9, L10a, L10b.
 
 ### 4.7 Reader records (T412)
 ```
@@ -763,7 +793,7 @@ LINT_PARAMS = {"version": "lint.v1", "checks": ["L1", "L2", "L3", "L4", "L5", "L
   "number_regex": "[-+]?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?",
   "cosine_regex": "(?i)cos(?:ine|\\s*sim)",
   "verdict_regex": "(?i)\\b(?:not[ _]derived|derived|abstain(?:s|ed)?)\\b",
-  "verdict_containers": [".verdict", ".semantics", ".caveat", "#system2", "#license"],
+  "verdict_containers": [".verdict", ".semantics", ".caveat", ".attrib-status", "#system2", "#license"],
   "license_deny": ["compliant", "complies", "compliance with", "violat", "infring", "permitted", "is allowed",
                    "are allowed", "you may ", "you can use", "free to use", "legal", "lawful", "no licence issue",
                    "no license issue"],
@@ -789,7 +819,7 @@ P5_RETRAIN   {attempt_seq, passed, failed: [check], error: str|null, evidence: {
               git_commit, code_id}
 P5_REPORTS   {reports: {label: {file_name, sha256, bytes, lint_ok, lint_rows: [{id, count, ok}], answer_key_sha256,
               bundle_sha256}}, passed, git_commit, code_id}
-P5_READER    {reader: "llm"|"human", reader_id: str, blind: bool|null, waived: str|null,
+P5_READER    {reader: "llm"|"human", reports_seq: int (the P5_REPORTS entry read), reader_id: str, blind: bool|null, waived: str|null,
               scores: {label: score}, answers_sha256: str, s2: {requested_model, served_model, request_host,
               usage}|null, passed, git_commit, code_id}
 P5_EXIT      {passed, failed: [check], rows: [{target, check, expected, actual, ok}], waivers: [str],
@@ -895,7 +925,7 @@ tests/test_exit_check_p5_offline.py                                             
 | Risk | Mitigation / test |
 |---|---|
 | Retraining recreates the base's neurons, so the signal never drops (exit C11) | Measured on a toy (§2.4). The loop reports `signal_persists` honestly; a FAIL goes to the human, and nothing is re-seeded or re-thresholded. T406 `test_signal_persists` proves the loop reports it |
-| Quality does not recover within the budget (exit C12) | Zero-init `down` (step 0 = MLP removed); both quality measures reported per eval step; measured on the toy (§2.4). A FAIL goes to the human |
+| Quality does not recover within the budget (exit C12): **the main exit risk** | Zero-init `down` (step 0 = MLP removed); both quality measures reported per eval step and right after re-initialisation; measured on two toys (§2.4): 2 of 8 blocks reach top-1 0.91 by step 250, 4 of 8 plateau at 0.85, and the exit budget is only about 0.42 tokens per trainable parameter. The bounds and the budget are frozen in `P5_FREEZE`; a FAIL goes to the human with the trace, and changing either needs a refreeze with a recorded reason (C2) |
 | Retrained weights persist (invariant 1) | No save call exists (static AST test over `scout/retrain`, T405); only scratch tensors of the plan are written (C7 `bytes_written == bytes_planned`); `finally` deletes tensors and purges; weights-free Card (T401 `test_retrain_no_weights`: no numeric list longer than 64 outside `final_attribution.blocks`) |
 | transformers downloads something behind the ByteLog (invariant 2) | `from_config` only; offline env flags; the rehearsal runs COMPUTE with `socket.socket.connect` patched to raise (T419) and T405 `test_no_network_in_compute` |
 | Data bytes bypass the gate | Data ≤ 32 MiB as logged META reads (P1 semantics); the plan display lists them; sha256 checked; C3 and C6 recount them |
@@ -922,7 +952,7 @@ tests/test_exit_check_p5_offline.py                                             
 | `scout/view.py` (P1 T011, P4 T318) | `depth_strips[].cells[].retrain` and `view.retrain` (§4.10) for v4 Cards; `None` for v0–v3; `DISCLAIMERS`, `ATTRIBUTION_CAVEAT` unchanged | T413 |
 | `scout/server.py` (P1 T013, P2 T113, P4 T318) | `make_server(..., report_config: ReportConfig \| None = None)`; new `GET /api/report?repo=&revision_sha=&component=` (text/html, built on request, never stored); `serve(..., report_config=None)`; every other route unchanged | T413 |
 | `scout/web/index.html`, `scout/web/app.js` (P1 T014, P2 T114, P4 T318) | a "report" link per stored subject; retrain outline and legend on the strip; P1–P4 ids kept | T413 |
-| `scout/cli.py` (P1 T012, P2 T112, P3 T215, P4 T319) | new `scout retrain`, `scout report`, `scout report-lint`; `scout resolve --repo-type {model,dataset}`; `scout serve --model/--library-manifest/--pins`; everything else unchanged | T414 |
+| `scout/cli.py` (P1 T012, P2 T112, P3 T215, P4 T319) | new `scout retrain`, `scout report`, `scout report-lint`; `scout resolve --repo-type {model,dataset}`; `scout serve --model/--library-manifest/--pins/--ledger`; new exit code 11 ("report lint failed"); everything else unchanged | T414 |
 | `scripts/pin_exit.py` (P1–P4) | `--phase 5`: targets `P5_REPOS`; datasets resolved with `scout resolve --repo-type dataset` and cross-checked with `git ls-remote https://huggingface.co/datasets/<repo> refs/heads/main`; phases 1–4 unchanged | T417 |
 | `scripts/p3_ledger.py` (P3 T218, P4 T321) | none: P5 calls it with `kinds=P5_KINDS` | — |
 | `pyproject.toml` | optional extra `retrain = ["torch>=2.4,<3", "transformers>=4.51,<6", "tokenizers>=0.20,<1"]`; `dev` gains the same three | T404 |
@@ -954,7 +984,9 @@ No P1–P4 test file is edited. No frozen P1–P4 parameter changes.
 | T418 | P5 rehearsal world (test only): P3/P4 stand-in artifacts and ledgers, the rt_family retrain target, a socket-guarded worker, reader stubs | opus | T208, T213, T214, T218, T313, T317, T321, T404, T412 |
 | T419 | P5 offline rehearsal: the whole exit on the rehearsal world with real worker subprocesses, plus failure paths | opus | T417, T418 |
 
-Parallel waves (no shared files within a wave; checked by `/tmp/p5plan/validate_tasks.py`):
+Parallel waves (each task in the earliest wave its dependencies allow; no shared files within a wave; checked by
+`/tmp/p5fin/validate_tasks.py`, which also checks YAML parsing, required keys, dependency existence and acyclicity,
+file disjointness across all tasks, and that this table, the waves, §6 and the ownership table match the task files):
 1. {T401, T402, T404, T415}
 2. {T403, T409}
 3. {T405, T410}

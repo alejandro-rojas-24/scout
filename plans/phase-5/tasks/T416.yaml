@@ -38,6 +38,8 @@ interface: |
                      env: Env5 = Env5()) -> list[Check]                                                                     # C2
         # client = {"retrain_params_digest", "report", "lint", "reader"} literals as imported on the client
     def check_plan(rplan: dict, models: list[tuple[dict, pyarrow.Table]], data_files: list[dict]) -> list[Check]            # C3
+    def check_resources(result: dict, target: dict) -> list[Check]                                                         # C9
+        # = p4.check_resources("retrain", result, target, p4.Env(max_rss_bytes=MAX_RSS_BYTES)) (48 GiB, not P4's bound)
     def check_baseline(retrain_card: dict) -> list[Check]                                                                  # C10
     def check_signal_drop(retrain_card: dict) -> list[Check]                                                               # C11
     def check_quality(retrain_card: dict) -> list[Check]                                                                   # C12
@@ -73,7 +75,8 @@ behavior: |
      job with label "retrain"; C6 additionally requires every data-file request path to be one of the two planned data
      files (done by the runner, T417, as an extra row "data files only"); C7 additionally checks purge.bytes_written ==
      plan.bytes_planned ("no checkpoint written").
-  6. C9: wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <= MAX_RSS_BYTES.
+  6. C9 (check_resources): wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <=
+     MAX_RSS_BYTES (48 GiB; Env5 has no knob for it, so the rehearsal checks the same bound).
   7. C10 (stats.attribution = baseline, stats.retrain.baseline): base reference status tested, null_ok, control_ok;
      attributed fraction of the base over tested blocks >= 0.95; control n_attributed == 0; every recipe block's
      baseline.flagged.attributed True; baseline.ppl within FROZEN_RETRAIN_PARAMS["baseline_ppl_range"].

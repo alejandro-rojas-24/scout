@@ -55,8 +55,13 @@ behavior: |
      sha256 of canonical s2in.
   5. data.cards[object] for every Card used (subject section Cards and references): the subset of plan.md 4.5 copied
      from the Card JSON with the same key paths, so a JSON pointer into the subset resolves exactly as into the full
-     Card. data.model = {"params": {"calibration_note": ...}, "thresholds": ...} copied from the model file with the
-     same key paths (system1 run only, else None).
+     Card. Model mirror (system1 run only): sha = sha256 of the model file bytes (lowercase hex); doc = the parsed file;
+     data.models = {sha: {"params": {"calibration_note": doc["params"]["calibration_note"]}, "thresholds": {"hi":
+     doc["thresholds"]["hi"], "lo": doc["thresholds"]["lo"]}}} (the file's own key paths, so the pointers
+     /params/calibration_note, /thresholds/hi and /thresholds/lo resolve to equal values in the mirror and in the file);
+     inputs.model = {"name": model file basename, "sha256": sha, "citation": cite_model(sha, ...)}. System 1 not run ->
+     data.models = {} and inputs.model = None. Every model source the renderer emits is f"model:{sha}#<one of the three
+     pointers>".
   6. Ledger citations (ledgers read with scripts-free code: the canonical line and hash chain rules of p3_ledger are
      re-implemented read-only here as `read_entries(path) -> list[dict]` with a verify flag; a broken chain -> the
      ledger is recorded as {name, error} and cites nothing):
@@ -89,6 +94,7 @@ acceptance:
     - "test_analysis_inputs: inputs.analysis lists the subject and reference objects in analyze order; data.analysis[0] equals analysis.analyze(...) recomputed in the test"
     - "test_citations: each Card is cited by the matching ledger entry (P3 SCAN card_files, P4_EXIT object, P5_RETRAIN card_object); the model by FREEZE_MODEL; a tampered ledger -> recorded error and no citation"
     - "test_pointer_equivalence: for every summary slot pointer card:<obj>#<ptr>, resolving ptr in data.cards[obj] equals resolving it in the full Card JSON from the store"
+    - "test_model_mirror: data.models has exactly one key, equal to sha256 of the model file and to inputs.model.sha256; for each of /params/calibration_note, /thresholds/hi, /thresholds/lo the pointer resolves to the same value in data.models[sha] and in the parsed model file; all-not-run bundle -> data.models == {} and inputs.model is None"
     - "test_s2_optional: with StubS2Client -> sections.system2 run, data.s2 validates as s2.v1, s2in_sha256 set; without -> not_run 'not requested'"
     - "test_no_network_no_weights: build_bundle under an httpx transport that raises and a socket guard -> succeeds; scout.report.bundle does not import scout.hub/sources/scan/gate (AST walk, transitive over scout.*)"
     - "test_deterministic: build_bundle twice with the same generated_at and code_id -> equal bundle_sha256"

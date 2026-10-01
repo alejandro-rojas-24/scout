@@ -20,7 +20,9 @@ interface: |
     def format_value(value, fmt: str) -> str
     def parse_source(source: str) -> tuple[str, str | None, str]    # (kind, id-or-None, json_pointer); ValueError if malformed
     def resolve_in_bundle(bundle: dict, source: str) -> Any         # card -> data.cards[id]; analysis -> data.analysis[i];
-                                                                    # model -> data.model; ledger -> data.ledger_entries["<name>:<seq>"] (whole entry);
+                                                                    # model -> data.models[id] (id = the 64-hex model sha256;
+                                                                    #   KeyError when absent or != inputs.model.sha256);
+                                                                    # ledger -> data.ledger_entries["<name>:<seq>"] (whole entry);
                                                                     # s2in -> data.s2in; s2 -> data.s2; bundle -> the bundle itself;
                                                                     # RFC 6901 pointer; KeyError if absent
     def data_el(bundle: dict, source: str, fmt: str, *, cls: str | None = None, extra: dict | None = None) -> str
@@ -44,27 +46,30 @@ behavior: |
   5. caveats: <ul class="caveat"> with the three DISCLAIMERS (caveats.DISCLAIMERS) as static text, one <li> each.
   6. subject: key fields; model-card claims labelled "claimed by the model card" (base_model list, relation, licence);
      architecture: one row per stack (prefix, depth), params_total, params_by_dtype, format.
-  7. system1: <p class="semantics">VERDICT_SEMANTICS</p>; table rows per analysis pair: reference title (id),
+  7. system1: <p class="semantics">VERDICT_SEMANTICS</p>; then <p class="thresholds"> with LABELS["thresholds"] and the
+     two decision thresholds as data_el(f"model:{sha}#/thresholds/hi", "f2") and (.../thresholds/lo, "f2"), and the
+     calibration note as data_el(f"model:{sha}#/params/calibration_note", "str") (sha = bundle.inputs.model.sha256; no
+     other model pointer is ever emitted); table rows per analysis pair: reference title (id),
      verdict <td> containing data_el(analysis:0#/pairs/i/system1/verdict, "str", cls "verdict", data-verdict=value),
      p_derived (f2), abstain reason (<span class="reason"> via data_el, only when verdict abstain), structure kind and
-     mode; claims table (claimed_base, status); unclaimed detections; calibration note (source
-     model:<model sha256>#/params/calibration_note,
-     "str"). No verdict word is ever produced by any other code path; sigma-curve r values are never labelled with a
-     verdict.
+     mode; claims table (claimed_base, status); unclaimed detections. No verdict word is ever produced by any other
+     code path; sigma-curve r values are never labelled with a verdict.
   8. system2: heading note LABELS["s2_note"]; per pair: the S2 final verdict as data_el(s2 pointer) with class
      "s2-verdict" (never "verdict": L4a counts only System 1 verdicts, and S2 can only keep or soften them), the reason
      code, and the explanation as escaped prose (LLM text; its digits are checked by L2c).
   9. attribution: an inline SVG depth strip with one <rect> per block, filled by status with the P4 T318 palette; the
      SVG contains no text and no digit (block indices appear only in the table); a table per reference (title id, role,
-     status, n_attributed/n_tested int, control mean f2, control sd f2, crit f2, df int), each cell a data_el into
+     status as data_el(..., "str", cls "attrib-status"), n_attributed/n_tested int, control mean f2, control sd f2, crit f2, df int), each cell a data_el into
      card:<obj>#/stats/attribution/references/j/...; a table per block (index int, status, primary title, z_adj f1,
      p e1, z_pair f1; the reason of an untestable block in <span class="reason">); <p class="caveat">ATTRIBUTION_CAVEAT</p>.
   10. retrain: recipe (blocks int list items, stack prefix id, budget str, seed int, lr str, max_steps int, eval_every
-      int, data repo@sha id, train/eval file id, data licence str), baseline (ppl f2; flagged attributed count int of
-      K int), right after re-initialisation (ppl_ratio f3, top1_agreement f3), trace table (step int, ppl_ratio f3, top1_agreement f3, flagged attributed count int, max flagged z_adj
-      f1), outcome str and stop step int, retrained digest id, "weights kept: no" (static), <p class="caveat">
-      RETRAIN_CAVEAT</p>. Counts that are not stored fields (flagged attributed per row) are rendered one data_el per
-      flagged block (its "attributed" boolean, fmt str) instead of a computed number.
+      int, data repo@sha id, train/eval file id, data licence str), baseline (ppl f2; per flagged block: index int,
+      z_adj f1, attributed str), right after re-initialisation (ppl_ratio f3, top1_agreement f3), trace table (one row
+      per trace row: step int, ppl_ratio f3, top1_agreement f3, then per flagged block one cell with its z_adj f1 and
+      its attributed boolean str; unflagged_attributed int of unflagged_tested int; control_hits int), outcome str and
+      stop step int, retrained digest id, "weights kept: no" (static), <p class="caveat">RETRAIN_CAVEAT</p>. Only
+      stored fields are rendered: no count, maximum or ratio is computed by the renderer (every data_el must satisfy
+      format_value(resolved) == text, so a derived number would be untraceable).
   11. license: table (model title, licence str or LABELS["unknown"]) for subject, references and data; then
       <p class="license-question">LICENSE_QUESTION</p>.
   12. provenance: table of Cards (role, repo@sha id, component, object id, schema, citation ledger/seq/line_sha256
@@ -82,8 +87,10 @@ acceptance:
     - "fixtures: bundles from the T409 test fixtures (full bundle; a bundle with every section not_run except subject; a bundle with S2 via StubS2Client)"
     - "test_deterministic: render(b) == render(copy.deepcopy(b)) byte for byte; changing generated_at changes only the header time and the bundle script"
     - "test_digit_free_templates: every string in SUMMARY_TEMPLATES, SECTION_TITLES, LABELS and CSS-free visible text of a render of a bundle whose data values are all non-numeric contains no digit (templates.py constants checked directly; CSS may contain digits but is inside <style>)"
+    - "test_no_stray_verdict_words: SUMMARY_TEMPLATES, SECTION_TITLES and LABELS have no match of the plan.md 4.8 verdict_regex; in a full render, every verdict_regex match in visible text lies inside one of the plan.md 4.8 verdict_containers (both as literals in the test: scout.report.lint is T411) (a bundle whose attribution reference has status 'abstain' included)"
     - "test_every_value_traced: every digit of a full render's visible text lies inside a <data> element or inside #system2 prose (parsed with html.parser)"
     - "test_data_elements_resolve: for every <data> element: format_value(resolve_in_bundle(bundle, src), fmt) == element text and json.loads(value) == the resolved value"
+    - "test_model_sources: every data-src starting with 'model:' is one of model:<inputs.model.sha256>#/params/calibration_note, #/thresholds/hi, #/thresholds/lo; resolve_in_bundle with another sha -> KeyError"
     - "test_verdicts_only_from_jev: every element with class 'verdict' has data-src matching ^analysis:0#/pairs/\\d+/system1/verdict$; a bundle whose analysis pairs are removed renders no 'verdict' class"
     - "test_sections_and_caveats: the three DISCLAIMERS appear once in #caveats; ATTRIBUTION_CAVEAT once in #attribution; RETRAIN_CAVEAT once in #retrain; LICENSE_QUESTION once in #license inside .license-question; not_run sections carry their reason"
     - "test_self_contained: no 'src=', '<link', '@import' or 'url(' in the output; exactly one <script>, of type application/json"

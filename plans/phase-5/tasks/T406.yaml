@@ -37,9 +37,9 @@ behavior: |
      ids_train = tokenize(inp.tokenizer_json, inp.train_texts); ids_eval likewise; b = budget(inp.budget_name);
      train_w = windows(ids_train, b.seq_len); eval_w = windows(ids_eval, b.seq_len, b.n_eval_seqs); either empty ->
      RetrainError("not enough data tokens for one window"). recipe.data.n_train_tokens / n_eval_tokens = len(ids).
-  3. Forward check: trainer = Trainer(model, [], ...) is NOT created yet; L0, ref = Trainer(model, trainable=[], ...)
-     .baseline(eval_w) with a trainer that owns no optimiser state (Trainer allows trainable=[] for baseline only);
-     ppl0 = exp(L0); baseline.eval_loss/ppl set. ppl0 outside RETRAIN_PARAMS["baseline_ppl_range"] (inclusive) ->
+  3. Forward check (before any re-initialisation): ev = Trainer(model, [], train_w, b, device=inp.device,
+     seed=recipe.seed, abort=abort) (trainable=[] creates no optimiser; T405); L0, ref = ev.baseline(eval_w) (ref = the
+     unmodified subject's argmax tokens, kept in RAM); ppl0 = exp(L0); baseline.eval_loss/ppl set. ppl0 outside RETRAIN_PARAMS["baseline_ppl_range"] (inclusive) ->
      outcome "refused_forward_check", reason f"baseline perplexity {ppl0:.2f} outside [lo, hi]: the forward pass does
      not reproduce the model", trace []; release(model); return.
   4. trainable = reinit_blocks(model, recipe.stack_prefix, recipe.blocks, recipe.reinit.init_std, recipe.reinit.seed);
@@ -50,7 +50,7 @@ behavior: |
   5. For s in 1..b.max_steps: loss = trainer.step(). When s % b.eval_every == 0: (L, agree) = trainer.evaluate(eval_w,
      ref); ov = tensors_of(model, gate_up); att = attribute(inp.attrib_plan, inp.models, inp.vocabs,
      RetrainProvider(inp.provider, ov), computed_at=now()); row = {step: s, train_loss: loss (the last step's),
-     eval_loss: L, ppl_ratio: exp(L - L0), top1_agreement: agree, **summarize(att, blocks) minus nothing,
+     eval_loss: L, ppl_ratio: exp(L - L0), top1_agreement: agree, **summarize(att, blocks),
      signal_dropped, quality_ok = flags(row), wall_s: clock() - t_start}; append; note(f"retrain eval step {s}: ppl_ratio
      {r:.3f} top1 {a:.3f} flagged_attributed {k}/{K}"); keep att as last_att; if both flags: outcome "success",
      stop_step s, final_attribution att; break.

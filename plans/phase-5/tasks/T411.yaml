@@ -17,8 +17,9 @@ interface: |
         require_ledger: bool = False
     def lint(html: bytes, ctx: LintContext) -> dict          # lint.v1 (plan.md 4.6)
     def resolve_source(source: str, ctx: LintContext, bundle: dict) -> Any
-        # card -> the store object's JSON (loaded by object id); model -> the JSON of ctx.model_path whose sha256 must
-        # equal the id; ledger -> the entry read from ctx.ledgers[name] (chain verified); analysis:<i> -> analysis.analyze
+        # card -> the store object's JSON (loaded by object id); model:<sha> -> the parsed JSON of ctx.model_path, only
+        # when sha256(file bytes) == <sha> (else LookupError "model file sha differs"); never data.models of the bundle
+        # (that mirror is what render used; L2b compares the two); ledger -> the entry read from ctx.ledgers[name] (chain verified); analysis:<i> -> analysis.analyze
         # recomputed from inputs.analysis[i] objects loaded from the store and the model file; s2in/s2 -> bundle.data
         # (only inside #system2); bundle -> the embedded bundle (allowed pointers only); unresolvable -> LookupError
     def format_table(result: dict) -> str     # one line per row: f"{id:<4} {name:<28} count {count:>4}  {'PASS' if ok else 'FAIL'}"
@@ -33,7 +34,8 @@ behavior: |
   3. L2a: digits (LINT_PARAMS number_regex matches) in visible text outside <data> elements and outside #system2.
      L2b: for every <data>: parse data-src (render.parse_source; malformed -> count); kind must be in REPORT_PARAMS
      ["sources"]; "bundle" only with pointers under /generated_at, /scout_version, /code_id, /params_digest,
-     /regenerate, /inputs; "s2"/"s2in" only inside #system2; resolve_source (LookupError -> count); count when
+     /regenerate, /inputs; "model" only with pointers /params/calibration_note, /thresholds/hi, /thresholds/lo;
+     "s2"/"s2in" only inside #system2; resolve_source (LookupError -> count); count when
      json.loads(value) != resolved or render.format_value(resolved, data-fmt) != element text.
      L2c: numbers in #system2 prose (outside <data>) that equal no numeric leaf of bundle.data.s2in when both are
      rounded to the number of decimals printed (integers exact).
@@ -42,9 +44,11 @@ behavior: |
      analysis model sha (bundle.inputs.analysis[i].model_sha256) differs from sha256(ctx.model_path file), or (with
      require_ledger) that sha is not the payload.sha256 of the last P3 FREEZE_MODEL entry. L4b: matches of verdict_regex
      in visible text outside every container in LINT_PARAMS["verdict_containers"].
-  6. L5: (a) number of abstain verdicts in the recomputed analysis minus the number of .verdict elements inside
-     #system1 with data-verdict "abstain" whose table row contains a non-empty .reason (summary verdicts are not
-     counted here); (b) attribution references with status abstain or
+  6. L5 (one row; count = |a| + |b| + |c| + |d|): (a) number of abstain verdicts in the recomputed analysis minus the
+     number of .verdict elements whose ancestor chain contains section#system1, with data-verdict "abstain", whose
+     enclosing <tr> contains a non-empty .reason. Verdict elements in #summary (or anywhere outside #system1) are NOT
+     counted: the summary repeats every verdict, so counting it would double-count (they are still checked by L4a);
+     (b) attribution references with status abstain or
      untestable minus rendered reference rows with a .reason; (c) untestable blocks minus rendered block rows with a
      .reason; (d) sections with status not_run without a p.not-run .reason. Each difference counted in absolute value.
   7. L6: for every inputs.cards entry: card_key repo and 40-hex revision present; object exists in the store and
@@ -55,7 +59,8 @@ behavior: |
   8. L7: matches of external_regex in the raw HTML, plus <script> elements other than the one bundle script.
   9. L8: #license missing counts 1; plus case-insensitive occurrences of each license_deny phrase in visible text
      outside license_containers.
-  10. L9: <data> elements whose source pointer ends in /p_derived with fmt != "f2"; ending in /z_adj or /z_pair with
+  10. L9: <data> elements whose source pointer ends in /p_derived, /thresholds/hi or /thresholds/lo with fmt != "f2";
+      ending in /z_adj or /z_pair with
       fmt != "f1"; ending in /p with fmt != "e1".
   11. L10a: render.render(bundle) != html (count 1). L10b: bundle.build_bundle(bundle.subject.target, ReportInputs(
       ctx.store, ctx.model_path, ctx.library_manifest, ctx.pins, ctx.ledgers, ctx.references), generated_at=
@@ -77,6 +82,8 @@ acceptance:
     - "test_model_not_frozen: a model file whose sha differs from the FREEZE_MODEL entry, require_ledger True -> L4a and L6 count it"
     - "test_cosine: a bundle key 'cosine_sim' or visible 'Cosine' -> L3 1"
     - "test_l5_abstain_hidden: remove the .reason of one abstain row -> L5 1; remove a not-run reason -> L5 1"
+    - "test_l5_summary_not_counted: a clean full render with 2 S1 abstentions (each shown in #summary and #system1) -> L5 0; removing the #summary copies of the abstain verdicts -> L5 still 0; removing one #system1 abstain row -> L5 1"
+    - "test_model_source: a data-src model:<other 64 hex>#/thresholds/hi -> L2b 1; model:<sha>#/weights/0 -> L2b 1 (pointer not allowed); ctx.model_path replaced by a file with another sha -> every model data_el counted in L2b and L4a counts the verdicts"
     - "test_l2c_s2_number: S2 explanation containing '0.73' when no s2in leaf rounds to 0.73 -> L2c 1; '0.97' equal to a p_derived shown to S2 -> 0"
     - "test_l7_external: add '<img src=\"https://x/y.png\">' -> L7 1; a second <script> -> L7 1"
     - "test_l8_license_answered: add 'use is permitted' outside the question -> L8 1; the LICENSE_QUESTION itself does not count"
