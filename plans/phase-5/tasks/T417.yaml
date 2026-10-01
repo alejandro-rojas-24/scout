@@ -1,0 +1,111 @@
+id: T417
+title: "P5 exit runner - scripts/exit_check_p5.py (freeze, plan, run, reports, reader-form, read, exit) with the script-written P5 ledger, store population from the P3/P4 artifacts, exit/pins_p5.json, pin_exit --phase 5 (dataset pins), .gitignore"
+depends_on: [T321, T408, T414, T416]
+files:
+  - scripts/exit_check_p5.py
+  - exit/pins_p5.json
+  - scripts/pin_exit.py
+  - .gitignore
+  - tests/test_exit_check_p5_units.py
+  - tests/test_pin_exit_p5.py
+  - tests/test_exit_p5_network.py
+route: opus
+spec_complete: true
+interface: |
+  exit/pins_p5.json (committed as, keys sorted): {"HuggingFaceTB/SmolLM2-360M": "UNPINNED", "Qwen/Qwen2.5-0.5B": "UNPINNED",
+    "Qwen/Qwen2.5-0.5B-Instruct": "UNPINNED", "Salesforce/wikitext": "UNPINNED"}
+  .gitignore: += "cards/p5-store/", "reports/"
+  scripts/pin_exit.py: --phase {1,2,3,4,5}; phase 5 targets = sorted(exit_expectations_p5.P5_REPOS), default pins
+    exit/pins_p5.json; the data repo (P5_RETRAIN_TARGET["data"]["repo"]) is resolved with `scout resolve <repo>
+    --repo-type dataset` and cross-checked with `git ls-remote https://huggingface.co/datasets/<repo> refs/heads/main`;
+    HF_TOKEN optional for phase 5 (passed through GIT_CONFIG_* env when set, P2 D29); phases 1-4 unchanged.
+  scripts/exit_check_p5.py:
+    P5_KINDS = ("P5_FREEZE", "P5_PREFLIGHT", "P5_PLAN", "P5_ATTEMPT", "P5_RETRAIN", "P5_REPORTS", "P5_READER", "P5_EXIT")
+    DEFAULTS = {"pins": "exit/pins_p5.json", "pins_p3": "exit/pins_p3.json", "pins_p4": "exit/pins_p4.json",
+                "ledger": "exit/ledger_p5.jsonl", "ledger_p3": "exit/ledger_p3.jsonl", "ledger_p4": "exit/ledger_p4.jsonl",
+                "store": "cards/p5-store", "cards_p3": "cards/p3", "store_p4": "cards/p4-store", "out": "reports/p5",
+                "model": "models/jev_v1.json", "manifest": "library/manifest.yaml", "form": "exit/reader_human.yaml"}
+    def worker_retrain_env(backend: Backend, timeout_s: float = 120.0) -> dict   # args ["retrain-env"], one JSON line
+    def populate_store(store: CardStore, cards_p3: Path, store_p4: Path, keys_p4: list[dict]) -> dict
+        # import_tree(cards_p3); for each key in keys_p4: every entry of store_p4 with that key -> export to a tmp dir ->
+        # import_tree (byte-identical); returns {"imported_p3": n, "imported_p4": m}
+    def main(argv: list[str] | None = None, *, backend_factory: Callable[[str], Backend] | None = None,
+             retrain_target: dict | None = None, report_targets: tuple[dict, ...] | None = None,
+             pins: dict[str, dict] | None = None,               # {"p5": {...}, "p3": {...}, "p4": {...}} (rehearsal)
+             env: Env5 | None = None, client_factory: Callable[[], httpx.Client] | None = None,
+             endpoint: str | None = None, code_state: Callable[[Path], dict] | None = None,
+             s2_client_factory: Callable[[], S2Client] | None = None, expected_reader_host: str = "api.anthropic.com",
+             allow_local_targets: bool = False, now: Callable[[], str] | None = None) -> int
+      # subcommands: freeze | plan | run | reports | reader-form | read | exit
+      # flags: every DEFAULTS key as --<key with '_' -> '-'>; --backend (plan, run; required); --confirm-plans ID:CAP
+      # (run; required; P2 parse_confirm_plans); --reader llm|human (read; required); --answers FILE (read human);
+      # --waive-human REASON (read human, instead of --answers); --refreeze-reason TEXT (freeze); --s2-model ID (read llm)
+      # keyword arguments exist for the offline rehearsal only; no CLI flag overrides a target or a threshold
+behavior: |
+  1. Common start: foreign HF_ENDPOINT -> exit 1 (P1 message); pins = the three files (or the keyword); C0 =
+     check_target_set(...) -> FAIL: print the table and exit 1 before any request, appending nothing; ledger problems
+     (p3_ledger.verify(ledger, kinds=P5_KINDS)) -> "LEDGER BROKEN", exit 1. code = (code_state or
+     scout.jobs.runner.code_identity)(repo_root).
+  2. freeze: payload = {params: {retrain, report, lint, reader literals as imported}, params_sha256, retrain_target,
+     report_targets, pins_sha256 (sha256 of the pins_p5 file bytes, or of canonical JSON of the keyword dict),
+     model_sha256, cited_ledgers {p3, p4: {last_seq, last_line_sha256} or null when the file is absent},
+     refreeze_reason, git_commit, code_id, code_dirty}. Rows C0 and C2 (step "freeze": literals and targets only).
+     The last P5_FREEZE with an identical payload apart from refreeze_reason -> "already frozen", exit 0, nothing
+     appended. A P5_ATTEMPT or P5_REPORTS after the last P5_FREEZE and no --refreeze-reason -> exit 5 "refreeze needs
+     --refreeze-reason". Else append P5_FREEZE and print {"step": "FREEZE", "phase": 5, "hostname", "ledger_seq", ...}.
+  3. plan and run start with populate_store (keys_p4 = the report targets whose "pins" is "p4", keyed by their pins);
+     missing Cards for any report target or the retrain subject -> a C0 row "missing Card: run the P3/P4 exit first",
+     exit 1.
+  4. plan: backend; hello = worker_hello; renv = worker_retrain_env; C1 (disk_needed 0); C2 (step "plan"); result =
+     scout.retrain.client.retrain(subject@pin, base=base@pin, controls=[control@pin], blocks, data=DataSpec(repo, pin,
+     train, eval), budget_name=env.budget, store, backend, plan_only=True, hello=hello, client=client_factory() if given
+     wrapped in scripts.exit_check.CountingTransport, gate_threshold_bytes (keyword override only in the rehearsal via
+     retrain_target["gate_threshold_bytes"])); rows C3 (models loaded from the store), C4a (plan-time client
+     totals.weight == 0 and no ranged request on the client wire), C1 again with disk_needed = plan disk_bytes. Print
+     "CONFIRM WITH: --confirm-plans <id>:<cap>" and "TOTAL CAP: <cap> B". Append P5_PLAN; exit 0 iff all rows ok.
+     P5_PREFLIGHT {hello, retrain_env, checks, git_commit, code_id} is appended before P5_PLAN in the same step.
+  5. run: the steps of plan, without appending P5_PREFLIGHT or P5_PLAN (the plan id must equal the last P5_PLAN's,
+     else "plan changed since P5_PLAN", exit 1, nothing appended); C2 (step "run"); audit_before = worker_audit; prior_attempts = earlier P5_ATTEMPT entries with
+     the same plan id; append P5_ATTEMPT BEFORE the job; retrain(..., confirm_plan/confirm_bytes from --confirm-plans only
+     when that exact pair is listed, wire_audit True); audit_after; rows C3-C14 with T416 (C4-C8 via the P4 functions,
+     C6 plus the "data files only" row, C7 plus "no checkpoint written", C14 with scout.view.build_view of the stored
+     Card v4). Any exception -> the job's rows FAIL with the error text. Append P5_RETRAIN (always; payload plan.md 4.9
+     with the evidence of plan.md 2.3) and print the table and {"step": "RETRAIN", ...}. Exit 0 iff every row ok.
+  6. reports: requires a P5_RETRAIN with passed true after the last P5_FREEZE (else exit 1 "no passing P5_RETRAIN").
+     For each report target (order of P5_REPORT_TARGETS): target string repo@pin[#component]; inputs = ReportInputs(
+     store, model, manifest, pins_p3 file (or a temp file of the keyword dict), ledgers {p3, p4, p5}); bundle =
+     build_bundle(target, inputs, generated_at=now(), code_id=code.code_id); html = render(bundle); write
+     out/<label>.html; lint with require_ledger env.require_ledger; key sha = reader.key_sha256(reader.answer_key(bundle));
+     rows C15 (reports_entry None). Append P5_REPORTS {reports: {label: {file_name, sha256, bytes, lint_ok, lint_rows,
+     answer_key_sha256, bundle_sha256}}, passed, git_commit, code_id}. Exit 0 iff all ok.
+  7. reader-form: requires P5_REPORTS; writes reader.reader_form({label: extract_bundle(file)}) to --form; appends
+     nothing; prints the path.
+  8. read: requires the last P5_REPORTS after the last P5_FREEZE and every file's sha256 equal to it (else exit 1
+     "reports changed since P5_REPORTS"). llm: client = RecordingS2Client(s2_client_factory() if given else
+     AnthropicS2Client()); config = S2Config.from_env(--s2-model or READER_PARAMS["llm_model"]); per report answers, raw =
+     llm_read(html, client, config); score; C16 rows (expected_host = expected_reader_host). human: parse_human(--answers)
+     -> scores -> C17 rows; or --waive-human REASON -> one WAIVED row. Append P5_READER (plan.md 4.9; answers_sha256 =
+     sha256 of canonical JSON of all answers; reports_seq = the P5_REPORTS seq). Exit 0 iff all rows ok.
+  9. exit: C0; C2 (step "exit"); the last P5_RETRAIN after the last P5_FREEZE: its recorded rows C3-C9 must all be ok
+     and C10-C14 are re-evaluated from the stored Card (store.load by card_object); C15 re-lints every file and
+     compares its sha256 with the last P5_REPORTS; C16 and C17 from the last P5_READER of each reader whose reports_seq
+     equals that P5_REPORTS seq. Print the table, the waivers and "EXIT CHECK (P5): PASS|FAIL"; append P5_EXIT (also
+     after an exception) and print {"step": "EXIT", "phase": 5, ...}. Exit 0 iff every row ok.
+  10. Stdin is never read; every confirmation comes from --confirm-plans.
+acceptance:
+  tests:
+    - "test_pins_file: exit/pins_p5.json has exactly the 4 repos with 'UNPINNED'"
+    - "test_pin_exit_p5: fake run_cmd where scout resolve (with --repo-type dataset for the data repo) and git ls-remote (datasets/ URL for the data repo) agree -> 4 pins written; disagreement -> non-zero, nothing written; HF_TOKEN unset -> still runs (exit 0)"
+    - "test_c0_before_request: pins_p5 with a model pin different from pins_p3 -> every subcommand exits 1 with C0 FAIL, no backend or client call, nothing appended"
+    - "test_freeze_idempotent_and_refreeze: freeze twice -> one P5_FREEZE; after a fake P5_ATTEMPT entry, freeze with changed code_id -> exit 5; with --refreeze-reason -> appended with the reason"
+    - "test_ledger_broken: one flipped byte -> LEDGER BROKEN exit 1"
+    - "test_populate_store_byte_identical: P3-layout cards and a P4-style store fixture -> imported objects have the same object ids as their sources"
+    - "test_read_requires_reports_unchanged: a report file edited after P5_REPORTS -> read exits 1 'reports changed since P5_REPORTS'"
+    - "test_exit_p5_network (tests/test_exit_p5_network.py): @pytest.mark.network; skipped unless SCOUT_P5_CONFIRM_PLANS and SCOUT_SPARK_HOST are set; runs main(['run', '--backend', 'ssh:' + host, '--confirm-plans', value]) == 0"
+  commands:
+    - pytest -q tests/test_exit_check_p5_units.py tests/test_pin_exit_p5.py
+    - pytest -q
+out_of_scope:
+  - the end-to-end offline rehearsal (T418 world, T419 tests); running E1-E8 on real hosts (environment; plan.md 2.5)
+invariants_touched: [1, 2, 5]
+decisions: [D93, D94, D95, D97]

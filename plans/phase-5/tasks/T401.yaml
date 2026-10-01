@@ -1,0 +1,103 @@
+id: T401
+title: "Card v4 - stats.retrain slot written only by with_retrain, retrain.v1 validator, scout/caveats.py (RETRAIN_CAVEAT, LICENSE_QUESTION, re-exported DISCLAIMERS and ATTRIBUTION_CAVEAT), shared test helper for retrain records"
+depends_on: [T306, T314, T318]
+files:
+  - scout/caveats.py
+  - scout/card.py
+  - tests/helpers/retrain_records.py
+  - tests/test_card_v4.py
+  - tests/test_caveats.py
+route: opus
+spec_complete: true
+interface: |
+  scout/caveats.py (imports nothing from scout; stdlib only):
+    DISCLAIMERS: tuple[str, str, str]        # by value, equal to scout.view.DISCLAIMERS (P1 T011), same order
+    ATTRIBUTION_CAVEAT: str                  # by value, equal to scout.attrib.ATTRIBUTION_CAVEAT (P4 T314)
+    RETRAIN_CAVEAT: str                      # plan.md 4.3, verbatim, one line
+    LICENSE_QUESTION: str                    # plan.md 4.3, verbatim, one line
+    def is_digit_free(text: str) -> bool     # not any(c.isdigit() for c in text)
+
+  scout/card.py (additions to P4 T306; card.py imports scout.caveats and nothing new otherwise; it must still not import
+  scout.attrib, scout.fullplan, scout.gate, scout.scan, scout.hub or scout.sources):
+    SCHEMA_VERSION = "card.v3"                                             # UNCHANGED
+    SUPPORTED_SCHEMA_VERSIONS = ("card.v0", "card.v1", "card.v2", "card.v3", "card.v4")
+    RETRAIN_VERSION = "retrain.v1"
+    RETRAIN_OUTCOMES = ("success", "signal_persists", "quality_not_recovered", "neither", "refused_baseline",
+                        "refused_forward_check")
+    def validate_retrain(r: dict) -> list[str]                            # [] when r is a valid retrain.v1 (plan.md 4.2)
+    def numeric_list_max_len(obj, *, skip_keys: Collection[str] = ()) -> int
+        # longest list whose elements are all int/float (bool excluded), searched recursively; dict keys in skip_keys
+        # are not descended into
+    def with_retrain(card: dict, table: pyarrow.Table, attribution: dict, retrain: dict, extra_log: dict,
+                     out_dir: pathlib.Path) -> BuiltCard
+    def load_card(json_path) -> tuple[dict, pyarrow.Table]               # accepts v0..v4 (returned as stored)
+
+  tests/helpers/retrain_records.py (test-only; used by T401, T406, T409-T413 tests):
+    def make_attribution(n_blocks: int = 8, *, attributed: Sequence[int] = (), base_title: str = "org/base@aaaaaaaaaaaa",
+                         control_title: str = "org/control@bbbbbbbbbbbb") -> dict      # a valid attribution.v1
+    def make_retrain(*, blocks: Sequence[int] = (2, 5), outcome: str = "success", n_rows: int = 3, eval_every: int = 50,
+                     parent_key: dict | None = None, parent_object: str = "0" * 64, n_blocks: int = 8) -> dict   # valid retrain.v1
+behavior: |
+  1. caveats.py holds the four texts. RETRAIN_CAVEAT and LICENSE_QUESTION are exactly the plan.md 4.3 strings joined into
+     one line (single spaces where the plan wraps). DISCLAIMERS and ATTRIBUTION_CAVEAT are copied by value; tests assert
+     equality with scout.view.DISCLAIMERS and scout.attrib.ATTRIBUTION_CAVEAT (so caveats.py itself never imports them).
+  2. validate_retrain(r) returns one message per problem (never raises):
+     a. version == "retrain.v1"; params is a dict; budget in ("exit", "rehearsal").
+     b. recipe has every plan.md 4.2 key with the stated types; blocks is a non-empty list of distinct ints in ascending
+        order; recipe_id == recipe_digest[:16]; recipe_digest is 64 lowercase hex; trainable has 3 * len(blocks)
+        strings; optimizer.name == "adamw"; data has every key (license may be None).
+     c. env has every key; device in ("cuda", "cpu").
+     d. baseline: eval_loss/ppl float or None; flagged is a list with one entry per recipe block, in block order, each
+        with index/z/z_adj/z_pair/crit/attributed keys; ok bool; reason str or None (None iff ok).
+     d2. reinit: None for the refused outcomes, else a dict with float eval_loss, ppl_ratio, top1_agreement.
+     e. trace: list of rows with every plan.md 4.2 key; steps strictly increasing, each a positive multiple of
+        recipe.eval_every and <= recipe.max_steps; each row's flagged lists the recipe blocks in order;
+        signal_dropped == (base_status == "tested" and null_ok and control_ok and not any(f["attributed"] for f in
+        flagged)); quality_ok == (ppl_ratio <= params.max_ppl_ratio and top1_agreement >= params.min_top1_agreement).
+     f. outcome in RETRAIN_OUTCOMES. "success" -> stop_step equals the step of the FIRST row with signal_dropped and
+        quality_ok, and that row exists. "signal_persists"/"quality_not_recovered"/"neither" -> no row has both flags, the
+        last row's step == recipe.max_steps rounded down to a multiple of eval_every, stop_step None, and the outcome
+        matches the last row's flags (quality_ok and not dropped / dropped and not quality_ok / neither).
+        "refused_baseline" -> baseline.ok False, trace == [], final_attribution None, retrained_digest None.
+        "refused_forward_check" -> baseline.ok True, trace == [], final_attribution None, retrained_digest None.
+     g. final_attribution is None or validates with validate_attribution (P4 T306); for a non-refused outcome it is not
+        None. retrained_digest matches ^sha256:[0-9a-f]{64}$ for non-refused outcomes.
+     h. weights_kept is False (the literal False, not falsy); lineage has parent (card key dict), parent_object (64
+        hex), relation == "partial-mlp-retrain", statement == RETRAIN_CAVEAT; caveat == RETRAIN_CAVEAT;
+        license.question == LICENSE_QUESTION.
+     i. numeric_list_max_len(r, skip_keys={"final_attribution"}) <= 64 ("retrain record holds a numeric list longer than
+        64: weights are never stored").
+     j. job is None or {job_id, host, plan_id}; computed_at ends with "Z".
+  3. with_retrain(card, table, attribution, retrain, extra_log, out_dir): problems = validate_attribution(attribution) +
+     validate_retrain(retrain); any -> ValueError listing them. Compose the new Card exactly as P4 with_attribution does
+     (same deep copy of the input Card, stats.attribution = attribution, the same fetch_log replacement from extra_log),
+     then set schema_version = "card.v4" and stats["retrain"] = retrain (inserted as the LAST stats key). The Parquet
+     table is the input table unchanged except for the schema metadata schema_version "card.v4". Write both files with
+     the same writer and paths as with_attribution (card_paths(out_dir, repo, sha, component)) and return the BuiltCard.
+     The input Card must be card.v3 (else ValueError "with_retrain needs a card.v3 header-scan Card").
+  4. load_card accepts card.v4 and returns it as stored. build_card, with_attribution, upgrade_to_v3 and object_id are
+     unchanged (SCHEMA_VERSION stays "card.v3").
+  5. retrain_records.make_retrain builds a record that passes validate_retrain: recipe from the given blocks
+     (stack_prefix "model.layers", max_steps = eval_every * n_rows), trace rows at eval_every, 2 * eval_every, ...;
+     for outcome "success" the last row has both flags; reinit {"eval_loss": 3.5, "ppl_ratio": 1.3, "top1_agreement":
+     0.8} for non-refused outcomes, None otherwise; env device "cpu"; final_attribution = make_attribution(n_blocks,
+     attributed=[all blocks not in `blocks`]); retrained_digest "sha256:" + "ab" * 32; lineage parent parent_key or
+     {"repo": "org/subject", "revision_sha": "c" * 40, "component": None}.
+acceptance:
+  tests:
+    - "test_caveats_equal: caveats.DISCLAIMERS == tuple(scout.view.DISCLAIMERS); caveats.ATTRIBUTION_CAVEAT == scout.attrib.ATTRIBUTION_CAVEAT; RETRAIN_CAVEAT and LICENSE_QUESTION equal the plan literals (asserted as exact strings in the test)"
+    - "test_caveats_digit_free: is_digit_free holds for all six texts (three disclaimers, attribution caveat, retrain caveat, licence question)"
+    - "test_caveats_imports: in a subprocess, import scout.caveats -> no other scout module in sys.modules"
+    - "test_validate_retrain_ok: make_retrain() for each outcome success, signal_persists, quality_not_recovered, neither, refused_baseline, refused_forward_check -> []"
+    - "test_validate_retrain_rules: one mutated copy per rule 2a-2j (e.g. stop_step pointing at the second qualifying row, a trace step not a multiple of eval_every, weights_kept 0, a 65-float list in trace, statement changed, license.question changed) -> a problem naming the field"
+    - "test_with_retrain_roundtrip: a v3 header-scan Card from the P1 cards helper + make_attribution + make_retrain -> files written; load_card returns schema card.v4, stats keys == v3 stats keys + ['retrain'] in that order; Parquet metadata schema_version card.v4; object_id of the two files is stable across two identical writes"
+    - "test_with_retrain_rejects: a v2 Card -> ValueError; an invalid retrain -> ValueError with the problems"
+    - "test_v3_unchanged: SCHEMA_VERSION == 'card.v3'; build_card still writes card.v3 (the P4 test_v3_plain expectations hold); a v3 Card has no 'retrain' key in stats"
+    - "test_card_imports: static AST check: scout/card.py imports none of scout.attrib, scout.fullplan, scout.gate, scout.scan, scout.hub, scout.sources"
+  commands:
+    - pytest -q tests/test_card_v4.py tests/test_caveats.py
+    - pytest -q
+out_of_scope:
+  - building retrain.v1 (T406); the job and client (T407, T408); view rendering (T413)
+invariants_touched: [1, 5]
+decisions: [D83, D92]

@@ -1,0 +1,112 @@
+id: T403
+title: "RETRAIN_PARAMS and the retrain plan - subject refusals, dataset file resolution and limits, recipe and recipe digest, FullPlan with every subject tensor plus the unchanged P4 attribution reads, plan_id, format_retrain_plan"
+depends_on: [T310, T401, T402, T404]
+files:
+  - scout/retrain/__init__.py
+  - scout/retrain/params.py
+  - scout/retrain/plan.py
+  - tests/test_retrain_plan.py
+route: opus
+spec_complete: true
+interface: |
+  scout/retrain/__init__.py: docstring only (no imports: `import scout.retrain` must not import torch).
+  scout/retrain/params.py (stdlib + scout.errors only):
+    RETRAIN_PARAMS: dict                     # EXACTLY the plan.md 4.8 literal
+    def retrain_params_digest() -> str       # sha256(json.dumps(RETRAIN_PARAMS, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    def budget(name: str) -> dict            # RETRAIN_PARAMS["budgets"][name]; unknown -> ValueError
+    class RetrainRefused(ScoutError):        # exit code 10
+        exit_code = 10
+  scout/retrain/plan.py (imports scout.fullplan, scout.retrain.params, scout.card (validate only), scout.caveats; never torch):
+    @dataclass(frozen=True)
+    class DataSpec:
+        repo: str; revision: str; train_file: str; eval_file: str
+        # repo: a Hub dataset id (owner/name; revision 40-hex when pinned) or an absolute local folder (the offline
+        # rehearsal; revision = the P1 LocalSource stat hash, lfs_sha256 None)
+    @dataclass(frozen=True)
+    class DataFile:
+        repo: str; revision_sha: str; path: str; size: int; lfs_sha256: str | None
+        def to_dict(self) -> dict
+    @dataclass(frozen=True)
+    class RetrainPlan:
+        plan: FullPlan; attrib_plan: FullPlan; data_files: list[DataFile]; data_bytes: int; recipe: dict; recipe_digest: str
+        @property attrib_plan_id -> str      # attrib_plan.plan_id
+        @property plan_id -> str             # plan.plan_id
+        def to_dict(self) -> dict            # {"plan": plan.to_dict(), "attrib_plan_id", "data_files", "data_bytes", "recipe", "recipe_digest"}
+    def check_subject(subject: LoadedModel) -> None
+    def resolve_data(files: list[RepoFile], spec: DataSpec, revision_sha: str) -> list[DataFile]
+    def build_recipe(subject: LoadedModel, base: LoadedModel, controls: list[LoadedModel], blocks: list[int],
+                     data_files: list[DataFile], budget_name: str, data_license: str | None) -> dict
+    def recipe_digest(recipe: dict) -> str
+    def plan_retrain(subject: LoadedModel, base: LoadedModel, *, controls: list[LoadedModel], blocks: list[int],
+                     data_files: list[DataFile], budget_name: str, data_license: str | None = None,
+                     threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES, host: str | None = None,
+                     scratch_root: str | None = None, disk_free_bytes: int | None = None) -> RetrainPlan
+    def format_retrain_plan(rp: RetrainPlan, *, licenses: dict | None = None) -> str
+    def data_source(spec: DataSpec, log: ByteLog, *, client=None, endpoint=None, token=None) -> Source
+    def data_license(source: Source) -> str | None
+    def confirm_line(rp: RetrainPlan) -> str     # f"CONFIRM WITH: --confirm-plan {plan_id} --confirm-bytes {bytes_cap}"
+behavior: |
+  1. check_subject(m) raises RetrainRefused with these messages, in this order: key.component not None ->
+     "retrain needs a single-unit subject (no #selector)"; weights.format != "safetensors" or weights.quant not None ->
+     "retrain needs an unquantised safetensors subject"; config.model_type not in RETRAIN_PARAMS["model_types"] ->
+     f"model_type {t} is not supported for retraining (supported: llama, qwen2, qwen3, mistral)"; stats.tokenizer_minhash
+     is None or its source_file != "tokenizer.json" -> "retrain needs the subject's tokenizer.json".
+  2. resolve_data(files, spec, sha): both spec files must be in files (else RetrainRefused f"data file {p} not in
+     {repo}@{sha[:12]}"); each path ends with ".parquet" or ".txt" (else RetrainRefused "data files must be Parquet
+     (text column) or .txt"); sizes known; sum <= RETRAIN_PARAMS["data_max_bytes"] (else RetrainRefused f"data files
+     total {n} B > {max} B (data_max_bytes)"). Returns [train, eval] DataFiles with lfs_sha256 from the RepoFile.
+  3. build_recipe: b = budget(budget_name); select_stack(subject) (P4 T310) gives the tested stack; blocks must be a
+     non-empty subset of its tested blocks (else RetrainRefused f"block {i} is not a tested block of {prefix}"), sorted
+     ascending, distinct. init_std = config.raw.get("initializer_range", RETRAIN_PARAMS["init_std_default"]).
+     trainable = for each block, the gate, up and down tensor names of that block (gate/up from roles_by_block; down =
+     the Parquet row with rel name "mlp.down_proj.weight" of that block, else RetrainRefused "no mlp.down_proj.weight in
+     block {i}"). Recipe dict = plan.md 4.2 `recipe` without recipe_id/recipe_digest and with data n_train_tokens and
+     n_eval_tokens = None (filled by the worker), data license = data_license, base/controls {card_key, title}.
+     recipe_digest(recipe) = sha256 of canonical JSON of {"recipe": recipe minus the data token counts, "params":
+     RETRAIN_PARAMS}; the returned recipe then gets recipe_digest and recipe_id = digest[:16].
+  4. plan_retrain: check_subject(subject); recipe = build_recipe(subject, base, controls, blocks, data_files,
+     budget_name, data_license) (it carries recipe_digest); ap = fullplan.plan_attribution(subject, [base], controls=controls,
+     threshold_bytes=threshold_bytes, host=host, scratch_root=scratch_root, disk_free_bytes=disk_free_bytes). The subject
+     ModelPlan is extended: every Parquet row of the subject not already read by ap gets a FullRead(role "train",
+     block_index = the row's block_index or -1, the same absolute-range rule as T310 behavior 1), appended in Parquet
+     row order after the attribution reads. reads = the subject's extended reads, then the other models' reads
+     unchanged (plan order). bytes_planned = sum; slack, bytes_cap, disk_bytes by T310's slack_bytes rule;
+     memory_peak_bytes = ap.memory_peak_bytes + 16 * subject.card["weights"]["params_total"]; reason = ap.reason +
+     f"; retrain: every tensor of {subject title} (MLP of blocks {blocks})". plan_id = sha256(json.dumps(["retrain.v1",
+     ap.plan_id, [[r.path, r.start, r.end_exclusive] for subject reads], [[d.repo, d.revision_sha, d.path, d.size,
+     d.lfs_sha256] for data_files], recipe_digest], separators=(",", ":")).encode()).hexdigest()[:16]. The FullPlan is
+     dataclasses.replace(ap, plan_id=..., models=[extended subject] + ap.models[1:], reads=..., bytes...). data_bytes =
+     sum of data sizes. RetrainPlan.attrib_plan = ap (unchanged; the loop fingerprints with it).
+  4b. def data_source(spec: DataSpec, log: ByteLog, *, client=None, endpoint=None, token=None) -> Source: a HubSource(
+     spec.repo, spec.revision, log, repo_type="dataset", client=..., endpoint=..., token=...) when spec.repo matches
+     scout.hub.REPO_RE, else LocalSource(spec.repo, log) (absolute path required, else ValueError). Also
+     def data_license(source: Source) -> str | None: README.md via source.read_file -> scout.metadata's model-card
+     parser (P1 T007) license field (license_name when license is "other"), None when absent.
+  5. Invariant: the subject's reads cover every tensor exactly once (sum of read sizes == weights.tensor_bytes_total;
+     asserted inside plan_retrain, AssertionError otherwise).
+  6. format_retrain_plan(rp, licenses): lines = fullplan.format_full_plan(rp.plan), then "DATA (meta class, read in
+     META, not weight bytes):", one line per data file f"  {repo}@{sha[:12]}/{path}  {size} B  sha256 {lfs[:12] or
+     '-'}", f"  total {data_bytes} B (limit {data_max_bytes} B)", then "RECIPE {recipe_id}:" and one line per key
+     (blocks, reinit, trainable count, objective, optimizer, batch x seq, max_steps, eval_every, seed, stop rule =
+     RETRAIN_PARAMS["stop_rule"], thresholds max_ppl_ratio/min_top1_agreement), then the licences (licenses dict
+     {"subject": str|None, "references": [{title, license}], "data": str|None}; "unknown" for None) and LICENSE_QUESTION,
+     then RETRAIN_CAVEAT.
+acceptance:
+  tests:
+    - "fixtures: T404 rt_family (base, derived, control) scanned into a tmp store with tokenizer=True (header scans, 0 weight bytes); LoadedModel from the store; a FakeHub dataset repo (T402) serving rt_family data"
+    - "test_params_literal: RETRAIN_PARAMS equals the plan.md 4.8 literal (asserted as a literal in the test); budget('exit')['max_steps'] == 2000; budget('x') -> ValueError; RetrainRefused().exit_code == 10"
+    - "test_plan_reads_all_subject_tensors: plan_retrain(derived, base, controls=[control], blocks=[2, 5], ...) -> subject reads cover every Parquet row once; sum == weights.tensor_bytes_total; base/control reads equal plan_attribution's for the same models; bytes_cap follows slack_bytes"
+    - "test_plan_id_depends_on_recipe: changing blocks, budget name, a data file size or the data sha changes plan_id; the same inputs twice give the same plan_id"
+    - "test_refuse_subjects: a TE pipeline subject with selector, a GGUF subject (T313 write_gguf_repo), a model_type 'gemma2' config, a subject without tokenizer.json -> RetrainRefused with the exact messages, before any read"
+    - "test_blocks_invalid: block 99 -> RetrainRefused naming it"
+    - "test_data_source_kinds: data_source for 'org/data' -> HubSource with repo_type 'dataset'; for an absolute path -> LocalSource; a relative path -> ValueError; data_license reads the README front matter (cc0-1.0 for rt_family data)"
+    - "test_data_limits: data files summing to 32 MiB + 1 -> RetrainRefused; a .json data file -> RetrainRefused; a missing file -> RetrainRefused"
+    - "test_format: format_retrain_plan contains 'FULL DOWNLOAD GATE', 'DATA (meta class', 'RECIPE ', the stop rule, LICENSE_QUESTION and RETRAIN_CAVEAT; confirm_line format"
+    - "test_no_torch_import: in a subprocess, import scout.retrain.plan -> 'torch' not in sys.modules"
+  commands:
+    - pytest -q tests/test_retrain_plan.py
+    - pytest -q
+out_of_scope:
+  - downloading, training, the worker (T405-T407); CLI (T414)
+invariants_touched: [1, 2]
+decisions: [D81, D84]

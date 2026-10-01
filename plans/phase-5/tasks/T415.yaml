@@ -1,0 +1,56 @@
+id: T415
+title: "Usage notes - docs/usage-notes.md (format, seeded wishes from later.md) and scripts/usage_notes.py (check, triage by the frozen rule, record a triage decision)"
+depends_on: []
+files:
+  - docs/usage-notes.md
+  - scripts/usage_notes.py
+  - tests/test_usage_notes.py
+route: sonnet
+spec_complete: true
+interface: |
+  docs/usage-notes.md: a short header (what a note is, the line format, the triage rule of plan.md 3.10, verbatim), then
+  a line "## Notes", then one note per line. Seeded notes (exactly these four lines, in this order):
+    - 2026-09-29 | ui | wish | subtree-collapse | Collapse and expand subtrees in the module graph (seeded from P1 later.md / FUTURE_IMPROVEMENTS)
+    - 2026-09-29 | ui | wish | ui-job-gate-panel | Start attribution and retrain jobs from the UI, with a gate panel and a live job panel (seeded from P4 later.md)
+    - 2026-09-29 | ui | wish | ui-system2 | Run System 2 commentary from the report view (seeded from P3 later.md)
+    - 2026-09-29 | report | wish | release-date-direction | Show release dates next to base-model claims (seeded from P3 later.md)
+  scripts/usage_notes.py (stdlib only; no scout imports):
+    AREAS = ("scan", "diff", "analyze", "attribute", "retrain", "report", "ui", "cli", "jobs", "store")
+    KINDS = ("bug", "blocker", "friction", "wish")
+    LINE_RE = re.compile(r"^- (\d{4}-\d{2}-\d{2}) \| ([a-z]+) \| ([a-z-]+) \| ([a-z0-9]+(?:-[a-z0-9]+)*) \| (.+)$")
+    CHECK_RE = re.compile(r"\b[CL]\d{1,2}[ab]?\b")
+    @dataclass(frozen=True)
+    class Note:
+        date: str; area: str; kind: str; key: str; text: str; line_no: int
+    def parse(text: str) -> tuple[list[Note], list[str]]       # (notes incl. triage lines, problems)
+    def triage(notes: list[Note]) -> list[dict]
+        # [{"key", "area", "dates": [str], "kinds": [str], "rule": "bug-or-blocker"|"two-dates"|"blocks-exit-check",
+        #   "notes": [text]}] for keys that meet the rule and have no triage line yet; sorted by key
+    def triage_line(date: str, key: str, target: str) -> str  # f"- {date} | triage | - | {key} | -> {target}"
+    def main(argv: list[str] | None = None) -> int
+      # usage_notes.py check [--file PATH]            -> prints problems; exit 0 iff none
+      # usage_notes.py triage [--file PATH] [--json]  -> prints candidates; exit 0 (1 if the file has problems)
+      # usage_notes.py record KEY TARGET [--file PATH] [--date YYYY-MM-DD]   -> appends triage_line; TARGET matches
+      #     ^T\d{3}$ or == "later.md"; exit 0
+behavior: |
+  1. parse: only lines starting with "- " after the "## Notes" line are notes; each must match LINE_RE; area must be
+     in AREAS (or "triage" with kind "-" and text starting with "-> "); kind in KINDS for non-triage lines; the date
+     must be a valid calendar date. Every other "- " line after "## Notes" is a problem f"line {n}: not a note".
+  2. triage: group non-triage notes by key; a key is a candidate if (1) any note has kind bug or blocker, or (2) its
+     friction/wish notes span >= 2 distinct dates, or (3) any note's text matches CHECK_RE; the first rule that holds
+     (in that order) is reported; keys that already have a triage line are skipped.
+  3. record appends one line at the end of the file (a trailing newline kept), never edits or deletes a line.
+acceptance:
+  tests:
+    - "test_seeded_file_valid: parse(docs/usage-notes.md) -> 4 notes, no problems; triage -> [] (single-date wishes)"
+    - "test_rules: bug once -> candidate 'bug-or-blocker'; two wishes of one key on 2 dates -> 'two-dates'; same date twice -> none; a friction mentioning 'blocks C15' -> 'blocks-exit-check'"
+    - "test_triaged_key_skipped: after record(key, 'T501') the key is no longer a candidate"
+    - "test_parse_problems: bad area, bad kind, bad date (2026-02-30), missing field -> problems with line numbers"
+    - "test_cli: check exit 0 on the seeded file; triage --json prints []; record appends exactly one line"
+  commands:
+    - pytest -q tests/test_usage_notes.py
+    - pytest -q
+out_of_scope:
+  - turning candidates into tasks (the next wave's planner)
+invariants_touched: []
+decisions: [D91]

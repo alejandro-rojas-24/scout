@@ -1,0 +1,61 @@
+id: T413
+title: "View, server, frontend - retrain panel (depth-strip cells of retrained blocks with before/after status, retrain legend with outcome, RETRAIN_CAVEAT and LICENSE_QUESTION) and a read-only report route with a 'report' link per stored subject"
+depends_on: [T318, T401, T410]
+files:
+  - scout/view.py
+  - scout/server.py
+  - scout/web/index.html
+  - scout/web/app.js
+  - tests/test_view_p5.py
+  - tests/test_server_p5.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/view.py (P1 T011, P4 T318; DISCLAIMERS and ATTRIBUTION_CAVEAT unchanged; must not import scout.attrib,
+  scout.retrain or scout.report):
+    def build_view(card: dict, table: pyarrow.Table) -> dict
+      # adds (plan.md 4.10): depth_strips[].cells[].retrain and view["retrain"]; None for v0-v3 Cards
+  scout/server.py (P1 T013, P2 T113, P4 T318):
+    @dataclass(frozen=True)
+    class ReportConfig:
+        model_path: pathlib.Path | None; library_manifest: pathlib.Path | None; pins: pathlib.Path | None
+        ledgers: dict[str, pathlib.Path]
+    def make_server(..., store: CardStore | None = None, report_config: ReportConfig | None = None) -> ScoutServer
+    GET /api/report?repo=&revision_sha=&component=   -> 200 text/html; charset=utf-8 = scout.report.render.render(
+        scout.report.bundle.build_bundle(f"{repo}@{sha}" + (f"#{component}" if component else ""),
+        ReportInputs(store, **report_config fields))) | 400 (bad sha, SHA_KEY_RE) | 404 (no store, no report_config, or
+        no Card of that key) ; the response is built per request and never written to disk
+    def serve(..., store_dir: pathlib.Path | None = None, report_config: ReportConfig | None = None)
+  scout/web/index.html: no new ids besides "retrain-legend" (a div under the strip container).
+  scout/web/app.js: in the stored-Card list each item gains a link "report" (href "/api/report?repo=..&revision_sha=..
+    &component=..", target "_blank", rel "noopener"); strip cells with cell.retrain.flagged get an SVG stroke "#d81b60"
+    width 2 and the tooltip suffix " - retrained: {before} -> {after}"; when view.retrain is non-null, #retrain-legend
+    shows "Retrain experiment: {outcome}" + (" at step {stop_step}" if any) + ", blocks {blocks joined by ', '}", then
+    ppl ratio and top-1 agreement (toFixed(3)) when not null, then view.retrain.caveat and view.retrain.license_question
+    as two paragraphs; otherwise #retrain-legend is empty.
+behavior: |
+  1. build_view: for a card.v4 (stats.retrain r non-null): the strip whose prefix == r.recipe.stack_prefix gets, per
+     cell i, retrain = {"flagged": block index in r.recipe.blocks, "before": the baseline status of that block from
+     stats.attribution (blocks[i].status), "after": the status of that block in r.final_attribution (None when
+     final_attribution is None)}; other strips' cells get None. view["retrain"] = {"outcome": r.outcome, "stop_step",
+     "blocks": r.recipe.blocks, "ppl_ratio" and "top1_agreement" of the trace row at stop_step (or the last row; None
+     when the trace is empty), "caveat": r.caveat, "license_question": r.license.question}. The P4 attribution fields are
+     filled from stats.attribution as for v3. Cards v0-v3: every cell retrain None and view["retrain"] None.
+  2. The report route imports scout.report lazily inside the handler; any exception in bundle building -> 500 with the
+     message as text/plain (no stack trace). It performs no network request (build_bundle never does) and reads no
+     weight byte.
+  3. app.js stays an IIFE with no external URL; the report link is relative.
+acceptance:
+  tests:
+    - "test_view_retrain: a card.v4 from tests/helpers/retrain_records (with_retrain on the P1 cards helper Card with 8 blocks, blocks [2, 5]) -> cells 2 and 5 have flagged True with before 'attributed' and after 'not_attributed'; other cells flagged False; view.retrain has outcome, blocks, ppl_ratio/top1 of the stop row, caveat == RETRAIN_CAVEAT and license_question == LICENSE_QUESTION"
+    - "test_view_v3_unchanged: a v3 Card -> retrain None everywhere; the P4 view test expectations still hold"
+    - "test_view_imports: importing scout.view does not import scout.attrib, scout.retrain or scout.report (subprocess sys.modules check)"
+    - "test_report_route: make_server(store=T409 fixture store, report_config=fixture model/manifest/pins/ledgers) -> GET /api/report for the subject returns 200 text/html whose bytes equal render(build_bundle(...)) apart from generated_at (the test freezes time via monkeypatch of the bundle's clock); bad sha -> 400; unknown key -> 404; without report_config -> 404"
+    - "test_web_static_p5: index.html contains 'retrain-legend'; app.js contains '/api/report', 'retrain-legend', '#d81b60' and no 'http://' or 'https://'"
+  commands:
+    - pytest -q tests/test_view_p5.py tests/test_server_p5.py
+    - pytest -q
+out_of_scope:
+  - starting jobs or System 2 from the UI (usage-notes queue); report linting in the UI
+invariants_touched: [1, 5]
+decisions: [D91]

@@ -1,0 +1,82 @@
+id: T412
+title: "Blind-reader checklist - READER_PARAMS questions, answer_key(bundle), deterministic scoring, the LLM reader over the P3 S2Client seam (visible text only, structured answers), the human reader form and answer-file parser"
+depends_on: [T410]
+files:
+  - scout/report/reader.py
+  - tests/test_report_reader.py
+route: opus
+spec_complete: true
+interface: |
+  scout/report/reader.py (imports scout.report.render (visible_text, extract_bundle), scout.system2 (S2Client, S2Config,
+  S2Raw), yaml, json, re):
+    READER_PARAMS: dict                        # EXACTLY the plan.md 4.8 literal, with "questions" = the plan.md 3.8 table:
+      # {"Q1": {"text": "Which model is this report about (repository and revision)?", "format": "repo@sha",
+      #         "variant": "all", "critical": True}, ... "Q9r"/"Q10r" (variant "retrain") and "Q9n"/"Q10n" (variant
+      #         "no_retrain")} - a report gets Q1-Q8 plus its variant's Q9/Q10, always 10 questions
+    READER_SCHEMA: dict                        # JSON schema of plan.md 4.7 READER_SCHEMA (additionalProperties false)
+    READER_SYSTEM_PROMPT: str                  # exact text below
+    def questions_for(bundle: dict) -> list[dict]          # [{id: "Q1".."Q10", key: internal id, text, format, critical}]
+    def answer_key(bundle: dict) -> dict                   # {"Q1": expected, ...} (normalised)
+    def key_sha256(key: dict) -> str                        # sha256 of canonical JSON
+    def normalise(answer: str, fmt: str) -> Any
+    def score(answers: dict[str, str], key: dict, questions: list[dict], required_edits: list[dict], reader: str,
+              label: str) -> dict                           # plan.md 4.7 score
+    def llm_read(html: bytes, client: S2Client, config: S2Config) -> tuple[dict, S2Raw]
+        # (parsed READER_SCHEMA answer, raw); the user message is JSON {"questions": [...], "report_text": visible_text}
+    def reader_form(labels_bundles: dict[str, dict]) -> str   # YAML with the questions per report, empty answers
+    def parse_human(yaml_text: str) -> dict                  # validated plan.md 4.7 human answers file
+behavior: |
+  1. answer_key(bundle): Q1 = (subject repo, subject revision_sha); Q2 = set of reference repos whose S1 verdict is
+     "derived" in data.analysis[0] (empty set -> "none"), or "not run"; Q3 = {repo: abstain_reason} for S1 abstentions
+     (or "none"/"not run"); Q4 = {repo: (n_attributed, n_tested)} over attribution references with role "reference", or
+     "not run"; Q5 = set of control repos of the attribution, or "not run"; Q6 = "yes"; Q7 = "no"; Q8 = "no";
+     retrain variant (sections.retrain run): Q9 = (set of recipe blocks, "yes" iff outcome == "success"), Q10 = "yes";
+     no_retrain variant: Q9 = set of section ids with status not_run (among system1, system2, attribution, retrain),
+     Q10 = "no".
+  2. normalise(answer, fmt): strip, collapse whitespace; "repo@sha": split on "@", repo exact, sha lowercase and matched
+     as a prefix of >= 7 hex characters; lists: split on commas/semicolons/newlines, each item stripped, compared as sets
+     (repos exact, section ids case-insensitive, integers parsed); "repo: reason" pairs: repo exact, reason compared
+     case-insensitively after replacing spaces with "_" against the abstain reason text or code; "repo: n of N": both
+     integers must match; yes/no: first word lowercased in {"yes", "no"}; "none" and "not run" literal (case-insensitive).
+     A blank answer is wrong.
+  3. score: per question correct/incorrect; correct = count; critical_ok = all critical questions correct; required
+     edits = len(required_edits) (each must have a quote and a reason in READER_PARAMS["edit_reasons"], else it counts
+     and also marks the answer file invalid in the detail); passed = correct >= min_correct and critical_ok and
+     required_edits <= max_required_edits.
+  4. READER_SYSTEM_PROMPT (exact): "You are a careful reader who received a model-lineage report from a colleague. Answer
+     each question using only the report text you are given; do not use outside knowledge about any model, company or
+     licence. Give short answers in the requested format. Then list required edits: statements in the report that are
+     factually wrong, contradict another part of the report, would mislead a reader, or are unreadable; quote each one
+     exactly. Put stylistic suggestions in optional_edits. If the report does not answer a question, answer
+     'not stated'."
+  5. llm_read: text = render.visible_text(html) (the bundle script is excluded); user = json.dumps({"questions":
+     [{"id", "text", "format"} ...], "report_text": text}); raw = client.complete(READER_SYSTEM_PROMPT, user,
+     READER_SCHEMA, config) with config.model = READER_PARAMS["llm_model"] unless overridden, effort
+     READER_PARAMS["llm_effort"], max_tokens READER_PARAMS["llm_max_tokens"]; the answer is parsed and validated against
+     READER_SCHEMA; unavailable (P3 T212 outcomes) -> returns ({}, raw) and the caller scores it as all wrong with
+     detail raw's unavailable_reason.
+  6. reader_form: YAML {"reader": {"id": "", "blind": false, "date": ""}, "instructions": <one paragraph: open each
+     HTML file in a browser, answer from the report alone, list required edits, set blind true only if you have not seen
+     the plan, the code or other scout output>, "reports": {label: {"file": "<label>.html", "questions": [{id, text,
+     format}], "answers": {Q1: "", ...}, "required_edits": []}}}. No key, no hint.
+  7. parse_human: yaml.safe_load; reader.id non-empty, reader.blind bool, reader.date YYYY-MM-DD, every report label
+     present with 10 answers; problems -> ValueError listing them.
+acceptance:
+  tests:
+    - "fixtures: T409/T410 bundles (full with retrain; all-not-run; negative-style bundle with abstentions)"
+    - "test_params_literal: READER_PARAMS equals the plan literal; every question text equals the plan.md 3.8 table text; questions_for gives 10 questions for each variant"
+    - "test_answer_key: full bundle -> Q2 == the derived reference set; Q9 == (blocks, 'yes'); all-not-run bundle -> Q2 'not run', Q4 'not run', Q9 == {'system1', 'system2', 'attribution', 'retrain'}"
+    - "test_key_sha_stable: key_sha256 of the same key twice is equal; a changed bundle outcome changes it"
+    - "test_score_all_correct: answers built from the key in natural language forms ('Qwen/X@abcdef1', 'yes', 'org/a, org/b', 'org/a: 21 of 24') -> correct 10, passed"
+    - "test_score_critical_miss: only Q8 wrong -> correct 9, critical_ok False, passed False"
+    - "test_score_edits: one required edit -> passed False; an edit with reason 'style' -> counted and flagged invalid"
+    - "test_llm_read_stub: StubS2Client answering from the key -> passed; the user message contains no '<script' and no bundle JSON; the request body passes system2.assert_request_no_weights"
+    - "test_llm_unavailable: stub refusal -> ({}, raw with unavailable_reason 'refusal'); score of {} -> correct 0"
+    - "test_reader_form_and_parse: reader_form has no expected answer strings (e.g. the subject sha is absent); a filled form parses; missing Q7 -> ValueError"
+  commands:
+    - pytest -q tests/test_report_reader.py
+    - pytest -q
+out_of_scope:
+  - ledger entries and exit rows (T416, T417)
+invariants_touched: [3, 5]
+decisions: [D88, D89]

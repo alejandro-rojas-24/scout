@@ -1,0 +1,51 @@
+id: T402
+title: "Dataset repositories in HubSource (repo_type 'dataset': API and resolve URLs) and in FakeHub, with the P1 logging, preflight, redirect and error semantics unchanged"
+depends_on: [T003, T005, T302]
+files:
+  - scout/hub.py
+  - tests/helpers/fakehub.py
+  - tests/test_hub_dataset.py
+route: opus
+spec_complete: true
+interface: |
+  scout/hub.py (P1 T005, P4 T302):
+    REPO_TYPES = ("model", "dataset")
+    class HubSource:
+        def __init__(self, repo_id: str, revision: str | None, log: ByteLog, *, client=None, endpoint=None, token=None,
+                     attempts=3, backoff_s=(0.5, 1.0), timeout_s=10.0, sleep=time.sleep,
+                     repo_type: str = "model") -> None           # NEW keyword, last; other types -> ValueError
+        repo_type: str
+        # everything else unchanged
+  tests/helpers/fakehub.py (P1 T003, P4 T302):
+    def add_repo(self, repo_id, root, sha="a" * 40, gated=False, token=None, meta_redirect=None, lfs_sha256=False,
+                 repo_type: str = "model") -> None               # NEW keyword, last
+behavior: |
+  1. HubSource with repo_type "model": every URL, header, logged path and error text is byte-identical to P4 (the P1/P2/
+     P4 hub tests pass unchanged).
+  2. repo_type "dataset": resolve() GETs f"{endpoint}/api/datasets/{repo}/revision/{quote(rev or 'main', safe='')}"
+     (params {"blobs": "true"}), logged under the same API_PATH with the same META_MAX_BYTES cap and the same error
+     mapping (RepoNotFound, RevisionNotFound, GatedRepo; the messages say "dataset" instead of the implicit model:
+     f"dataset {repo}: not found or private (HF_TOKEN set|not set)"). Siblings -> RepoFile(rfilename, size,
+     lfs_sha256) exactly as for models (T302). File URLs are f"{endpoint}/datasets/{repo}/resolve/{revision_sha}/
+     {quote(path)}". read_file / read_range / redirects / retries / preflight / byte classes are unchanged (a .parquet
+     or .txt file classifies as meta, as every non-weight file does).
+  3. The Authorization header rule is unchanged (only for the endpoint host).
+  4. FakeHub.add_repo(..., repo_type="dataset") registers the repo under the dataset namespace: GET
+     {HUB}/api/datasets/{owner}/{name}/revision/{rev} and GET {HUB}/datasets/{owner}/{name}/resolve/{rev}/{path} with
+     the same responses, error headers and lfs_sha256 option as the model routes; a dataset repo is invisible under
+     the model routes and vice versa (401 RepoNotFound). Model repos behave byte-identically to P4.
+acceptance:
+  tests:
+    - "test_dataset_resolve_and_read: FakeHub dataset repo with data/train.parquet (a pyarrow table with a 'text' column) and README.md -> HubSource(..., repo_type='dataset').resolve() fills revision_sha and files with sizes and lfs_sha256 (option on); read_file('data/train.parquet') returns the exact bytes; the ByteLog has RESOLVE and META fetch events with class meta only and totals.weight == 0"
+    - "test_dataset_urls: the requests recorded by FakeHub are /api/datasets/<repo>/revision/<rev> and /datasets/<repo>/resolve/<sha>/<path>"
+    - "test_dataset_not_under_models: a dataset repo requested with repo_type 'model' -> RepoNotFoundError; a model repo with repo_type 'dataset' -> RepoNotFoundError"
+    - "test_dataset_pinned_mismatch: requested 40-hex rev != served sha -> RevisionMismatch"
+    - "test_repo_type_invalid: repo_type='space' -> ValueError before any request"
+    - "test_models_unchanged: the P1 T005 and P4 T302 hub test modules pass unchanged (full suite)"
+  commands:
+    - pytest -q tests/test_hub_dataset.py
+    - pytest -q
+out_of_scope:
+  - dataset search, streaming datasets, the datasets library; the retrain data policy (T403)
+invariants_touched: [2]
+decisions: [D84]

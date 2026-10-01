@@ -1,0 +1,38 @@
+id: T419
+title: "P5 offline rehearsal - the whole exit (freeze, plan, run, reports, reader-form, read llm, read human, exit) on the rehearsal world with a real socket-guarded worker subprocess, plus the failure paths"
+depends_on: [T417, T418]
+files:
+  - tests/test_exit_check_p5_offline.py
+route: opus
+spec_complete: true
+interface: |
+  tests/test_exit_check_p5_offline.py: calls scripts.exit_check_p5.main(argv, backend_factory=lambda s: LocalBackend(
+  tmp scratch, argv_prefix=[sys.executable, "-m", "tests.helpers.p5_rehearsal", "guarded-worker"], env={**os.environ,
+  "HF_TOKEN": "rehearsal-dummy"}), retrain_target=world.retrain_target, report_targets=world.report_targets,
+  pins=world.pins, env=Env5(p4=p4.Env(machine=platform.machine(), system=platform.system(), min_mem_total_bytes=0,
+  require_clean=False), require_cuda=False, budget="rehearsal", require_ledger=True), s2_client_factory=<reader stub>,
+  expected_reader_host="stub.invalid", allow_local_targets=True, code_state=<the real code_identity unless a test
+  overrides it>) with --ledger, --ledger-p3, --ledger-p4, --store, --cards-p3, --store-p4, --out, --model,
+  --library-manifest and --form pointing into a per-test tmp copy of the world's ledgers and outputs.
+behavior: |
+  1. Only test-only keywords are overridden (targets, pins, Env5 host facts, budget name "rehearsal", reader host,
+     backend argv); every threshold is the frozen one. A rehearsal FAIL goes to the human (no fixture constant is tuned
+     to make it pass).
+  2. The guarded worker proves the COMPUTE stage (torch, transformers) makes no network attempt.
+acceptance:
+  tests:
+    - "test_rehearsal_pass: freeze -> 0; plan -> 0 and prints CONFIRM WITH; run with the printed pair -> 0 (rows C0-C14 PASS; outcome success; stored card.v4); reports -> 0 (3 files, lint clean, C15 PASS); reader-form writes a YAML without any key value; read --reader llm -> 0 (C16 PASS for 3 reports); read --reader human --answers <write_human_answers from the keys> -> 0; exit -> 0 with 'EXIT CHECK (P5): PASS'; ledger kinds in order P5_FREEZE, P5_PREFLIGHT, P5_PLAN, P5_ATTEMPT, P5_RETRAIN, P5_REPORTS, P5_READER, P5_READER, P5_EXIT (run repeats the plan steps without appending P5_PREFLIGHT or P5_PLAN); p3_ledger.verify(..., kinds=P5_KINDS) == []; the worker scratch audit reports 0 files"
+    - "test_rehearsal_refused_baseline: retrain_target with subject rt redrawn (pins adjusted) and blocks (3,) -> run exit 1; C10 and C11 FAIL; P5_RETRAIN passed false; reports then exit 1 'no passing P5_RETRAIN'"
+    - "test_rehearsal_crash_then_sweep: first run with argv_prefix [sys.executable, '-m', 'tests.helpers.crash_worker'] (P4 T321) -> run exit 1, C8 FAIL, the failure sweep removed 1 orphan; second run with the guarded worker -> 0 and its P5_ATTEMPT has prior_attempts 1"
+    - "test_rehearsal_plan_before_freeze: a fresh ledger, plan without freeze -> C2 FAIL, exit 1"
+    - "test_rehearsal_code_changed: freeze, then plan with code_state returning another code_id -> C2 FAIL"
+    - "test_rehearsal_report_edited: after reports, change one digit inside a <data> element of retrain.html -> read exits 1 ('reports changed since P5_REPORTS'); exit -> C15 FAIL (L2b, L10a, sha mismatch)"
+    - "test_rehearsal_reader_fail: stub reader answering Q8 'Yes.' for the te report -> read llm exit 1, C16 FAIL for te only"
+    - "test_rehearsal_human_waiver: read --reader human --waive-human 'no independent reader' -> 0; exit -> 0 and the table lists 'WAIVED: no independent reader'"
+  commands:
+    - pytest -q tests/test_exit_check_p5_offline.py
+    - pytest -q
+out_of_scope:
+  - E1-E8 on real hosts (environment; plan.md 2.5)
+invariants_touched: [1, 2, 5]
+decisions: [D93, D94, D95]

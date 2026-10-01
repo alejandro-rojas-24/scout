@@ -1,0 +1,68 @@
+id: T414
+title: "CLI P5 - scout retrain, scout report (write + lint), scout report-lint, scout resolve --repo-type, scout serve report options"
+depends_on: [T319, T408, T411, T412, T413]
+files:
+  - scout/cli.py
+  - tests/test_cli_p5.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/cli.py (additions to P4 T319; main signature unchanged):
+    scout retrain SUBJECT --base TARGET --control TARGET [--control TARGET ...] --blocks LIST --data REPO[@REV]
+                  --train-file PATH --eval-file PATH [--budget exit|rehearsal] [--backend local|ssh:HOST] [--store DIR]
+                  [--plan-only | --confirm-plan PLAN_ID --confirm-bytes N] [--gate-threshold-bytes N] [--out DIR]
+                  [--json] [--endpoint URL]
+      defaults: --budget exit; --backend env SCOUT_BACKEND or "local"; --store env SCOUT_STORE or "cards/store";
+      LIST = comma-separated non-negative integers ("6,12,18"); REPO is a Hub dataset id or an absolute folder; REV
+      defaults to "main" for Hub datasets (pinned by the client) and is ignored for folders
+    scout report TARGET --out FILE [--store DIR] [--model PATH] [--library-manifest PATH] [--pins PATH]
+                  [--reference TARGET ...] [--ledger NAME=PATH ...] [--s2] [--s2-model ID] [--require-ledger]
+                  [--generated-at ISO] [--json]
+      defaults: --store as above; --model env SCOUT_JEV_MODEL or "models/jev_v1.json" when that file exists, else none;
+      --library-manifest "library/manifest.yaml" when it exists; --pins "exit/pins_p3.json" when it exists; ledgers p3,
+      p4, p5 = exit/ledger_p3.jsonl, exit/ledger_p4.jsonl, exit/ledger_p5.jsonl for each file that exists, overridden
+      by --ledger (NAME in p3, p4, p5)
+    scout report-lint FILE [same --store/--model/--library-manifest/--pins/--reference/--ledger] [--require-ledger] [--json]
+    scout resolve REPO[@REV] [--repo-type model|dataset]        # P1 resolve plus the flag (default model)
+    scout serve ... [--model PATH] [--library-manifest PATH] [--pins PATH] [--ledger NAME=PATH ...]
+      # builds server.ReportConfig (T413) when --store is given; otherwise the report route is off (404)
+behavior: |
+  1. retrain: blocks parse error -> argparse exit 2 "--blocks takes comma-separated block indices"; --confirm-plan
+     without --confirm-bytes (or the reverse) -> exit 2 "--confirm-plan and --confirm-bytes go together"; at least one
+     --control is required (exit 2 "retraining needs an independent --control model; see plan.md 3.1"). Calls
+     scout.retrain.client.retrain(...) with display = stderr printer and DataSpec(repo, rev or "main", train, eval).
+     --plan-only prints the plan and CONFIRM WITH to stderr, exit 0. Success (any outcome): stdout = result.text, or
+     with --json {"card_key", "object", "outcome", "attribution": card.stats.attribution, "retrain": card.stats.retrain,
+     "disclaimers": list(DISCLAIMERS), "caveats": {"attribution": ATTRIBUTION_CAVEAT, "retrain": RETRAIN_CAVEAT,
+     "license_question": LICENSE_QUESTION}}; exit 0. GateDeclined 6, JobError 7, PurgeError 8, DiskSpaceError 9,
+     RetrainRefused 10, other ScoutError their codes; message on stderr.
+  2. report: inputs = ReportInputs(CardStore(store), model, manifest, pins, ledgers, tuple(references), s2 client
+     (AnthropicS2Client or the s2_client_factory test keyword) and S2Config.from_env(--s2-model) when --s2);
+     code_id = scout.jobs.runner.code_identity(Path(scout.__file__).resolve().parent.parent)["code_id"];
+     bundle = build_bundle(TARGET, inputs, generated_at=--generated-at, code_id=code_id); html = render(bundle);
+     write FILE atomically (tmp + os.replace; parent dirs created); then result = lint(html, LintContext(... ,
+     require_ledger=--require-ledger)). stdout: f"wrote {FILE} ({len(html)} B, sha256 {sha})" then lint.format_table(
+     result) (or with --json {"file", "sha256", "bytes", "bundle_sha256", "lint": result}). Exit 0 iff result.ok, else
+     11 (the file stays written so it can be inspected; the message says "report written but NOT clean: do not hand
+     it on").
+  3. report-lint: reads FILE, runs lint with the same context options; prints the table (or JSON); exit 0 iff ok else 11.
+  4. resolve --repo-type dataset: HubSource(..., repo_type="dataset").resolve(); prints the 40-hex sha exactly as the
+     P1 resolve does for models (stdout: the sha only).
+  5. Exit code 11 is new ("report lint failed"); nothing else in the P1-P4 CLI changes.
+acceptance:
+  tests:
+    - "test_retrain_plan_only: backend_factory -> InProcessBackend over T404 rt_family local folders; `scout retrain <derived> --base <base> --control <control> --blocks 2,5 --data <data dir> --train-file data/train.parquet --eval-file data/test.parquet --budget rehearsal --plan-only --store tmp` -> exit 0; stderr has FULL DOWNLOAD GATE, DATA (meta class, RECIPE and CONFIRM WITH; stdout empty"
+    - "test_retrain_confirmed_json: rerun with the printed pair and --gate-threshold-bytes 0 --json -> exit 0; stdout JSON outcome 'success', disclaimers == DISCLAIMERS, caveats has the three texts"
+    - "test_retrain_arg_errors: --blocks '2,x' -> exit 2; no --control -> exit 2; only --confirm-plan -> exit 2"
+    - "test_retrain_refused_exit_10: subject with '#text_encoder' -> exit 10"
+    - "test_report_and_lint: with the T409 fixture store/model/manifest/pins/ledgers: `scout report <subject> --out tmp/r.html --require-ledger` -> exit 0, file written, stdout has 'wrote' and 14 PASS rows; `scout report-lint tmp/r.html --require-ledger` -> exit 0; after editing one digit in the file -> exit 11"
+    - "test_report_not_clean_exit_11: a store where a cited Card's object id is missing from the ledger with --require-ledger -> exit 11 and the NOT clean message; the file exists"
+    - "test_resolve_dataset: FakeHub dataset via client_factory -> `scout resolve org/data --repo-type dataset` prints the sha"
+    - "test_serve_report_config: main(['serve', ..., '--store', tmp, '--model', m]) builds a ReportConfig (serve monkeypatched to capture its kwargs)"
+  commands:
+    - pytest -q tests/test_cli_p5.py
+    - pytest -q
+out_of_scope:
+  - behaviour behind the commands (T403-T413)
+invariants_touched: [2, 5]
+decisions: [D85, D87]

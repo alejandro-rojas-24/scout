@@ -1,0 +1,88 @@
+id: T404
+title: "Retrain fixtures (test-only) - a tiny Llama family actually trained on CPU (base, fine-tuned derivative, independent control, a derivative with one re-drawn block), a WordLevel tokenizer, a Markov-chain text dataset in Parquet; the retrain extra in pyproject.toml"
+depends_on: [T003, T212, T313, T314]
+files:
+  - tests/helpers/retrain_fixtures.py
+  - tests/test_retrain_fixtures.py
+  - pyproject.toml
+route: sonnet
+spec_complete: true
+interface: |
+  pyproject.toml: [project.optional-dependencies] gains
+    retrain = ["torch>=2.4,<3", "transformers>=4.51,<6", "tokenizers>=0.20,<1"]
+    and the existing dev list gains the same three strings (nothing else changes).
+
+  tests/helpers/retrain_fixtures.py (test-only; imports numpy, pyarrow, torch, transformers and
+  tests.helpers.attrib_fixtures (T313: GluSpec, glu_config, write_st_repo); no scout imports):
+    # FROZEN constants (test_frozen asserts the literals; changing one to make a test pass is hand-tuning)
+    RT_N_WORDS = 1022
+    RT_BRANCHING = 4
+    RT_CHAIN_SEED = 11
+    RT_DIMS = {"n_layers": 8, "hidden": 128, "inter": 512, "n_heads": 4, "n_kv_heads": 2, "head_dim": 32}
+    RT_CONTROL_INTER = 384
+    RT_TRAIN = {"steps": 400, "batch": 16, "seq": 64, "lr": 0.003}
+    RT_FINETUNE = {"steps": 60, "batch": 16, "seq": 64, "lr": 0.0003}
+    RT_SEEDS = {"base": 1, "control": 2, "finetune": 3, "text_train": 21, "text_eval": 22, "redraw": 4}
+    RT_FLAGGED = (2, 5)
+    RT_REDRAWN_BLOCK = 3
+    RT_TEXT_WORDS = {"train": 200000, "eval": 20000}
+
+    def rt_vocab() -> list[str]                    # ["<unk>", "<eos>"] + [f"w{i}" for i in range(RT_N_WORDS)] (1024)
+    def rt_tokenizer_json() -> bytes
+    def markov_text(seed: int, n_words: int) -> str
+    def write_text_dataset(root: pathlib.Path) -> dict   # {"root", "train_file": "data/train.parquet", "eval_file": "data/test.parquet"}
+    def llama_config(inter: int) -> dict                  # glu_config(GluSpec(seed=0, **dims with inter), 1024) + tie false
+    def train_model(config: dict, seed: int, text: str, *, steps: int, batch: int, seq: int, lr: float,
+                    init_state: dict | None = None) -> dict[str, numpy.ndarray]    # float32 state dict
+    def write_family(root: pathlib.Path) -> dict[str, pathlib.Path]
+        # {"base", "derived", "control", "redrawn", "data"}; cached: returns at once when root/"DONE" exists
+    rt_family: a pytest fixture (scope "session") -> write_family(tmp_path_factory.getbasetemp() / "rt_family")
+behavior: |
+  1. rt_tokenizer_json(): json.dumps({"version": "1.0", "truncation": None, "padding": None, "added_tokens": [{"id": 0,
+     "content": "<unk>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
+     {"id": 1, "content": "<eos>", ...same flags}], "normalizer": None, "pre_tokenizer": {"type": "WhitespaceSplit"},
+     "post_processor": None, "decoder": None, "model": {"type": "WordLevel", "vocab": {t: i for i, t in
+     enumerate(rt_vocab())}, "unk_token": "<unk>"}}).encode(). It must load with tokenizers.Tokenizer.from_str and
+     encode "w5 w7" to ids [7, 9]; the P2 tokenizer reader sees type WordLevel and the P3 normalisation is "plain".
+  2. markov_text(seed, n): chain = numpy.random.default_rng(RT_CHAIN_SEED): for each word i in range(RT_N_WORDS),
+     succ[i] = chain.choice(RT_N_WORDS, RT_BRANCHING, replace=False) and prob[i] = chain.dirichlet(ones(RT_BRANCHING));
+     rng = default_rng(seed); w = rng.integers(RT_N_WORDS); emit n words f"w{w}", each next w = succ[w][rng.choice(
+     RT_BRANCHING, p=prob[w])]; join with " ", inserting "\n" instead of " " after every 64th word.
+  3. write_text_dataset(root): train = markov_text(RT_SEEDS["text_train"], RT_TEXT_WORDS["train"]), eval with
+     "text_eval" and "eval"; each written as a Parquet file with one string column "text", one row per line
+     (pyarrow.parquet.write_table, compression "zstd"), at data/train.parquet and data/test.parquet; README.md =
+     "---\nlicense: cc0-1.0\n---\n# synthetic markov text\n".
+  4. train_model(config, seed, text, ...): torch.manual_seed(seed); torch.use_deterministic_algorithms(True);
+     model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**config)) in float32 on CPU; init_state given ->
+     load_state_dict(init_state as tensors, strict=True). ids = tokenizers.Tokenizer.from_str(rt_tokenizer_json()).encode(
+     text).ids; batches: numpy.random.default_rng(seed) picks `batch` random windows of seq + 1 tokens per step; AdamW(lr,
+     betas (0.9, 0.95), weight_decay 0); causal-LM loss (labels = inputs shifted inside the model call with labels=);
+     returns {name: tensor.detach().numpy().astype(float32)} of model.state_dict() (buffers excluded).
+  5. write_family(root): base = train_model(llama_config(RT_DIMS["inter"]), RT_SEEDS["base"], train text, **RT_TRAIN);
+     derived = train_model(same config, RT_SEEDS["finetune"], markov_text(RT_SEEDS["finetune"], 50000),
+     **RT_FINETUNE, init_state=base); control = train_model(llama_config(RT_CONTROL_INTER), RT_SEEDS["control"], train
+     text, **RT_TRAIN); redrawn = derived with block RT_REDRAWN_BLOCK's mlp.gate_proj/up_proj/down_proj replaced by
+     numpy.random.default_rng(RT_SEEDS["redraw"]).normal(0, 0.02, shape) (float32). Each is written with T313
+     write_st_repo(root / name, w, GluSpec-compatible dims, rt_vocab(), dtype="F32", readme=...) and its tokenizer.json
+     is then overwritten with rt_tokenizer_json(); config.json is llama_config(...) (write_st_repo's config replaced
+     when it differs). The derived and redrawn READMEs carry front matter "base_model: base" and "license: apache-2.0";
+     base and control carry "license: apache-2.0". data = write_text_dataset(root / "data")["root"]. Finally write
+     root/"DONE". Total runtime on 4 CPU cores <= 180 s (test_runtime).
+acceptance:
+  tests:
+    - "test_frozen: every RT_* constant equals its literal"
+    - "test_tokenizer: tokenizers.Tokenizer.from_str(rt_tokenizer_json()).encode('w5 w7\\nw9').ids == [7, 9, 11]; json has model type WordLevel"
+    - "test_markov_deterministic: markov_text(21, 1000) is identical across calls; every word is w0..w1021; exactly 1000 words"
+    - "test_dataset_files: write_text_dataset writes two Parquet files with a single 'text' column; each <= 2 MiB; README front matter license cc0-1.0"
+    - "test_family_shapes: write_family -> 5 entries; base/derived/redrawn have 8 blocks of gate (512, 128), control gate (384, 128); every safetensors file parses; tokenizer.json equals rt_tokenizer_json()"
+    - "test_family_quality: for base and derived, eval perplexity on the eval text (first 16 windows of 64 tokens) lies in [2.0, 60.0] (inside RETRAIN_PARAMS.baseline_ppl_range, so the rehearsal's forward check can pass)"
+    - "test_family_relations: derived gate weights are within relative Frobenius distance 0.2 of base per block; control gate shapes differ from base; redrawn differs from derived only in block 3's MLP tensors"
+    - "test_runtime: write_family on a fresh tmp dir finishes in <= 180 s (marker: slow is NOT used; the fixture is session-cached)"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_retrain_fixtures.py
+    - pytest -q
+out_of_scope:
+  - any scout code; the retrain plan, loop or job (T403-T407)
+invariants_touched: []
+decisions: [D82]

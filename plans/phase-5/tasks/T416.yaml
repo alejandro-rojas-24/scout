@@ -1,0 +1,108 @@
+id: T416
+title: "P5 exit expectations - frozen retrain target, report targets and P5 literals; C0-C17 as pure check functions (reusing the P4 C4-C8 functions for the job plumbing)"
+depends_on: [T320, T403, T406, T411, T412]
+files:
+  - scripts/exit_expectations_p5.py
+  - tests/test_exit_expectations_p5.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_expectations_p5.py:
+    from scripts.exit_expectations import Check                      # P1 T016
+    import scripts.exit_expectations_p4 as p4                        # P4 T320 (check_env, check_gate, check_log,
+                                                                     # check_wire, check_disk, check_intervention, Env)
+    P5_RETRAIN_TARGET: dict = {"label": "retrain", "subject": "Qwen/Qwen2.5-0.5B-Instruct", "base": "Qwen/Qwen2.5-0.5B",
+        "controls": ("HuggingFaceTB/SmolLM2-360M",), "blocks": (6, 12, 18), "budget": "exit",
+        "data": {"repo": "Salesforce/wikitext", "train_file": "wikitext-2-raw-v1/train-00000-of-00001.parquet",
+                 "eval_file": "wikitext-2-raw-v1/test-00000-of-00001.parquet"},
+        "max_wall_s": 7200, "max_compute_s": 5400}
+    P5_REPORT_TARGETS: tuple[dict, ...] = (
+        {"label": "retrain", "subject": "Qwen/Qwen2.5-0.5B-Instruct", "component": None, "pins": "p3",
+         "run": ("system1", "attribution", "retrain"), "not_run": ("system2",)},
+        {"label": "te", "subject": "Qwen/Qwen-Image", "component": "text_encoder", "pins": "p4",
+         "run": ("attribution",), "not_run": ("system1", "system2", "retrain")},
+        {"label": "negative", "subject": "HuggingFaceTB/SmolLM2-1.7B", "component": None, "pins": "p3",
+         "run": ("system1",), "not_run": ("system2", "attribution", "retrain")})
+    P5_REPOS: frozenset[str]        # {subject, base, control, data repo} of P5_RETRAIN_TARGET (4)
+    MIN_BASELINE_ATTRIBUTED_FRAC = 0.95; MIN_UNFLAGGED_ATTRIBUTED_FRAC = 0.95; MAX_CONTROL_HITS = 0
+    MAX_RSS_BYTES = 48 * 2**30; MIN_GPU_MEM_BYTES = 32 * 2**30; TORCH_MIN = (2, 4); TRANSFORMERS_RANGE = ((4, 51), (6, 0))
+    FROZEN_RETRAIN_PARAMS, FROZEN_REPORT_PARAMS, FROZEN_LINT_PARAMS, FROZEN_READER_PARAMS: dict    # plan.md 4.8 literals
+    @dataclass(frozen=True)
+    class Env5:                         # the only knobs the offline rehearsal may override (never a threshold)
+        p4: p4.Env = p4.Env(); require_cuda: bool = True; min_gpu_mem_bytes: int = MIN_GPU_MEM_BYTES
+        budget: str = "exit"; require_ledger: bool = True
+
+    def check_target_set(pins_p5: dict, pins_p3: dict, pins_p4: dict, report_targets=P5_REPORT_TARGETS) -> list[Check]   # C0
+    def check_env(hello: dict, retrain_env: dict, client_code: dict, disk_needed: int, env: Env5 = Env5()) -> list[Check]  # C1
+    def check_frozen(client: dict, retrain_env: dict, entries: list[dict], client_code: dict, *, step: str,
+                     env: Env5 = Env5()) -> list[Check]                                                                     # C2
+        # client = {"retrain_params_digest", "report", "lint", "reader"} literals as imported on the client
+    def check_plan(rplan: dict, models: list[tuple[dict, pyarrow.Table]], data_files: list[dict]) -> list[Check]            # C3
+    def check_baseline(retrain_card: dict) -> list[Check]                                                                  # C10
+    def check_signal_drop(retrain_card: dict) -> list[Check]                                                               # C11
+    def check_quality(retrain_card: dict) -> list[Check]                                                                   # C12
+    def check_card_v4(store: CardStore, entry: StoreEntry, parent_object: str) -> list[Check]                              # C13
+    def check_caveats(text: str, view: dict) -> list[Check]                                                                # C14
+    def check_report(target: dict, lint_result: dict, file_sha256: str, reports_entry: dict | None, bundle: dict) -> list[Check]   # C15
+    def check_reader(target: dict, score: dict, *, reader: str, s2_meta: dict | None, waived: str | None,
+                     blind: bool | None, expected_host: str = "api.anthropic.com") -> list[Check]                        # C16 / C17
+behavior: |
+  Each function returns Check(target, name, expected, actual, ok) rows exactly as plan.md 2.3 states:
+  1. C0: set(pins_p5) == P5_REPOS; every pin 40-hex; pins_p5[r] == pins_p3[r] for the 3 model repos; for each report
+     target, its subject pin exists in the named pins file (pins_p3 or pins_p4) - the rehearsal passes its own dicts.
+  2. C1: p4.check_env(hello, client_code, disk_needed, env.p4) rows, plus: retrain_env.error is None; torch version >=
+     TORCH_MIN (parsed major.minor); cuda_available is True when env.require_cuda; device_name non-empty when
+     env.require_cuda; gpu_mem_total_bytes >= env.min_gpu_mem_bytes when env.require_cuda; transformers version in
+     TRANSFORMERS_RANGE (lower inclusive, upper exclusive); tokenizers non-null.
+  3. C2: scout.retrain.params.RETRAIN_PARAMS == FROZEN_RETRAIN_PARAMS, scout.report.bundle.REPORT_PARAMS ==
+     FROZEN_REPORT_PARAMS, scout.report.lint.LINT_PARAMS == FROZEN_LINT_PARAMS, scout.report.reader.READER_PARAMS ==
+     FROZEN_READER_PARAMS; retrain_env.retrain_params_digest == client retrain_params_digest (when retrain_env given);
+     scout.attrib.ATTRIB_PARAMS == p4.FROZEN_ATTRIB_PARAMS (likewise QUANT, GGUF, JOB, STORE) and the P2/P3 parameters
+     equal the exit_expectations_p2/p3 frozen literals (the comparisons p4.check_frozen makes, without its P4_PLAN
+     clause); ledger order: a P5_FREEZE exists, the last P5_FREEZE
+     precedes every P5_PLAN/P5_ATTEMPT/P5_REPORTS/P5_READER counted for this step, and every entry after it has code_id
+     == its code_id == client_code["code_id"]; each P5_FREEZE after a P5_ATTEMPT or P5_REPORTS has a non-empty
+     refreeze_reason (listed in actual); the freeze payload's params equal the literals and its targets equal
+     P5_RETRAIN_TARGET / P5_REPORT_TARGETS; env.require_clean (p4 Env) -> client_code dirty False.
+  4. C3: models [subject, base, control] roles; subject reads cover every Parquet row of the subject Card once and
+     sum == weights.tensor_bytes_total; for base and control, p4.expected_plan_bytes([...], attribution part) equals the
+     plan's bytes for them and their reads equal the attribution plan's; bytes_cap == bytes_planned + slack by the P4
+     rule; disk_bytes == bytes_planned; data files == the target's two paths, sizes equal the dataset listing, sum <=
+     FROZEN_RETRAIN_PARAMS["data_max_bytes"]; recipe.blocks == target blocks, budget == env.budget.
+  5. C4-C8 are the P4 functions (check_gate, check_log, check_wire, check_disk, check_intervention) applied to the retrain
+     job with label "retrain"; C6 additionally requires every data-file request path to be one of the two planned data
+     files (done by the runner, T417, as an extra row "data files only"); C7 additionally checks purge.bytes_written ==
+     plan.bytes_planned ("no checkpoint written").
+  6. C9: wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <= MAX_RSS_BYTES.
+  7. C10 (stats.attribution = baseline, stats.retrain.baseline): base reference status tested, null_ok, control_ok;
+     attributed fraction of the base over tested blocks >= 0.95; control n_attributed == 0; every recipe block's
+     baseline.flagged.attributed True; baseline.ppl within FROZEN_RETRAIN_PARAMS["baseline_ppl_range"].
+  8. C11: outcome == "success"; the stop row: base_status "tested", null_ok, control_ok, no flagged attributed,
+     control_hits == 0, unflagged_attributed / unflagged_tested >= 0.95; stop_step <= max_steps of the budget.
+  9. C12: the stop row's ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from the frozen literal).
+  10. C13: schema card.v4; validate_retrain == []; validate_attribution(stats.attribution) == []; lineage.parent_object ==
+      parent_object; weights_kept is False; store.load(entry) returns the Card; card.object_id of the stored files ==
+      entry.object.
+  11. C14: text and view each contain the three DISCLAIMERS, ATTRIBUTION_CAVEAT, RETRAIN_CAVEAT and LICENSE_QUESTION
+      (the view: view.disclaimers, view.attribution.caveat, view.retrain.caveat, view.retrain.license_question).
+  12. C15: lint_result.ok and every row count 0 (one Check per lint row); file_sha256 == reports_entry.sha256 (when the
+      entry is given); bundle.sections statuses equal target run/not_run; answer_key_sha256 in the entry equals
+      reader.key_sha256(reader.answer_key(bundle)).
+  13. C16/C17: score.passed, correct >= 9, critical_ok, required_edits == 0; llm: s2_meta.available True, served_model
+      non-null, request_host == expected_host (the rehearsal passes "stub.invalid"); human: blind is True; waived
+      non-empty -> a single row "C17 waived" with ok True and actual "WAIVED: <reason>" (listed in P5_EXIT waivers).
+acceptance:
+  tests:
+    - "test_literals: every FROZEN_* equals the plan.md 4.8 literal and the module constant it mirrors; P5_RETRAIN_TARGET and P5_REPORT_TARGETS equal the plan.md 2.1 tables"
+    - "test_each_check_pass_and_fail: for every function, one passing fixture and one failing fixture per clause (e.g. C11 with outcome success but the stop row control_ok False -> FAIL; C12 with ppl_ratio 1.0500001 -> FAIL, 1.05 -> PASS; C0 with a model pin differing from pins_p3 -> FAIL; C15 with one lint row count 1 -> FAIL; C16 with correct 9 but Q8 wrong -> FAIL)"
+    - "test_c2_ledger_order: a P5_PLAN before any P5_FREEZE -> FAIL; a refreeze after P5_ATTEMPT without reason -> FAIL; with reason -> PASS and the reason in actual; a P5_REPORTS entry with another code_id -> FAIL"
+    - "test_c1_retrain_env: cuda False with require_cuda -> FAIL; require_cuda False -> PASS; transformers '6.0.0' -> FAIL; '4.51.0' -> PASS"
+    - "test_c3_recount: a plan missing one subject tensor -> FAIL naming it; data file size mismatch -> FAIL"
+    - "test_c17_waiver: waived 'no independent reader' -> one row ok True with actual starting 'WAIVED'"
+  commands:
+    - pytest -q tests/test_exit_expectations_p5.py
+    - pytest -q
+out_of_scope:
+  - running anything (T417, T418)
+invariants_touched: [1, 2, 5]
+decisions: [D87, D88, D93, D94, D95]
