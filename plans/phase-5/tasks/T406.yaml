@@ -46,32 +46,41 @@ behavior: |
      trainer = Trainer(model, trainable, train_w, b, device=inp.device, seed=recipe.seed, abort=abort).
      gate_up = the gate and up names among trainable. Right after re-initialisation (before any step): (Lr, ar) =
      trainer.evaluate(eval_w, ref); reinit = {"eval_loss": Lr, "ppl_ratio": exp(Lr - L0), "top1_agreement": ar}
-     (the "MLP removed" state; reported, never a stop point).
+     (the "MLP removed" state; reported, never a stop point); reinit_digest = digest(tensors_of(model, trainable),
+     trainable) (validation r1 minor: the exit compares it with retrained_digest to show training changed the weights).
   5. For s in 1..b.max_steps: loss = trainer.step(). When s % b.eval_every == 0: (L, agree) = trainer.evaluate(eval_w,
      ref); ov = tensors_of(model, gate_up); att = attribute(inp.attrib_plan, inp.models, inp.vocabs,
      RetrainProvider(inp.provider, ov), computed_at=now()); row = {step: s, train_loss: loss (the last step's),
      eval_loss: L, ppl_ratio: exp(L - L0), top1_agreement: agree, **summarize(att, blocks),
      signal_dropped, quality_ok = flags(row), wall_s: clock() - t_start}; append; note(f"retrain eval step {s}: ppl_ratio
-     {r:.3f} top1 {a:.3f} flagged_attributed {k}/{K}"); keep att as last_att; if both flags: outcome "success",
-     stop_step s, final_attribution att; break.
-  6. No break: outcome from the last row per plan.md 4.2 (signal_persists / quality_not_recovered / neither),
-     stop_step None, final_attribution = last_att, reason = the failed flags spelled out.
+     {r:.3f} top1 {a:.3f} flagged_attributed {k}/{K}"); keep att as last_att.
+     Stop rule with persistence (plan.md 3.1 step 5, 4.2; validation r1 major 2): keep `candidate` = the previous row
+     when it had both flags. If candidate is set and this row has signal_dropped -> outcome "success", stop_step =
+     candidate.step, confirm_step = s, post_stop_max_z_adj = max non-null flagged z_adj of this row, final_attribution
+     = att (this row's); break. Otherwise candidate = this row if it has both flags and s + eval_every <= max_steps,
+     else None. (A drop seen at one look only is never a stop; the loop always measures one more interval.)
+  6. No break: outcome from the last row per plan.md 4.2 (signal_persists / quality_not_recovered / neither /
+     unconfirmed when the last row has both flags), stop_step None, confirm_step None, post_stop_max_z_adj None,
+     final_attribution = last_att, reason = the failed flags spelled out.
   7. retrained_digest = digest(tensors_of(model, trainable), trainable); then release(model, trainer) (every tensor
      reference dropped; CUDA cache emptied). The finally around steps 2-7 always calls release, also on Aborted.
   8. Assemble retrain.v1 (plan.md 4.2): params RETRAIN_PARAMS, budget, recipe, env = {device, device_name, dtype
      ("bf16-autocast" on cuda, "float32" on cpu), torch, transformers, tokenizers, cuda} from environment(), baseline,
-     reinit (None when refused), trace, outcome, stop_step, reason, final_attribution, retrained_digest, weights_kept False, lineage = inp.lineage |
+     reinit (None when refused), reinit_digest (None when refused), trace, outcome, stop_step, confirm_step,
+     post_stop_max_z_adj, reason, final_attribution, retrained_digest, weights_kept False, lineage = inp.lineage |
      {"relation": "partial-mlp-retrain", "statement": RETRAIN_CAVEAT}, license = inp.license | {"question":
      LICENSE_QUESTION}, caveat RETRAIN_CAVEAT, job None, computed_at now(). Every float rounded to 6 decimals.
      validate_retrain(result) must be [] (else AssertionError: a bug, never data).
 acceptance:
   tests:
     - "fixtures: T404 rt_family; subject derived, base, control; attrib plan from T403 plan_retrain(...).plan restricted to its attribution part (plan_attribution with the same models); a numpy TensorProvider over the fixture safetensors files (test helper in this file); rehearsal budget; device cpu"
-    - "test_loop_success: blocks [2, 5] -> outcome 'success'; baseline.ok with both blocks attributed; at stop_step both flagged blocks not attributed while base tested, null_ok and control_ok; unflagged_attributed == unflagged_tested == 6; ppl_ratio <= 1.05 and top1_agreement >= 0.90 at stop_step; reinit recorded with ppl_ratio > the stop row's; validate_retrain == []; stop_step is a multiple of 50 and <= 400"
+    - "test_loop_success (rt_family, the T404 frozen fixture; numbers measured by the planner in plan.md 2.4 'Rehearsal fixture'): blocks list(RT_FLAGGED) -> outcome 'success'; baseline.ok with every flagged block attributed; recovery is exercised: reinit.top1_agreement < 0.90 or reinit.ppl_ratio > 1.05 (quality_ok False right after re-initialisation) and the first trace row has quality_ok False; at stop_step and confirm_step every flagged block is not attributed while base tested, null_ok and control_ok; unflagged_attributed == unflagged_tested == 8 - len(RT_FLAGGED) at both rows; ppl_ratio <= 1.05 and top1_agreement >= 0.90 at stop_step; confirm_step == stop_step + 50 == last trace step; retrained_digest != reinit_digest; validate_retrain == []; confirm_step <= 400"
     - "test_refused_baseline: subject redrawn, blocks [3] -> outcome 'refused_baseline', reason names block 3, no model built (build_model spy not called)"
     - "test_refused_forward_check: Trainer.baseline monkeypatched to return loss 10.0 -> 'refused_forward_check', trace []"
     - "test_signal_persists: Trainer.step monkeypatched so that after the real step it copies the base's gate/up (permuted rows) into the flagged blocks -> no row has signal_dropped; outcome 'signal_persists' (quality stubbed ok) and final_attribution attributes the flagged blocks"
     - "test_quality_not_recovered: Trainer.evaluate monkeypatched to return (L0 + 1.0, 0.5) -> outcome 'quality_not_recovered' after max_steps; stop_step None"
+    - "test_transient_drop_not_a_stop (validation r1 major 2): attribute() wrapped so that the flagged block is reported attributed at the second eval only (a drop at the first eval, back at the second, dropped from the third on; quality stubbed ok) -> stop_step is the third eval step, confirm_step the fourth; the first eval is never the stop"
+    - "test_unconfirmed: quality stubbed ok only at the last eval step -> outcome 'unconfirmed', stop_step None"
     - "test_abort_releases: abort flips to True after 3 steps -> Aborted raised; release was called (spy)"
     - "test_provider_overrides: RetrainProvider returns overrides only for model 0 and only for the given names; rows() always delegates"
     - "test_summarize_flags: hand-built attribution (tests/helpers/retrain_records.make_attribution) -> summarize values; flags() truth table over the 4 combinations"

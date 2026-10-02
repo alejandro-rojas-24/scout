@@ -52,7 +52,8 @@ behavior: |
      untestable minus rendered reference rows with a .reason; (c) untestable blocks minus rendered block rows with a
      .reason; (d) sections with status not_run without a p.not-run .reason. Each difference counted in absolute value.
   7. L6: for every inputs.cards entry: card_key repo and 40-hex revision present; object exists in the store and
-     card.object_id(json bytes, parquet bytes) == object; with require_ledger a citation whose ledger entry exists,
+     card.object_id(json bytes, parquet bytes) == object; with require_ledger a citation with seq <= that ledger's pinned
+     head_seq whose ledger entry exists (read with bundle.read_entries(path, upto_seq=head_seq)),
      whose line sha256 matches and whose payload names this Card (same rule as T409 behavior 6); model sha256 equals the
      file and (require_ledger) a FREEZE_MODEL citation; code_id is 64 hex; scout_version and regenerate non-empty. Count
      = number of failed conditions.
@@ -64,7 +65,11 @@ behavior: |
       fmt != "f1"; ending in /p with fmt != "e1".
   11. L10a: render.render(bundle) != html (count 1). L10b: bundle.build_bundle(bundle.subject.target, ReportInputs(
       ctx.store, ctx.model_path, ctx.library_manifest, ctx.pins, ctx.ledgers, ctx.references), generated_at=
-      bundle.generated_at, code_id=bundle.code_id) differs from the embedded bundle (canonical JSON compare; the system2
+      bundle.generated_at, code_id=bundle.code_id, ledger_heads={r["name"]: r["head_seq"] for r in
+      bundle.inputs.ledgers if r["head_seq"] is not None}) differs from the embedded bundle (validation r1 blocker: each
+      ledger is re-read only up to the head the report pinned, its chain verified up to that seq, and the line sha256
+      at the head must equal head_line_sha256 (else count 1, detail "ledger <name> changed below the pinned head");
+      entries appended after the head are ignored, so E5-E8 appends never invalidate a report) (canonical JSON compare; the system2
       section is compared by its s2in_sha256 only and data.s2/data.s2in are taken from the embedded bundle, since an LLM
       answer cannot be rebuilt) (count 1).
   12. Rows: L1, L2a, L2b, L2c, L3, L4a, L4b, L5, L6, L7, L8, L9, L10a, L10b in that order; threshold 0 for all; ok =
@@ -89,6 +94,9 @@ acceptance:
     - "test_l8_license_answered: add 'use is permitted' outside the question -> L8 1; the LICENSE_QUESTION itself does not count"
     - "test_l9_precision: re-render with p_derived fmt 'f3' -> L9 1"
     - "test_l10b_store_changed: put a newer attribution Card of the subject into the store after rendering -> L10b 1"
+    - "test_l10b_ledger_append_ignored (validation r1 blocker): render the full bundle with require_ledger; then append to the P5 ledger a P5_REPORTS, a P5_READER and a P5_RETRAIN whose card_object equals the cited card.v4 object (scripts.p3_ledger.append) -> every row count 0 (L6 and L10b included)"
+    - "test_l10b_ledger_rewritten_below_head: rewrite the P5 ledger so the entry at the pinned head differs (a valid new chain) -> L10b 1 with detail 'changed below the pinned head'"
+    - "test_l5b_reference_reason (validation r1 minor): a bundle whose attribution reference has status 'abstain' (retrain_records.make_attribution(base_status='abstain', base_reason='independent control ... attributed at block ...: the in-run null is not homogeneous')) -> clean render L5 0 (the reference row carries its .reason, T410 behavior 9); removing that row's .reason span -> L5 1"
     - "test_bundle_source_restricted: a <data data-src='bundle:#/data/cards/...'> -> L2b 1"
   commands:
     - pytest -q tests/test_report_lint.py

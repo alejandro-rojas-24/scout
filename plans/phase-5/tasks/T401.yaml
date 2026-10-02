@@ -22,8 +22,8 @@ interface: |
     SCHEMA_VERSION = "card.v3"                                             # UNCHANGED
     SUPPORTED_SCHEMA_VERSIONS = ("card.v0", "card.v1", "card.v2", "card.v3", "card.v4")
     RETRAIN_VERSION = "retrain.v1"
-    RETRAIN_OUTCOMES = ("success", "signal_persists", "quality_not_recovered", "neither", "refused_baseline",
-                        "refused_forward_check")
+    RETRAIN_OUTCOMES = ("success", "signal_persists", "quality_not_recovered", "neither", "unconfirmed",
+                        "refused_baseline", "refused_forward_check")
     def validate_retrain(r: dict) -> list[str]                            # [] when r is a valid retrain.v1 (plan.md 4.2)
     def numeric_list_max_len(obj, *, skip_keys: Collection[str] = ()) -> int
         # longest list whose elements are all int/float (bool excluded), searched recursively; dict keys in skip_keys
@@ -34,7 +34,9 @@ interface: |
 
   tests/helpers/retrain_records.py (test-only; used by T401, T406, T409-T413 tests):
     def make_attribution(n_blocks: int = 8, *, attributed: Sequence[int] = (), base_title: str = "org/base@aaaaaaaaaaaa",
-                         control_title: str = "org/control@bbbbbbbbbbbb") -> dict      # a valid attribution.v1
+                         control_title: str = "org/control@bbbbbbbbbbbb", base_status: str = "tested",
+                         base_reason: str | None = None) -> dict      # a valid attribution.v1; base_status "abstain" or
+                         # "untestable" -> that reference carries base_reason and nothing is attributed
     def make_retrain(*, blocks: Sequence[int] = (2, 5), outcome: str = "success", n_rows: int = 3, eval_every: int = 50,
                      parent_key: dict | None = None, parent_object: str = "0" * 64, n_blocks: int = 8) -> dict   # valid retrain.v1
 behavior: |
@@ -58,10 +60,20 @@ behavior: |
         quality_ok, and that row exists. "signal_persists"/"quality_not_recovered"/"neither" -> no row has both flags, the
         last row's step == recipe.max_steps rounded down to a multiple of eval_every, stop_step None, and the outcome
         matches the last row's flags (quality_ok and not dropped / dropped and not quality_ok / neither).
+        Persistence rule (validation r1 major 2; plan.md 4.2): "success" -> stop_step equals the step of the FIRST row k
+        with signal_dropped and quality_ok whose NEXT row (step + eval_every) has signal_dropped; that next row is the
+        last row of the trace and its step == confirm_step; post_stop_max_z_adj == the maximum non-null flagged z_adj of
+        the confirm row (None when all are null). A row with both flags whose next row lacks signal_dropped is not a
+        stop. "unconfirmed" -> no row satisfies the rule, the last row (step == max_steps rounded down) has both flags
+        and no confirmation row exists. Every non-success outcome has confirm_step None and post_stop_max_z_adj None.
+        "signal_persists"/"quality_not_recovered"/"neither"/"unconfirmed" additionally require that no row k satisfies
+        the rule (the loop would have stopped).
         "refused_baseline" -> baseline.ok False, trace == [], final_attribution None, retrained_digest None.
         "refused_forward_check" -> baseline.ok True, trace == [], final_attribution None, retrained_digest None.
      g. final_attribution is None or validates with validate_attribution (P4 T306); for a non-refused outcome it is not
-        None. retrained_digest matches ^sha256:[0-9a-f]{64}$ for non-refused outcomes.
+        None (for "success" it is the attribution of the confirm row). retrained_digest and reinit_digest each match
+        ^sha256:[0-9a-f]{64}$ for non-refused outcomes and are None for refused ones (reinit_digest = the flagged
+        tensors right after re-initialisation, before any step; the exit compares the two, plan.md C11a).
      h. weights_kept is False (the literal False, not falsy); lineage has parent (card key dict), parent_object (64
         hex), relation == "partial-mlp-retrain", statement == RETRAIN_CAVEAT; caveat == RETRAIN_CAVEAT;
         license.question == LICENSE_QUESTION.
@@ -69,29 +81,38 @@ behavior: |
         64: weights are never stored").
      j. job is None or {job_id, host, plan_id}; computed_at ends with "Z".
   3. with_retrain(card, table, attribution, retrain, extra_log, out_dir): problems = validate_attribution(attribution) +
-     validate_retrain(retrain); any -> ValueError listing them. Compose the new Card exactly as P4 with_attribution does
+     validate_retrain(retrain); any -> ValueError listing them. The input must be a header-scan Card (validation r1
+     major 5): schema_version in card.v0..card.v3 and stats.attribution absent or None, else ValueError(f"with_retrain
+     needs a header-scan Card (card.v0-v3 without stats.attribution); got {schema_version}{' with attribution' if
+     ...}") - so a card.v4 or an attribution Card is never a parent. v0-v2 inputs (the P3 exit Cards are card.v2) are
+     first upgraded with upgrade_to_v3 exactly as with_attribution does. Compose the new Card exactly as P4 with_attribution does
      (same deep copy of the input Card, stats.attribution = attribution, the same fetch_log replacement from extra_log),
      then set schema_version = "card.v4" and stats["retrain"] = retrain (inserted as the LAST stats key). The Parquet
      table is the input table unchanged except for the schema metadata schema_version "card.v4". Write both files with
      the same writer and paths as with_attribution (card_paths(out_dir, repo, sha, component)) and return the BuiltCard.
-     The input Card must be card.v3 (else ValueError "with_retrain needs a card.v3 header-scan Card").
+     (The header-scan rule above replaces the r0 "card.v3 only" rule, which rejected the P3 card.v2 subject Cards.)
   4. load_card accepts card.v4 and returns it as stored. build_card, with_attribution, upgrade_to_v3 and object_id are
      unchanged (SCHEMA_VERSION stays "card.v3").
   5. retrain_records.make_retrain builds a record that passes validate_retrain: recipe from the given blocks
      (stack_prefix "model.layers", max_steps = eval_every * n_rows), trace rows at eval_every, 2 * eval_every, ...;
-     for outcome "success" the last row has both flags; reinit {"eval_loss": 3.5, "ppl_ratio": 1.3, "top1_agreement":
+     for outcome "success" (n_rows >= 2) the second-to-last row has both flags, the last row has signal_dropped and
+     quality_ok, every earlier row has quality_ok False, stop_step = the second-to-last step, confirm_step = the last
+     step, post_stop_max_z_adj = the last row's max flagged z_adj; for "unconfirmed" only the last row has both flags;
+     reinit {"eval_loss": 3.5, "ppl_ratio": 1.3, "top1_agreement":
      0.8} for non-refused outcomes, None otherwise; env device "cpu"; final_attribution = make_attribution(n_blocks,
-     attributed=[all blocks not in `blocks`]); retrained_digest "sha256:" + "ab" * 32; lineage parent parent_key or
+     attributed=[all blocks not in `blocks`]); retrained_digest "sha256:" + "ab" * 32 and reinit_digest "sha256:" +
+     "cd" * 32 for non-refused outcomes; lineage parent parent_key or
      {"repo": "org/subject", "revision_sha": "c" * 40, "component": None}.
 acceptance:
   tests:
     - "test_caveats_equal: caveats.DISCLAIMERS == tuple(scout.view.DISCLAIMERS); caveats.ATTRIBUTION_CAVEAT == scout.attrib.ATTRIBUTION_CAVEAT; RETRAIN_CAVEAT and LICENSE_QUESTION equal the plan literals (asserted as exact strings in the test)"
     - "test_caveats_digit_free: is_digit_free holds for all six texts (three disclaimers, attribution caveat, retrain caveat, licence question)"
     - "test_caveats_imports: in a subprocess, import scout.caveats -> no other scout module in sys.modules"
-    - "test_validate_retrain_ok: make_retrain() for each outcome success, signal_persists, quality_not_recovered, neither, refused_baseline, refused_forward_check -> []"
+    - "test_validate_retrain_ok: make_retrain() for each outcome success, signal_persists, quality_not_recovered, neither, unconfirmed, refused_baseline, refused_forward_check -> []"
+    - "test_validate_persistence: a success record whose stop row's next row has a flagged block attributed -> problem; a success record whose stop_step points at a qualifying row that has no next row -> problem; confirm_step != last row step -> problem; post_stop_max_z_adj differing from the confirm row's max -> problem; signal_persists while some row k satisfies the rule -> problem"
     - "test_validate_retrain_rules: one mutated copy per rule 2a-2j (e.g. stop_step pointing at the second qualifying row, a trace step not a multiple of eval_every, weights_kept 0, a 65-float list in trace, statement changed, license.question changed) -> a problem naming the field"
     - "test_with_retrain_roundtrip: a v3 header-scan Card from the P1 cards helper + make_attribution + make_retrain -> files written; load_card returns schema card.v4, stats keys == v3 stats keys + ['retrain'] in that order; Parquet metadata schema_version card.v4; object_id of the two files is stable across two identical writes"
-    - "test_with_retrain_rejects: a v2 Card -> ValueError; an invalid retrain -> ValueError with the problems"
+    - "test_with_retrain_parents: a card.v2 header-scan Card (P3 style, sigma+tokenizer+anchors) -> accepted, written as card.v4 with the upgrade_to_v3 defaults; a card.v4 Card -> ValueError; a card.v3 Card with stats.attribution -> ValueError; an invalid retrain -> ValueError with the problems"
     - "test_v3_unchanged: SCHEMA_VERSION == 'card.v3'; build_card still writes card.v3 (the P4 test_v3_plain expectations hold); a v3 Card has no 'retrain' key in stats"
     - "test_card_imports: static AST check: scout/card.py imports none of scout.attrib, scout.fullplan, scout.gate, scout.scan, scout.hub, scout.sources"
   commands:

@@ -24,10 +24,19 @@ interface: |
         # {"subject": str|None, "references": [{"title", "license"}], "data": str|None}; license = model_card.license, or
         # model_card.license_name when license == "other"
     def format_retrain(card: dict) -> str
+    def parent_entry(store: CardStore, key: dict) -> StoreEntry | None
+        # the subject's header-scan Card used as the lineage parent (validation r1 major 5): among store.entries(repo,
+        # sha) with component == key.component, params_digest == scout.store.params_digest(), schema_version != "card.v4",
+        # has["tokenizer"] True and has["attribution"] False, the newest (P4 find order: created_at, then object id)
 behavior: |
   1. controls empty -> ValueError("retraining needs >= 1 independent control"); blocks empty -> ValueError.
   2. Header scans exactly as P4 T317 step 1 (store.cached_scan with tokenizer=True, a fresh ByteLog each, one unit per
-     target), for [subject] + [base] + controls; pinning of targets as P4 T317 step 2.
+     target), for [base] + controls; pinning of targets as P4 T317 step 2. The SUBJECT is different (validation r1
+     major 5: after a retrain, cached_scan(tokenizer=True) returns the newer card.v4, whose parent would be wrong and
+     which with_retrain refuses): parent = parent_entry(store, subject key); None -> scan.scan(subject target, tmp,
+     ByteLog(), tokenizer=True, ...) (header scan, 0 weight bytes) and store.put_files of its Card, then parent =
+     parent_entry again. The subject's LoadedModel, plan and with_retrain all use this parent Card (card.v0-v3,
+     e.g. the P3 card.v2 at the exit), never a card.v4 or an attribution Card.
   3. log = ByteLog(); log.stage(RESOLVE); dsrc = data_source(data, log, client=client, endpoint=endpoint, token=token);
      dsrc.resolve() (a Hub data spec without a 40-hex revision is pinned to dsrc.revision_sha); files = resolve_data(
      dsrc.files(), data, sha); log.stage(META); lic = data_license(dsrc). No data file body is read on the client.
@@ -39,14 +48,14 @@ behavior: |
   6. display the DATA/RECIPE/licence part of text (everything after the format_full_plan block) and log it as a gate
      note; d = run_full_gate(rp.plan, log, flag_confirmer(confirm_plan, confirm_bytes), display=display) (P4: displays the
      full plan before the decision). Not approved -> display("NOT CONFIRMED. " + confirm_line(rp)); GateDeclined; no job.
-  7. parent = store entry of the subject's header scan (step 2); spec = make_retrain_spec(rplan=rp, decision=d,
+  7. parent = the entry chosen in step 2; spec = make_retrain_spec(rplan=rp, decision=d,
      subject_target, base_target, control_targets, blocks, budget_name, data=DataSpec(repo, pinned sha, train, eval),
      parent_object=parent.object, endpoint=endpoint or DEFAULT_ENDPOINT, scratch_root=hello scratch_root, wire_audit,
      client_hostname=socket.gethostname(), git_commit). outcome = run_job_via(backend, spec, log, display=display).
      Failed -> as P4 T317 step 7 (JobError with the worker's bytes; exit 7, or 8/9/10 re-raised as PurgeError /
      DiskSpaceError / RetrainRefused from the worker's error type).
   8. Success: att = result["attribution"] | {"job": {job_id, host, plan_id}}; rt = result["retrain"] | {"job": same};
-     log.stage(REPORT); extra_log as P4 T317 step 8; built = card.with_retrain(subject card, subject table, att, rt,
+     log.stage(REPORT); extra_log as P4 T317 step 8; built = card.with_retrain(parent Card, parent table (step 2), att, rt,
      extra_log, tmp); entry = store.put_files(...); optional export to out_dir; log.stage(PURGE); log.note("purge",
      "PURGE check: client holds no weights; worker: " + purge summary). Return RetrainResult(entry, card=built.card,
      plan, decision, job=outcome.record, outcome=rt["outcome"], text=format_retrain(built.card)).
@@ -72,6 +81,9 @@ acceptance:
     - "test_refused_before_job: subject with selector -> RetrainRefused (exit 10) before any backend call"
     - "test_worker_refusal_mapped: a worker error message of type RetrainRefused (fake worker scenario) -> RetrainRefused raised on the client with the worker's message"
     - "test_licenses_of: license 'other' + license_name 'llama3.1' -> 'llama3.1'; missing -> None"
+    - "test_retrain_twice (validation r1 major 5): two complete retrains of the same subject (InProcessBackend, rehearsal budget, the second with blocks [RT_FLAGGED[0]] only) -> both succeed and store a card.v4; both have lineage.parent_object == the same header-scan entry's object; neither run's plan used a card.v4 (spy on plan_retrain's subject card schema_version)"
+    - "test_parent_from_p3_card: a store holding only a P3-style card.v2 Card of the subject (sample+tokenizer+anchors, imported with import_tree) -> parent_entry returns it, no rescan happens (scan spy not called) and the retrain stores a card.v4 built from it"
+    - "test_parent_entry_rules: a store with a header-scan v3, an attribution v3 and a v4 of the same key -> parent_entry returns the header-scan v3; with only the attribution v3 and the v4 -> None (the client then rescans)"
   commands:
     - pytest -q tests/test_retrain_client.py
     - pytest -q

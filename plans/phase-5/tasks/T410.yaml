@@ -57,16 +57,22 @@ behavior: |
   8. system2: heading note LABELS["s2_note"]; per pair: the S2 final verdict as data_el(s2 pointer) with class
      "s2-verdict" (never "verdict": L4a counts only System 1 verdicts, and S2 can only keep or soften them), the reason
      code, and the explanation as escaped prose (LLM text; its digits are checked by L2c).
-  9. attribution: an inline SVG depth strip with one <rect> per block, filled by status with the P4 T318 palette; the
+  9. attribution: SECTION_TITLES["attribution"] == "Block attribution of the published subject (unmodified)" and
+     LABELS["attrib_scope"] (one sentence under the heading) == "These counts are for the subject as published; the
+     retrain section reports its own counts for the retrained copy." (validation r1 major 4: reader Q4 asks for this
+     section's counts, never the trace's); an inline SVG depth strip with one <rect> per block, filled by status with the P4 T318 palette; the
      SVG contains no text and no digit (block indices appear only in the table); a table per reference (title id, role,
-     status as data_el(..., "str", cls "attrib-status"), n_attributed/n_tested int, control mean f2, control sd f2, crit f2, df int), each cell a data_el into
+     status as data_el(..., "str", cls "attrib-status"), n_attributed/n_tested int, control mean f2, control sd f2, crit f2, df int, and for a
+     reference with status abstain or untestable its reason as data_el(.../references/j/reason, "str") inside
+     <span class="reason"> in the same row (validation r1 minor: L5b requires it)), each cell a data_el into
      card:<obj>#/stats/attribution/references/j/...; a table per block (index int, status, primary title, z_adj f1,
      p e1, z_pair f1; the reason of an untestable block in <span class="reason">); <p class="caveat">ATTRIBUTION_CAVEAT</p>.
   10. retrain: recipe (blocks int list items, stack prefix id, budget str, seed int, lr str, max_steps int, eval_every
       int, data repo@sha id, train/eval file id, data licence str), baseline (ppl f2; per flagged block: index int,
       z_adj f1, attributed str), right after re-initialisation (ppl_ratio f3, top1_agreement f3), trace table (one row
       per trace row: step int, ppl_ratio f3, top1_agreement f3, then per flagged block one cell with its z_adj f1 and
-      its attributed boolean str; unflagged_attributed int of unflagged_tested int; control_hits int), outcome str and
+      its attributed boolean str; unflagged_attributed int of unflagged_tested int under the header LABELS["trace_unflagged"] == "unflagged blocks
+      still attributed (retrained copy)"; control_hits int), outcome str and
       stop step int, retrained digest id, "weights kept: no" (static), <p class="caveat">RETRAIN_CAVEAT</p>. Only
       stored fields are rendered: no count, maximum or ratio is computed by the renderer (every data_el must satisfy
       format_value(resolved) == text, so a derived number would be untraceable).
@@ -92,6 +98,7 @@ acceptance:
     - "test_data_elements_resolve: for every <data> element: format_value(resolve_in_bundle(bundle, src), fmt) == element text and json.loads(value) == the resolved value"
     - "test_model_sources: every data-src starting with 'model:' is one of model:<inputs.model.sha256>#/params/calibration_note, #/thresholds/hi, #/thresholds/lo; resolve_in_bundle with another sha -> KeyError"
     - "test_verdicts_only_from_jev: every element with class 'verdict' has data-src matching ^analysis:0#/pairs/\\d+/system1/verdict$; a bundle whose analysis pairs are removed renders no 'verdict' class"
+    - "test_reference_reason_rendered: a bundle whose attribution reference has status 'abstain' (make_attribution(base_status='abstain', base_reason=...)) -> that reference row contains a span.reason whose data element resolves to the reason"
     - "test_sections_and_caveats: the three DISCLAIMERS appear once in #caveats; ATTRIBUTION_CAVEAT once in #attribution; RETRAIN_CAVEAT once in #retrain; LICENSE_QUESTION once in #license inside .license-question; not_run sections carry their reason"
     - "test_self_contained: no 'src=', '<link', '@import' or 'url(' in the output; exactly one <script>, of type application/json"
     - "test_extract_bundle_roundtrip: extract_bundle(render(b)) == b"

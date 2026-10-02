@@ -25,6 +25,7 @@ interface: |
          "run": ("system1",), "not_run": ("system2", "attribution", "retrain")})
     P5_REPOS: frozenset[str]        # {subject, base, control, data repo} of P5_RETRAIN_TARGET (4)
     MIN_BASELINE_ATTRIBUTED_FRAC = 0.95; MIN_UNFLAGGED_ATTRIBUTED_FRAC = 0.95; MAX_CONTROL_HITS = 0
+    MAX_CRASH_RERUNS = 2   # crash reruns (no result message) allowed per freeze without a refreeze
     MAX_RSS_BYTES = 48 * 2**30; MIN_GPU_MEM_BYTES = 32 * 2**30; TORCH_MIN = (2, 4); TRANSFORMERS_RANGE = ((4, 51), (6, 0))
     FROZEN_RETRAIN_PARAMS, FROZEN_REPORT_PARAMS, FROZEN_LINT_PARAMS, FROZEN_READER_PARAMS: dict    # plan.md 4.8 literals
     @dataclass(frozen=True)
@@ -35,19 +36,27 @@ interface: |
     def check_target_set(pins_p5: dict, pins_p3: dict, pins_p4: dict, report_targets=P5_REPORT_TARGETS) -> list[Check]   # C0
     def check_env(hello: dict, retrain_env: dict, client_code: dict, disk_needed: int, env: Env5 = Env5()) -> list[Check]  # C1
     def check_frozen(client: dict, retrain_env: dict, entries: list[dict], client_code: dict, *, step: str,
-                     env: Env5 = Env5()) -> list[Check]                                                                     # C2
+                     inputs_now: dict, env: Env5 = Env5()) -> list[Check]                                                   # C2
         # client = {"retrain_params_digest", "report", "lint", "reader"} literals as imported on the client
+        # inputs_now = {"pins_sha256": sha256 of the pins_p5 bytes now, "model_sha256": sha256 of the JEV model file now,
+        #               "ledger_lines": {"p3": {seq: line_sha256}, "p4": {...}}} (the runner reads them; pure here)
     def check_plan(rplan: dict, models: list[tuple[dict, pyarrow.Table]], data_files: list[dict]) -> list[Check]            # C3
     def check_resources(result: dict, target: dict) -> list[Check]                                                         # C9
         # = p4.check_resources("retrain", result, target, p4.Env(max_rss_bytes=MAX_RSS_BYTES)) (48 GiB, not P4's bound)
     def check_baseline(retrain_card: dict) -> list[Check]                                                                  # C10
-    def check_signal_drop(retrain_card: dict) -> list[Check]                                                               # C11
+    def check_loop_integrity(retrain_card: dict) -> list[Check]                                                            # C11a
+    def check_signal_drop(retrain_card: dict) -> list[Check]                                                               # C11b
     def check_quality(retrain_card: dict) -> list[Check]                                                                   # C12
     def check_card_v4(store: CardStore, entry: StoreEntry, parent_object: str) -> list[Check]                              # C13
     def check_caveats(text: str, view: dict) -> list[Check]                                                                # C14
     def check_report(target: dict, lint_result: dict, file_sha256: str, reports_entry: dict | None, bundle: dict) -> list[Check]   # C15
-    def check_reader(target: dict, score: dict, *, reader: str, s2_meta: dict | None, waived: str | None,
-                     blind: bool | None, expected_host: str = "api.anthropic.com") -> list[Check]                        # C16 / C17
+    def check_reader(label: str, samples: list[dict], *, reader: str, canary: bool, s2_metas: list[dict] | None,
+                     waived: str | None, blind: bool | None, expected_host: str = "api.anthropic.com") -> list[Check]  # C16 / C17
+        # samples = per-sample score dicts (real report) or canary_detection dicts (canary); llm: 3 samples, human: 1
+    def check_one_shot(entries: list[dict]) -> list[Check]                                                                 # C18
+    def exit_status(entries: list[dict], rows: list[Check]) -> tuple[str, list[str]]
+        # ("PASS" | "PASS after refreeze" | "PASS with waiver" | "PASS after refreeze, with waiver" | "FAIL", notes)
+    ALLOWED_DATASET_PATHS: tuple[str, ...] = ("api", "README.md", "train_file", "eval_file")   # C6 data rule (below)
 behavior: |
   Each function returns Check(target, name, expected, actual, ok) rows exactly as plan.md 2.3 states:
   1. C0: set(pins_p5) == P5_REPOS; every pin 40-hex; pins_p5[r] == pins_p3[r] for the 3 model repos; for each report
@@ -66,23 +75,44 @@ behavior: |
      == its code_id == client_code["code_id"]; each P5_FREEZE after a P5_ATTEMPT or P5_REPORTS has a non-empty
      refreeze_reason (listed in actual); the freeze payload's params equal the literals and its targets equal
      P5_RETRAIN_TARGET / P5_REPORT_TARGETS; env.require_clean (p4 Env) -> client_code dirty False.
+     Freeze inputs (validation r1 minor; plan.md 2.1): at every step after the freeze, inputs_now.pins_sha256 == the
+     last P5_FREEZE's pins_sha256, inputs_now.model_sha256 == its model_sha256, and for p3 and p4 the line sha256 at
+     the freeze's cited_ledgers.<name>.head_seq equals its head_line_sha256 (entries appended after that head are
+     allowed). Each failed comparison is its own row naming the input.
   4. C3: models [subject, base, control] roles; subject reads cover every Parquet row of the subject Card once and
      sum == weights.tensor_bytes_total; for base and control, p4.expected_plan_bytes([...], attribution part) equals the
      plan's bytes for them and their reads equal the attribution plan's; bytes_cap == bytes_planned + slack by the P4
      rule; disk_bytes == bytes_planned; data files == the target's two paths, sizes equal the dataset listing, sum <=
      FROZEN_RETRAIN_PARAMS["data_max_bytes"]; recipe.blocks == target blocks, budget == env.budget.
   5. C4-C8 are the P4 functions (check_gate, check_log, check_wire, check_disk, check_intervention) applied to the retrain
-     job with label "retrain"; C6 additionally requires every data-file request path to be one of the two planned data
-     files (done by the runner, T417, as an extra row "data files only"); C7 additionally checks purge.bytes_written ==
-     plan.bytes_planned ("no checkpoint written").
+     job with label "retrain"; plus, defined HERE (validation r1 minor; the runner only calls them):
+     - C6 "dataset requests": every worker wire request whose URL path contains "/datasets/" is one of exactly
+       (a) GET /api/datasets/<data repo>/revision/<pin> (the listing; ALLOWED_DATASET_PATHS "api"), (b)
+       /datasets/<data repo>/resolve/<pin>/README.md (the licence, "README.md"), (c) /datasets/<data repo>/resolve/
+       <pin>/<train_file> and (d) .../<eval_file> (redirect targets of (b)-(d) on *.hf.co are attributed to their
+       origin request, as P4 check_wire does for model files); every (c)/(d) body is read exactly once in full; any
+       other dataset path -> FAIL naming it. Function: check_dataset_wire(wire: list[dict], target: dict, pins: dict)
+       -> list[Check] (one row).
+     - C7 "no checkpoint written": purge.bytes_written == plan.bytes_planned; the post-purge audit (which now covers
+       the redirected HOME/TMPDIR/HF_HOME/TORCH_HOME/TRITON_CACHE_DIR/XDG_CACHE_HOME under the job dir, T407) reports 0
+       files and 0 bytes; result env_files and env_bytes are shown in actual (not thresholded).
   6. C9 (check_resources): wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <=
      MAX_RSS_BYTES (48 GiB; Env5 has no knob for it, so the rehearsal checks the same bound).
   7. C10 (stats.attribution = baseline, stats.retrain.baseline): base reference status tested, null_ok, control_ok;
      attributed fraction of the base over tested blocks >= 0.95; control n_attributed == 0; every recipe block's
      baseline.flagged.attributed True; baseline.ppl within FROZEN_RETRAIN_PARAMS["baseline_ppl_range"].
-  8. C11: outcome == "success"; the stop row: base_status "tested", null_ok, control_ok, no flagged attributed,
-     control_hits == 0, unflagged_attributed / unflagged_tested >= 0.95; stop_step <= max_steps of the budget.
-  9. C12: the stop row's ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from the frozen literal).
+  8. C11a loop integrity (validation r1 major 1 and minor: rows a correct build passes deterministically, kept apart
+     from the empirical outcome): validate_retrain(r) == []; outcome not refused; reinit present and "re-initialisation
+     changed the forward pass": reinit.ppl_ratio > 1.0 or reinit.top1_agreement < 1.0; "training changed the weights":
+     retrained_digest != reinit_digest; the trace has a row at every multiple of eval_every from eval_every to its last
+     step (no gap); every trace row's flagged entries carry non-null z (the re-fingerprint ran on the live tensors);
+     the baseline flagged z values differ from the last row's (the provider served the retrained tensors).
+     C11b signal drop (empirical): outcome == "success"; at the stop row AND the confirm row (persistence rule, plan.md
+     3.1 step 5): base_status "tested", null_ok, control_ok, no flagged block attributed, control_hits == 0,
+     unflagged_attributed / unflagged_tested >= 0.95; confirm_step == stop_step + eval_every <= max_steps;
+     post_stop_max_z_adj shown in actual.
+  9. C12 quality (empirical): the stop row's ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from
+     the frozen literal).
   10. C13: schema card.v4; validate_retrain == []; validate_attribution(stats.attribution) == []; lineage.parent_object ==
       parent_object; weights_kept is False; store.load(entry) returns the Card; card.object_id of the stored files ==
       entry.object.
@@ -91,9 +121,25 @@ behavior: |
   12. C15: lint_result.ok and every row count 0 (one Check per lint row); file_sha256 == reports_entry.sha256 (when the
       entry is given); bundle.sections statuses equal target run/not_run; answer_key_sha256 in the entry equals
       reader.key_sha256(reader.answer_key(bundle)).
-  13. C16/C17: score.passed, correct >= 9, critical_ok, required_edits == 0; llm: s2_meta.available True, served_model
-      non-null, request_host == expected_host (the rehearsal passes "stub.invalid"); human: blind is True; waived
-      non-empty -> a single row "C17 waived" with ok True and actual "WAIVED: <reason>" (listed in P5_EXIT waivers).
+  13. C16/C17 (plan.md 3.8; validation r1 majors 3 and 4): one row per file (three reports and the canary).
+      llm: len(samples) == READER_PARAMS["llm_samples"] and reader.llm_verdict(samples, canary=...) ok (a real report:
+      >= 2 of 3 samples passed; the canary: >= 2 of 3 samples failed_as_required); every s2_meta has served_model
+      non-null and request_host == expected_host (the rehearsal passes "stub.invalid"); unavailable samples count as
+      failed samples. human: exactly one sample per file; a real report passed, the canary failed_as_required; blind
+      is True. waived non-empty -> a single row "C17 waived" with ok True and actual "WAIVED: <reason>" (listed in
+      P5_EXIT waivers).
+  14. C18 one-shot protocol (validation r1 major 3; P3 one-shot pattern): over the ledger since the FIRST P5_FREEZE:
+      (a) after every P5_RETRAIN that is not a crash (payload crash False) and did not pass, the next P5_ATTEMPT is
+      preceded by a P5_FREEZE with a refreeze_reason; after a passing P5_RETRAIN no further P5_ATTEMPT exists under the
+      same freeze; (b) at most one P5_REPORTS per P5_FREEZE; (c) at most one P5_READER per (reports_seq, reader);
+      (d) at most MAX_CRASH_RERUNS (2) crash reruns per freeze. Any violation -> FAIL naming the entries
+      (the runner refuses them, so a violation means a hand-edited ledger or a runner bug). actual lists every
+      refreeze reason, every crash rerun and every waiver.
+  15. exit_status(entries, rows): "FAIL" if any row not ok; else "PASS after refreeze" when some P5_FREEZE follows a
+      P5_ATTEMPT, P5_REPORTS or P5_READER entry (the earlier evidence was superseded, whatever its result), with the
+      reasons as notes; "PASS with waiver" when C17 is waived; both -> "PASS after refreeze, with waiver"; else "PASS".
+      The runner prints f"EXIT CHECK (P5): {status}" and the notes, and records status in P5_EXIT. A refreeze is never
+      shown as a plain PASS.
 acceptance:
   tests:
     - "test_literals: every FROZEN_* equals the plan.md 4.8 literal and the module constant it mirrors; P5_RETRAIN_TARGET and P5_REPORT_TARGETS equal the plan.md 2.1 tables"
@@ -102,6 +148,13 @@ acceptance:
     - "test_c1_retrain_env: cuda False with require_cuda -> FAIL; require_cuda False -> PASS; transformers '6.0.0' -> FAIL; '4.51.0' -> PASS"
     - "test_c3_recount: a plan missing one subject tensor -> FAIL naming it; data file size mismatch -> FAIL"
     - "test_c17_waiver: waived 'no independent reader' -> one row ok True with actual starting 'WAIVED'"
+    - "test_c2_freeze_inputs: a pins sha, a model sha or the P3 line at the frozen head differing from the freeze -> FAIL row naming it; an entry appended to the P3 ledger after the head -> PASS"
+    - "test_c6_dataset_wire: the four allowed dataset requests -> PASS; an extra GET of /datasets/<repo>/resolve/<pin>/other.parquet -> FAIL naming it; the train file read twice -> FAIL"
+    - "test_c11a_integrity: reinit ppl_ratio 1.0 and top1 1.0 -> FAIL ('re-initialisation changed the forward pass'); retrained_digest == reinit_digest -> FAIL; a trace with a gap -> FAIL; last-row flagged z equal to the baseline's -> FAIL"
+    - "test_c11b_persistence: success record whose confirm row has control_ok False -> FAIL; confirm_step > max_steps -> FAIL"
+    - "test_c16_k_of_n: llm samples 2 of 3 passed -> PASS; 1 of 3 -> FAIL; canary 2 of 3 failed_as_required -> PASS, 1 of 3 -> FAIL; 2 samples given -> FAIL"
+    - "test_c18_one_shot: a P5_ATTEMPT after a non-crash failed P5_RETRAIN without an intervening refreeze -> FAIL; with a refreeze -> PASS; two P5_READER llm for one reports_seq -> FAIL; two P5_REPORTS under one freeze -> FAIL; three crash reruns -> FAIL"
+    - "test_exit_status: all rows ok and no refreeze -> 'PASS'; a P5_FREEZE after a P5_RETRAIN -> 'PASS after refreeze' with its reason; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one FAIL row -> 'FAIL'"
   commands:
     - pytest -q tests/test_exit_expectations_p5.py
     - pytest -q

@@ -30,8 +30,13 @@ interface: |
     def cite(entry_files: tuple[str, str], object_id: str, key: dict, ledgers: dict[str, list[dict]]) -> dict | None
     def cite_model(model_sha256: str, ledgers: dict[str, list[dict]]) -> dict | None
     def line_sha256(entry: dict) -> str                # sha256 of p3_ledger.canonical(entry) (the line without "\n")
+    def read_entries(path: pathlib.Path, *, upto_seq: int | None = None) -> tuple[list[dict], str | None]
+        # (entries with seq <= upto_seq (all when None), error or None); verifies the hash chain of that prefix only
+    def ledger_heads(ledgers: dict[str, pathlib.Path]) -> dict[str, int]   # {name: seq of the last entry} of each file
     def build_bundle(target: str, inp: ReportInputs, *, generated_at: str | None = None,
-                     code_id: str | None = None) -> dict                           # report.v1 (plan.md 4.5)
+                     code_id: str | None = None, ledger_heads: dict[str, int] | None = None) -> dict   # report.v1 (plan.md 4.5)
+        # ledger_heads None -> the current head of every given ledger (normal use); given -> every ledger is read only up
+        # to that seq (L10b passes the heads recorded in the embedded bundle, so later appends never change a rebuild)
     def bundle_sha256(bundle: dict) -> str             # sha256 of canonical JSON (sort_keys, separators (",", ":"), ASCII)
 behavior: |
   1. select_cards(store, key): entries = store.entries(repo, sha) with component == key.component and the current
@@ -63,14 +68,22 @@ behavior: |
      data.models = {} and inputs.model = None. Every model source the renderer emits is f"model:{sha}#<one of the three
      pointers>".
   6. Ledger citations (ledgers read with scripts-free code: the canonical line and hash chain rules of p3_ledger are
-     re-implemented read-only here as `read_entries(path) -> list[dict]` with a verify flag; a broken chain -> the
-     ledger is recorded as {name, error} and cites nothing):
+     re-implemented read-only here as `read_entries(path, upto_seq=...)`; a broken chain in the read prefix -> the
+     ledger is recorded as {name, file_name, head_seq: null, head_line_sha256: null, error} and cites nothing).
+     **Ledger heads are pinned (validation r1 blocker).** heads = ledger_heads(inp.ledgers) when the argument is None,
+     else the argument (a name absent from it, or a file shorter than its head -> recorded error "ledger shorter than
+     the pinned head", cites nothing). Every ledger is read only up to its head, and every citation rule below
+     (including "latest") is evaluated on that prefix. Entries appended after the head therefore never change the
+     bundle: an exit report built at E5 stays byte-identical in an L10b rebuild after E5-E8 append P5_REPORTS,
+     P5_READER and P5_EXIT, and so does a product report citing a live ledger.
+     inputs.ledgers = one row per given ledger, in LEDGER_NAMES order: {name, file_name (basename), head_seq,
+     head_line_sha256 (line_sha256 of the entry at head_seq), error: null}. No entry count or "last" value of the live
+     file is recorded anywhere in the bundle.
      - a Card: the latest P3 `SCAN` entry with payload.mode "confirm" whose card_files[repo] == {json: sha256 of the
        object's JSON file, parquet: sha256 of its Parquet file}; else the latest P4 `P4_EXIT` whose payload.targets.*.object
        == object id; else the latest P5 `P5_RETRAIN` whose payload.card_object == object id; else None.
      - the model: the latest P3 `FREEZE_MODEL` with payload.sha256 == sha256(model file).
      - citation = {ledger, seq, line_sha256}; data.ledger_entries[f"{ledger}:{seq}"] = the full entry.
-     - inputs.ledgers = one summary row per given ledger (file name, n_entries, last_seq, last_line_sha256).
   7. Licences: {"subject": licence of the subject Card, "references": [{title, license}] for every reference Card of
      system1 and every attribution reference (deduplicated by card key, order of first use), "data":
      retrain.recipe.data.license when the retrain section runs}. Licence = model_card.license, or license_name when
@@ -98,6 +111,9 @@ acceptance:
     - "test_s2_optional: with StubS2Client -> sections.system2 run, data.s2 validates as s2.v1, s2in_sha256 set; without -> not_run 'not requested'"
     - "test_no_network_no_weights: build_bundle under an httpx transport that raises and a socket guard -> succeeds; scout.report.bundle does not import scout.hub/sources/scan/gate (AST walk, transitive over scout.*)"
     - "test_deterministic: build_bundle twice with the same generated_at and code_id -> equal bundle_sha256"
+    - "test_heads_pinned (blocker): b1 = build_bundle(...); append two entries to the P5 ledger (a P5_RETRAIN whose card_object equals the already-cited card.v4 object, so an unpinned 'latest' rule would move the citation to it, and one P5_READER); build_bundle(..., ledger_heads={r['name']: r['head_seq'] for r in b1['inputs']['ledgers']}) == b1 (canonical JSON), while build_bundle without ledger_heads differs (head_seq moved); inputs.ledgers rows carry head_seq/head_line_sha256 and no n_entries/last_seq keys"
+    - "test_heads_shorter_ledger: ledger_heads naming seq 99 for a 3-entry ledger -> that ledger recorded with error 'ledger shorter than the pinned head' and no citation from it"
+    - "test_read_entries_prefix: a ledger whose entry 4 is corrupted -> read_entries(upto_seq=3) verifies and returns 3 entries; upto_seq=None -> error"
   commands:
     - pytest -q tests/test_report_bundle.py
     - pytest -q

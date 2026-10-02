@@ -62,7 +62,12 @@ behavior: |
      g. FULL_DOWNLOAD: run_full_gate(rp.plan, log, spec_confirmer(spec.confirmation)); emit gate; grant; ScratchDir.create;
         download.download_plan(rp.plan, sources, scratch, log) (P4, unchanged).
      h. log.stage(COMPUTE) (revokes the grant). With os.environ temporarily updated by RETRAIN_PARAMS["offline_env"]
-        (restored afterwards): provider = ScratchProvider(scratch, rp.plan, block_sizes); inputs = LoopInputs(
+        and by the cache redirection (validation r1 minor, C7 scope): HOME, TMPDIR, XDG_CACHE_HOME, HF_HOME,
+        TORCH_HOME and TRITON_CACHE_DIR = <scratch job dir>/env/<name> (created empty first), and tempfile.tempdir set
+        to <job dir>/env/TMPDIR, so any file torch, transformers, tokenizers or triton writes during COMPUTE lands
+        inside the job dir and is counted by the post-purge 0-file audit (the env subtree is deleted by scratch.purge
+        like everything else; run_retrain_job counts the files and bytes under env/ right before scratch.purge() and puts
+        them in the result as env_files / env_bytes; the P4 purge report is unchanged). Everything is restored afterwards: provider = ScratchProvider(scratch, rp.plan, block_sizes); inputs = LoopInputs(
         attrib_plan=rp.attrib_plan, models, vocabs (as P4 T316), provider, subject_config=subject card config.raw,
         subject_names=[r.tensor for r in the subject ModelPlan reads], tokenizer_json=the subject's tokenizer.json bytes
         (from the inspection's tokenizer read), train_texts=read_texts(train), eval_texts=read_texts(eval),
@@ -74,7 +79,7 @@ behavior: |
      i. PURGE check (P4 T316 step 9).
      j. result = P4 JobResult fields (plan_id, purge, disk, totals, n_events, stage_s, wall_s, rss_peak_bytes, wire,
         git_commit, scout_version, sweep_before) + {"attribution": baseline attribution.v1 (job None), "retrain":
-        retrain, "retrain_env": environment()}; emitted as the result message by worker.main.
+        retrain, "retrain_env": environment(), "env_files": int, "env_bytes": int}; emitted as the result message by worker.main.
   3. Baseline attribution hand-off: T406's run_loop calls on_baseline exactly once with the baseline attribution.v1
      right after computing it (T406 interface); this task edits nothing in loop.py.
   4. Abort: when the AbortFlag is set (client gone), the Trainer raises Aborted at its next step or eval chunk; the
@@ -91,6 +96,7 @@ acceptance:
     - "test_data_sha_mismatch: FakeHub dataset (T402) with lfs_sha256 on, InProcessBackend-style direct call, scout.retrain.job's sha256 helper monkeypatched to return a wrong digest -> RetrainRefused (exit 10), 0 weight bytes, no scratch dir"
     - "test_abort_on_broken_pipe: emit raises BrokenPipeError for heartbeat messages once COMPUTE started (heartbeat_s monkeypatched to 0.01) -> the job raises within 2 trainer steps of the flag (Trainer.step spy counts), scratch dir absent, purge note emitted"
     - "test_offline_env_restored: during run_loop os.environ has HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1 (spy); afterwards the previous values are back"
+    - "test_cache_dirs_in_job_dir (validation r1 minor): during run_loop HOME, TMPDIR, XDG_CACHE_HOME, HF_HOME, TORCH_HOME, TRITON_CACHE_DIR and tempfile.gettempdir() all lie under the scratch job dir (spy); a file written to tempfile.gettempdir() by a monkeypatched Trainer.step appears in the result's env_files == 1 and is gone after the purge (audit 0 files); afterwards every variable has its previous value"
     - "test_retrain_env_cli: `python -m scout.jobs.worker retrain-env` prints one JSON line with type retrain_env and every plan.md 4.4 key; exit 0"
     - "test_attribute_jobs_unchanged: the P4 T316 test module passes unchanged (full suite)"
   commands:

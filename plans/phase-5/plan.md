@@ -1,6 +1,7 @@
 # Phase 5 plan: Product refinement (retrain loop, report export, polish)
 
-Status: DRAFT r0 complete (planner), 2026-10-01. Ready for VALIDATE.
+Status: r1 (planner REVISE round 1 of 2), 2026-10-01. Responds to `validation.md` r1 (1 blocker, 6 majors, 13 minors);
+see §11. Ready for VALIDATE.
 
 This plan builds on the Phase 1–4 plans (`plans/phase-{1,2,3,4}/plan.md`, tasks T001–T321) and treats them as
 contracts: Card v3 and its stats, the ByteLog and the download gates (P2 exact `(plan_id, cap)`, P4 full-download batch
@@ -14,20 +15,24 @@ changes and the task that owns the change. Task ids are T401–T419. Decision nu
 
 scout gets a retrain-plan loop that re-initialises the MLP blocks attributed to a base, retrains only those blocks as a
 gated batch job on the DGX Spark, re-fingerprints them with the unchanged P4 attribution test at fixed intervals, and
-stops at the first point where the flagged blocks are no longer attributed while perplexity stays within a stated
-bound; the retrained weights are deleted like every other weight, only the subject's Card keeps the record, and the
+stops at the first point where the flagged blocks are no longer attributed, quality is within stated bounds, and the drop
+persists at the next interval; the retrained weights are deleted like every other weight, only the subject's Card keeps the record, and the
 panel surfaces the licence question without answering it. scout also exports a self-contained HTML report whose every
 number carries a pointer to a Card, the frozen JEV model or a ledger entry, which a linter verifies mechanically, and
-which two blind readers (an LLM and a person) must understand without any edit.
+which two blind readers (an LLM and a person) must understand without any edit, while failing a planted-defect copy.
 
 ## 2. Exit check (runnable, falsifiable)
 
-"You would hand a report to someone else without editing it" is made falsifiable by four things, all frozen in the
+"You would hand a report to someone else without editing it" is made falsifiable by five things, all frozen in the
 `P5_FREEZE` ledger entry before any real run:
 1. a report linter with numeric checks (§3.7, C15);
 2. a fixed set of three report targets (§2.1);
-3. a blind-reader checklist with pass criteria, answered by an LLM reader (C16) and a human reader (C17) (§3.8);
-4. one full retrain-loop run on a small real model on the Spark with numeric criteria (C3–C14).
+3. a blind-reader checklist with pass criteria, answered by an LLM reader (C16) and a human reader (C17), plus a
+   negative-control canary report with three planted defects that each reader must fail (§3.8);
+4. one full retrain-loop run on a small real model on the Spark with numeric criteria (C3–C14), whose loop-integrity
+   rows (C11a) are kept apart from the empirical outcome rows (C11b, C12);
+5. one-shot gates: every gate (retrain run, reports, each reader) is recorded once per freeze; a retry exists only
+   through a recorded refreeze, and the exit then says "PASS after refreeze", never a plain PASS (C18, §2.1).
 
 ### 2.1 Targets, pins, freeze (fixed)
 
@@ -80,14 +85,27 @@ offline (T410, T411).
 **Frozen before any real run (`P5_FREEZE`, E2).** The freeze entry records, and C2 asserts at every later step:
 - the literals `RETRAIN_PARAMS`, `REPORT_PARAMS`, `LINT_PARAMS`, `READER_PARAMS` (the checklist questions and pass
   criteria), `P5_RETRAIN_TARGET`, `P5_REPORT_TARGETS` (§4.8) and their sha256;
-- the sha256 of `exit/pins_p5.json`, of the JEV model file `models/jev_v1.json`, and of the P3 and P4 ledgers' last
-  entries (the evidence the reports cite);
+- the sha256 of `exit/pins_p5.json`, of the JEV model file `models/jev_v1.json`, and the P3 and P4 ledger heads
+  (`head_seq`, `head_line_sha256`: the evidence the reports cite). C2 recomputes all three at every later step (pins and
+  model bytes, and the line at each frozen head; later appends to P3/P4 are allowed) (T416 `check_frozen`);
 - the client `code_id` (P4 D78: tree hashes of `scout`, `scripts`, `pyproject.toml`). From `P5_FREEZE` to `P5_EXIT` the
   code is frozen: every later entry's `code_id` must equal the freeze's (C2).
 
-`P5_FREEZE` must precede `P5_PLAN`, `P5_ATTEMPT` and `P5_REPORTS`. A second `P5_FREEZE` after a `P5_ATTEMPT` or a
-`P5_REPORTS` entry is refused unless `--refreeze-reason "<human reason>"` is given; the reason is recorded, and C2 lists
-every refreeze. P2's `SIGMA_PARAMS`/`ALIGN_PARAMS`, P3's `CKA_PARAMS`/`TSTATS_PARAMS`/`FEATURE_PARAMS`/`JEV_PARAMS` and
+`P5_FREEZE` must precede `P5_PLAN`, `P5_ATTEMPT` and `P5_REPORTS`. A second `P5_FREEZE` after a `P5_ATTEMPT`, a
+`P5_REPORTS` or a `P5_READER` entry is refused unless `--refreeze-reason "<human reason>"` is given; the reason is
+recorded, and C2 lists every refreeze.
+
+**One-shot gates (validation r1 major 3; the P3 one-shot pattern, P3 D54).** Under one freeze:
+- `run`: once. After a `P5_RETRAIN` that passed, or that FAILed with a result (a finding: `crash: false`), `run` exits 5
+  and appends nothing. Only a crash (no `result` message: transport or backend error, worker death, `PlanMismatch`,
+  `DiskSpaceError`; `crash: true`) may be rerun without a refreeze, at most `MAX_CRASH_RERUNS = 2` times.
+- `reports`: once. `read --reader llm`: once per `P5_REPORTS`, with the pre-registered 2-of-3 samples taken in that one
+  invocation (§3.8); an invocation in which every call failed before any response (no answer seen) appends nothing and
+  exits 3. `read --reader human` (or `--waive-human`): once; the answers are hashed into the ledger before any score is
+  shown.
+- Any other retry needs `freeze --refreeze-reason`. The exit status is then **`PASS after refreeze`** with every reason
+  and the superseded entries listed (T416 `exit_status`); a refreeze is never reported as a plain `PASS`. C18 audits the
+  whole ledger for these rules (a violation means a hand-edited ledger or a runner bug). P2's `SIGMA_PARAMS`/`ALIGN_PARAMS`, P3's `CKA_PARAMS`/`TSTATS_PARAMS`/`FEATURE_PARAMS`/`JEV_PARAMS` and
 P4's `ATTRIB_PARAMS`/`QUANT_PARAMS`/`GGUF_PARAMS`/`JOB_PARAMS`/`STORE_PARAMS` are unchanged, and C2 checks them against
 their frozen literals.
 
@@ -133,35 +151,45 @@ python scripts/exit_check_p5.py plan --backend "ssh:$SCOUT_SPARK_HOST" --store c
 
 # E4 the confirmed retrain run (the human copies the CONFIRM WITH line; invariant 2)
 python scripts/exit_check_p5.py run --backend "ssh:$SCOUT_SPARK_HOST" --store cards/p5-store --confirm-plans <id>:<cap>
-# expect exit 0; one job, no prompt; rows C0..C14 PASS; the subject Card v4 (stats.retrain) is in the store;
-# ledger gains P5_ATTEMPT (before the job) then P5_RETRAIN
+# expect exit 0; one job, no prompt; rows C0..C14 PASS (C11a loop integrity, C11b signal drop with persistence, C12
+# quality); the subject Card v4 (stats.retrain) is in the store; ledger gains P5_ATTEMPT (before the job) then
+# P5_RETRAIN. One-shot: a second `run` under this freeze exits 5 unless the first was a crash (§2.1)
 
 # E5 reports (client, 0 network)
 python scripts/exit_check_p5.py reports --store cards/p5-store --out reports/p5
 # expect exit 0; reports/p5/{retrain,te,negative}.html built by the `scout report` code path (build_bundle, render,
-# lint); each lints clean (C15, L1-L10);
-# ledger gains P5_REPORTS {per report: sha256, lint rows, answer-key sha256}
+# lint); each lints clean (C15, L1-L10); each pins the ledger heads it cites (the p5 head is the entry before this
+# P5_REPORTS), so the E6-E8 appends never change a rebuild; reports/p5/canary.html = the retrain report with the three
+# frozen planted defects (§3.8; never linted); ledger gains P5_REPORTS {per report: sha256, lint rows, answer-key
+# sha256; canary sha256 and defects; neutral file names}
 
-# E6 LLM blind reader (api.anthropic.com; 3 calls)
+# E6 LLM blind reader (api.anthropic.com; 12 calls = 4 files x 3 pre-registered samples)
 python scripts/exit_check_p5.py read --reader llm
-# expect exit 0; C16 PASS for all 3 reports; ledger gains P5_READER (reader llm)
+# expect exit 0; C16 PASS for the 3 reports (>= 2 of 3 samples pass each) and for the canary (>= 2 of 3 samples fail it
+# with a planted defect detected); ledger gains P5_READER (reader llm) with every sample. One-shot (§2.1)
 
 # E7 human blind reader (a person who has not seen the plan, the code or scout's output)
-python scripts/exit_check_p5.py reader-form --form exit/reader_human.yaml     # questions only, no answers
-#   the reader opens the three HTML files, fills exit/reader_human.yaml, and signs the blind attestation
+python scripts/exit_check_p5.py reader-form --form exit/reader_human.yaml     # questions only, no answers, no labels
+#   copies the 4 files to reports/p5/reader/report-{A..D}.html in a frozen order that hides which one is the canary;
+#   the reader opens them, fills exit/reader_human.yaml, and signs the blind attestation
 python scripts/exit_check_p5.py read --reader human --answers exit/reader_human.yaml
-# expect exit 0; C17 PASS for all 3 reports; ledger gains P5_READER (reader human)
+# expect exit 0; the answers are appended (P5_READER, reader human) BEFORE any score is printed; C17 PASS for the 3
+# reports and the canary. One submission only (§2.1)
 
 # E8 exit (client, 0 network): re-verifies every row from the ledger, the store and the report files
 python scripts/exit_check_p5.py exit --store cards/p5-store --out reports/p5
-# expect exit 0; table C0..C17 all PASS; "EXIT CHECK (P5): PASS"; ledger gains P5_EXIT; commit the ledger
+# expect exit 0; table C0..C18 all PASS; last line exactly "EXIT CHECK (P5): PASS" (or "PASS with waiver" under D89;
+# "PASS after refreeze" when any gate was retried through a refreeze, with every reason listed); ledger gains P5_EXIT
+# {status, notes}; commit the ledger
 ```
 
 - Subcommands are mutually exclusive; `run` requires `--confirm-plans`; `read` requires `--reader`; `read --reader
   human` requires `--answers`.
 - `run` repeats the preflight and plan steps and FAILs ("plan changed since P5_PLAN") if the plan id differs.
 - `reports`, `read` and `exit` refuse (exit 1) unless a `P5_RETRAIN` entry with `passed: true` exists after the last
-  `P5_FREEZE`; `read` also needs a `P5_REPORTS` entry whose report sha256 values equal the files on disk.
+  `P5_FREEZE`; `read` also needs a `P5_REPORTS` entry whose report and canary sha256 values equal the files on disk.
+- Exit codes: 0 pass; 1 a check FAILed or a precondition is missing; 3 a credential or the reader endpoint is missing
+  or unreachable (nothing appended); 5 a one-shot or freeze rule refused the step (nothing appended).
 
 ### 2.3 Checks (P5 namespace; one row per check: `target | check | expected | actual | PASS/FAIL`)
 
@@ -175,26 +203,31 @@ C3–C14 are evaluated for the retrain job; C15–C17 per report.
 | C3 | retrain plan: models `== [subject, base, control]`; the subject's reads are **every tensor** of its Card (Σ `nbytes` `== weights.tensor_bytes_total`), recomputed independently from the stored Card; the base's and control's reads `==` the P4 attribution plan for the same models (`fullplan.plan_attribution`); `bytes_cap == bytes_planned + slack` by the P4 rule; `disk_bytes == bytes_planned`; data files `==` the target's two files with sizes from the dataset API and `Σ <= RETRAIN_PARAMS.data_max_bytes` | equal |
 | C4 | gate: plan-time client `totals.weight == 0`; in the run exactly 1 approved client decision via `cli-flag` with `bytes_confirmed == bytes_cap` and `(plan_id, cap)` in `--confirm-plans`; exactly 1 worker decision via `job-spec`; worker `plan_id ==` client `plan_id` | true |
 | C5 | streamed log: worker `bytes_planned <= totals.weight <= bytes_cap`; ingested events `== n_events`, seqs exactly `1..n_events` in arrival order; client totals of origin `<worker>` `==` the worker's totals | true |
-| C6 | worker wire: Σ body bytes `==` worker ByteLog `meta + header + weight`; hosts ⊆ {`huggingface.co`, `*.hf.co`}; every ranged request lies within a registered header bound or one planned read; every data-file request is for one of the two planned data files | true |
-| C7 | disk and purge (P4 C7 a–e): scratch audit before 0 files; `disk_peak_bytes <= disk_bytes`; purge report ok with `bytes_written == bytes_planned` (**no checkpoint or other file was ever written**); COMPUTE `purge` event before the PURGE check event; audit after: 0 files, 0 bytes | all true |
+| C6 | worker wire: Σ body bytes `==` worker ByteLog `meta + header + weight`; hosts ⊆ {`huggingface.co`, `*.hf.co`}; every ranged request lies within a registered header bound or one planned read; **dataset requests** (T416 `check_dataset_wire`): every request under `/datasets/` or `/api/datasets/` is one of exactly the listing `GET /api/datasets/<repo>/revision/<pin>`, `README.md` (licence) and the two planned data files at `<pin>` (redirects on `*.hf.co` attributed to their origin), each data file read once in full | true |
+| C7 | disk and purge (P4 C7 a–e): scratch audit before 0 files; `disk_peak_bytes <= disk_bytes`; purge report ok with `bytes_written == bytes_planned` (scout wrote only the planned tensors); during COMPUTE `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `HF_HOME`, `TORCH_HOME`, `TRITON_CACHE_DIR` and `tempfile.tempdir` point into the job dir (T407), so any file torch, transformers or triton writes is inside the audited tree; `env_files`/`env_bytes` shown; COMPUTE `purge` event before the PURGE check event; audit after: 0 files, 0 bytes | all true |
 | C8 | no manual intervention: 1 job submitted, `status == "succeeded"`, exit code 0, stdin never read | true |
 | C9 | resources: wall `<= 7200 s`; COMPUTE `<= 5400 s`; worker `rss_peak_bytes <= 48 GiB` | true |
 | C10 | **baseline** (the unmodified subject, computed in the job before any re-initialisation): base `status == "tested"`, `null_ok`, `control_ok`; base attributed fraction `>= 0.95`; control 0 leave-one-out hits; **every flagged block attributed to the base**; baseline perplexity in `[2.0, 60.0]` (forward-pass sanity) | true |
-| C11 | **signal drop** at the stop step: `outcome == "success"`; at that step base `status == "tested"`, `null_ok`, `control_ok` (not an abstention); **0 of the 3 flagged blocks attributed to the base**; unflagged blocks attributed fraction `>= 0.95` (the model is still detected as derived); control 0 hits; stop step `<= max_steps` | true |
-| C12 | **quality** at the stop step: `ppl_ratio = exp(eval_loss − eval_loss_baseline) <= 1.05`; top-1 agreement with the unmodified subject on the eval tokens `>= 0.90` | true |
+| C11a | **loop integrity** (deterministic on a correct build): `validate_retrain == []`; outcome not refused; **re-initialisation changed the forward pass** (`reinit.ppl_ratio > 1.0` or `reinit.top1_agreement < 1.0`); **training changed the weights** (`retrained_digest != reinit_digest`); a trace row at every multiple of `eval_every` up to the last row; every row's flagged z non-null, and the last row's flagged z differ from the baseline's (re-fingerprinted on the live tensors) | true |
+| C11b | **signal drop** (empirical), persistence rule: `outcome == "success"`; at the stop row **and** the confirm row (`confirm_step == stop_step + eval_every <= max_steps`): base `status == "tested"`, `null_ok`, `control_ok` (not an abstention); **0 of the 3 flagged blocks attributed to the base**; unflagged blocks attributed fraction `>= 0.95` (the model is still detected as derived); control 0 hits; `post_stop_max_z_adj` shown | true |
+| C12 | **quality** (empirical) at the stop step: `ppl_ratio = exp(eval_loss − eval_loss_baseline) <= 1.05`; top-1 agreement with the unmodified subject on the eval tokens `>= 0.90` | true |
 | C13 | Card v4 and store: the subject Card written by the job has `schema_version == "card.v4"`; `validate_retrain(stats.retrain) == []`; `stats.attribution` is the baseline and validates as `attribution.v1`; `retrain.lineage.parent_object ==` the object id of the header-scan Card the plan used; `retrain.weights_kept is False`; the store holds it; recomputing its object id from the two files gives the stored id | true |
 | C14 | caveats: the `scout retrain` text output and the view of the Card v4 carry the three `DISCLAIMERS`, `ATTRIBUTION_CAVEAT`, `RETRAIN_CAVEAT` and `LICENSE_QUESTION` | true |
 | C15 | **report lint** (per report, §3.7): L1–L10 all at their thresholds; file sha256 `==` the `P5_REPORTS` entry; the sections required by §2.1 present and the others "not run" with a reason | all pass |
-| C16 | **LLM blind reader** (per report, §3.8): available answer with a served model; request host `api.anthropic.com`; correct answers `>= 9` of 10; critical questions Q1, Q2, Q6, Q8 all correct; required edits `== 0` | all true |
-| C17 | **human blind reader** (per report): blind attestation `true`; correct `>= 9` of 10; critical all correct; required edits `== 0` | all true |
+| C16 | **LLM blind reader** (per file, §3.8): 3 samples per file in one invocation, each with a served model and request host `api.anthropic.com` (an unavailable sample counts as failed); a report passes a sample when correct `>= 9` of 10, critical Q1, Q2, Q4, Q6 all correct and required edits `== 0`; each of the 3 reports passes in `>= 2` of 3 samples; the **canary** fails as required (not passed, and `>= 1` planted defect detected) in `>= 2` of 3 samples | all true |
+| C17 | **human blind reader** (one submission over the 4 neutrally named files): blind attestation `true`; each report passes as above; the canary fails as required | all true |
+| C18 | **one-shot protocol** (§2.1): over the whole ledger, no `P5_ATTEMPT` after a passing or non-crash failing `P5_RETRAIN` without a refreeze in between; `<= 2` crash reruns per freeze; one `P5_REPORTS` per freeze; one `P5_READER` per (`P5_REPORTS`, reader); `actual` lists every refreeze reason, crash rerun and waiver | true |
 
 **E2** evaluates C0 and C2 (freeze only). **E3** evaluates C0–C3 and the plan half of C4. **E4** evaluates C0–C14.
-**E5** evaluates C15; **E6** C16; **E7** C17; **E8** re-evaluates every row from the ledger, the store and the files.
+**E5** evaluates C15; **E6** C16; **E7** C17; **E8** re-evaluates every row from the ledger, the store and the files, adds
+C18, and prints the status (`PASS`, `PASS with waiver`, `PASS after refreeze`, `PASS after refreeze, with waiver`, or
+`FAIL`).
 
 The `P5_RETRAIN` payload records: plan_id, bytes planned/cap, weight bytes, disk peak, wall/compute seconds, rss peak,
 the `retrain-env` report, the baseline (ppl, per-block base z_adj and z_pair), the whole trace (§4.2), the outcome, the
-stop step, the final flagged-block statistics, the `retrained_digest`, the Card object id, `prior_attempts`, the backend
-string, `git_commit`, `code_id`.
+stop and confirm steps, `post_stop_max_z_adj`, the final flagged-block statistics, `reinit_digest` and
+`retrained_digest`, `env_files`/`env_bytes`, the Card object id, `crash`, `prior_attempts`, the backend string,
+`git_commit`, `code_id`.
 
 ### 2.4 Why these numbers (exit numbers set by planner under the 2026-09-28 delegation; frozen in T416)
 
@@ -277,7 +310,7 @@ string, `git_commit`, `code_id`.
 | E1 (client) | `huggingface.co` API and git (3 model repos, 1 dataset repo) | blocked (proxy 403) |
 | E2, E5, E7, E8 (client) | local files only: `cards/p3`, `cards/p4-store`, ledgers, `models/jev_v1.json` | runs anywhere once the P3/P4 exits have produced them |
 | E3, E4 (worker) | ssh to the Spark; Spark egress to the Hub; the `retrain` extra with CUDA | no Spark from here |
-| E6 | `api.anthropic.com`, `ANTHROPIC_API_KEY`; 3 calls at up to about 20k input and 4k output tokens each at `claude-opus-5-5` ($4 / $20 per MTok) ≈ $0.5 worst case | not attempted here |
+| E6 | `api.anthropic.com`, `ANTHROPIC_API_KEY`; 12 calls (4 files × 3 pre-registered samples) at up to about 20k input and 4k output tokens each at `claude-opus-5-5` ($4 / $20 per MTok) ≈ $2 worst case | not attempted here |
 
 **Preconditions from earlier exits.** The P3 exit (Cards in `cards/p3`, `models/jev_v1.json`, `exit/ledger_p3.jsonl`)
 and the P4 exit (`cards/p4-store`, `exit/ledger_p4.jsonl`) must have run. If a report target's Card is missing, E3
@@ -324,10 +357,17 @@ estimate:
 4. **Re-fingerprint.** Every `eval_every` steps, the unchanged P4 statistic (`scout.attrib.attribute`, `ATTRIB_PARAMS`)
    is recomputed with the subject's current gate/up tensors against the same base and control, and the eval perplexity
    and the top-1 agreement with the unmodified subject are measured.
-5. **Confirm and stop.** The loop stops at the first eval step at which (a) no flagged block is attributed to the base,
-   while the base is `tested`, `null_ok` and `control_ok` (an abstention never counts as a drop), and (b)
-   `ppl_ratio <= max_ppl_ratio` and `top1_agreement >= min_top1_agreement`. If no eval step meets both before
-   `max_steps`, the outcome names what failed (`signal_persists`, `quality_not_recovered`, or `neither`).
+5. **Confirm and stop (persistence rule, r1).** A row is a *candidate* when (a) no flagged block is attributed to the
+   base while the base is `tested`, `null_ok` and `control_ok` (an abstention never counts as a drop: `signal_dropped`),
+   and (b) `ppl_ratio <= max_ppl_ratio` and `top1_agreement >= min_top1_agreement` (`quality_ok`). The loop keeps
+   training one more interval and stops only when the **next** row also has `signal_dropped`: `stop_step` = the
+   candidate, `confirm_step` = the next eval step, and the confirm row's maximum flagged `z_adj` is recorded as
+   `post_stop_max_z_adj`. A drop seen at a single look is never a stop (validation r1 major 2). Candidates are considered
+   up to `max_steps − eval_every`. If no candidate is confirmed by `max_steps`, the outcome names what failed from the
+   last row (`signal_persists`, `quality_not_recovered`, `neither`, or `unconfirmed` when only the last row is a
+   candidate). A margin (for example `z_adj <= crit/2`) was considered and not adopted: on every toy run it would never
+   have bound (the largest flagged `z_adj` at any eval, 2.49 at m = 1024 and 1.76 at m = 2048, is below `crit/2` of
+   both the toy and the exit, §2.4); the confirm row's value is reported instead.
 
 **What the loop does not claim.** A block that is no longer attributed has lost the matching-test signal; that is not
 evidence of independent training (P4 §3.8). The retrained checkpoint is still derived from the subject: its attention
@@ -397,7 +437,10 @@ Invariant 1 says the Card is the only persisted artifact and weights are never k
    logged, sha256 checked against the API's `lfs.sha256`).
 4. Re-plan and compare `plan_id`/`bytes_cap` with the spec (`PlanMismatch`, 0 weight bytes); disk check (P4).
 5. FULL_DOWNLOAD: gate, grant, scratch, `download_plan` (P4, unchanged).
-6. COMPUTE (`try … finally purge`), with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` set in the process:
+6. COMPUTE (`try … finally purge`), with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` set in the process, and
+   `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `HF_HOME`, `TORCH_HOME`, `TRITON_CACHE_DIR` and `tempfile.tempdir` pointed into
+   `<job dir>/env/` (r1, C7 scope: anything a library writes lands in the audited, purged tree; counted as
+   `env_files`/`env_bytes` before the purge):
    a. **Baseline fingerprint**: `attrib.attribute(plan_attrib, …, ScratchProvider)` → attribution.v1 of the unmodified
       subject.
    b. **Baseline refusal**: any flagged block whose base test is not `attributed`, or base not `tested`/`null_ok`, or
@@ -406,7 +449,8 @@ Invariant 1 says the Card is the only persisted artifact and weights are never k
    c. Build the model (§3.5) from the scratch tensors; tokenise the data; baseline eval (loss, perplexity, and the
       argmax token at every eval position, kept in RAM); baseline perplexity outside `baseline_ppl_range` → outcome
       `refused_forward_check` (the forward pass does not reproduce the model; no training).
-   d. Re-initialise the flagged blocks (§3.1 step 2); freeze everything else.
+   d. Re-initialise the flagged blocks (§3.1 step 2); freeze everything else; evaluate the "MLP removed" state
+      (`reinit`) and record `reinit_digest` (sha256 of the re-initialised flagged tensors).
    e. Train for up to `max_steps`; at every multiple of `eval_every`: eval metrics, re-fingerprint through a
       `RetrainProvider` that serves the flagged blocks' current gate/up tensors from the model (every other tensor is
       unchanged and comes from scratch); append a trace row; apply the stop rule (§3.1 step 5).
@@ -422,8 +466,12 @@ every step and every eval chunk, and raises `Aborted` (exit 7), so the `finally`
 instead of after the whole budget. The P4 attribution runner is unchanged (still re-deferred there).
 
 **Client (`scout.retrain.client.retrain`, T408).** Mirrors P4 `attribute()`: store-cached header scans with
-`tokenizer=True` (0 weight bytes), dataset resolve (0 weight bytes), plan, `plan_only` display, gate, spec, `run_job_via`,
-then `card.with_retrain` on the subject's header-scan Card with the job's baseline attribution as `stats.attribution`
+`tokenizer=True` for base and controls (0 weight bytes); for the subject, the **parent** is the newest store entry of its
+key that is not a `card.v4`, has a tokenizer and has no attribution (`parent_entry`; a fresh header scan only when none
+exists) - so a second retrain, or a rerun after a failed one, never plans from or composes onto a `card.v4` (validation
+r1 major 5), and the P3 exit's `card.v2` subject Card is a valid parent (`with_retrain` upgrades v0–v2 like
+`with_attribution`); dataset resolve (0 weight bytes), plan, `plan_only` display, gate, spec, `run_job_via`,
+then `card.with_retrain` on that parent Card with the job's baseline attribution as `stats.attribution`
 and `retrain.v1` as `stats.retrain` (`card.v4`), stored in the Card store; `format_retrain(card)` prints the recipe, the
 trace, the outcome, `RETRAIN_CAVEAT`, `LICENSE_QUESTION` (filled with the Cards' claimed licences), `ATTRIBUTION_CAVEAT`
 and the three `DISCLAIMERS`.
@@ -495,15 +543,18 @@ instead of its body):
    has neither σ-sample nor anchor evidence, or no JEV model is given.
 6. `system2` (optional, `--s2`): the S2 final verdicts, reason codes and explanations, headed "System 2 commentary
    (an LLM reading Cards and System 1 output; it can only keep or soften a verdict)".
-7. `attribution`: the depth strip (SVG), one row per reference (role, status, `n_attributed/n_tested`, null summary,
-   `crit`), one row per block (status, primary, `z_adj`, `p`, `z_pair`), `ATTRIBUTION_CAVEAT`. "Not run" when no Card
+7. `attribution`, titled "Block attribution of the published subject (unmodified)" with one scope sentence (so a
+   reader never confuses its counts with the retrain trace's): the depth strip (SVG), one row per reference (role,
+   status, `n_attributed/n_tested`, null summary, `crit`, and the reason of an abstaining or untestable reference in a
+   `.reason` span, which L5b counts), one row per block (status, primary, `z_adj`, `p`, `z_pair`), `ATTRIBUTION_CAVEAT`. "Not run" when no Card
    of the subject has `stats.attribution`.
 8. `retrain`: the recipe, the baseline, the trace table, the outcome and stop step, `RETRAIN_CAVEAT`. "Not run" when
    no Card v4 of the subject exists.
 9. `license`: the licences claimed by the subject's and every reference's model card (and the dataset's, when a retrain
    section exists), then `LICENSE_QUESTION`. Always present.
 10. `provenance`: every Card used (repo@sha, component, object id, schema version, and its ledger citation), the JEV
-    model sha256 and its `FREEZE_MODEL` citation, every ledger cited (file, seq, sha256 of the line), `code_id`,
+    model sha256 and its `FREEZE_MODEL` citation, every ledger read with its **pinned head** (file, `head_seq`,
+    `head_line_sha256`), every citation (ledger, seq, sha256 of the line), `code_id`,
     `scout_version`, `REPORT_PARAMS` digest, the bundle sha256, and the exact command that regenerates the file.
 
 **Traceability mechanism.** Every value that comes from data is rendered as
@@ -530,6 +581,17 @@ untraced number".
 the P3 `FREEZE_MODEL` entry with its sha256. Outside the exits, a Card without a ledger entry is shown as "not in a
 ledger" (allowed in product use; the exit linter requires every citation, `--require-ledger`).
 
+**Pinned ledger heads (validation r1 blocker).** A report must stay valid after its ledgers grow. `build_bundle` reads
+each ledger only up to a **head**: by default the file's last entry at build time, recorded in the bundle as
+`inputs.ledgers[] = {name, file_name, head_seq, head_line_sha256}`; every citation ("the latest entry that...") is chosen
+within that prefix. The bundle records no entry count or other property of the live file. L10b rebuilds the bundle with
+`ledger_heads` taken from the embedded bundle, re-verifies each chain up to its head and requires the line at the head
+to hash to `head_line_sha256`; entries appended later are ignored. So the E5 reports (whose p5 head is the entry before
+their own `P5_REPORTS`) still lint clean at E8 after `P5_REPORTS`, `P5_READER` and `P5_EXIT` were appended, and a
+product report citing a live ledger stays valid; rewriting the ledger below the head is detected (L10b, L6). Owners: T409
+(`read_entries(..., upto_seq)`, `ledger_heads`, `build_bundle(..., ledger_heads=)`), T411 (L10b, L6), tested by T409
+`test_heads_pinned`, T411 `test_l10b_ledger_append_ignored`, and the T419 rehearsal (E8 after appends).
+
 ### 3.7 Report linter (`scout report-lint`, T411; frozen `LINT_PARAMS`)
 
 The linter reads the HTML file, the store, the JEV model file and the ledgers, and returns one row per check with a
@@ -546,7 +608,7 @@ count and a threshold. Every threshold is a count that must be 0, except where s
 | L7 | self-contained | `src=`, `<link`, `@import`, `url(` with an `http:`/`https:` target; `<script>` elements other than the one bundle | 0 |
 | L8 | licence left open | matches of the frozen deny-list (§4.8) in visible text outside `.license-question` and `.caveat`; `#license` missing | 0 |
 | L9 | precision | `p_derived` values and the JEV thresholds (`/thresholds/hi`, `/thresholds/lo`) rendered with other than `f2`; attribution `z_adj`/`z_pair` with other than `f1`; p-values with other than `e1` | 0 |
-| L10 | unedited and reproducible | (a) `render(bundle) != file bytes`; (b) the bundle rebuilt from the store, model and ledgers (with the file's `generated_at`) differs from the embedded bundle | 0 each |
+| L10 | unedited and reproducible | (a) `render(bundle) != file bytes`; (b) the bundle rebuilt from the store, model and ledgers (with the file's `generated_at` and **its pinned ledger heads**; each chain verified up to its head, the head line hash equal) differs from the embedded bundle | 0 each |
 
 L10 is what makes "without editing" mechanical: any hand edit of the HTML breaks (a), and any edit of the bundle breaks
 (b). The exit also pins each file's sha256 in `P5_REPORTS` (C15).
@@ -554,41 +616,73 @@ L10 is what makes "without editing" mechanical: any hand edit of the HTML breaks
 ### 3.8 Blind-reader checklist (D88; frozen `READER_PARAMS`)
 
 Ten questions per report, answered from the rendered report alone. The answer key is computed from the bundle by frozen
-code (`answer_key(bundle)`), and its sha256 is written to `P5_REPORTS` **before** any reader answers. Questions 9 and 10
-depend on whether the report has a retrain section.
+code (`answer_key(bundle)`), and its sha256 is written to `P5_REPORTS` **before** any reader answers. Every report gets
+the same ten questions (r1: no variants).
+
+**Design rule (validation r1 major 4).** Every **critical** question has a key that depends on the report's content and
+cannot be given from general knowledge (T412 asserts on its fixture bundles that no critical key is the same for every
+report). The two fixed-answer questions (Q8, Q9) are not critical; they exist because each is linked to a planted
+defect of the canary below, where the fixed answer becomes wrong.
 
 | # | question | answer format | key |
 |---|---|---|---|
 | Q1 (critical) | Which model is this report about (repository and revision)? | `repo@sha` (≥ 7 hex) | subject key |
 | Q2 (critical) | Which references, if any, does System 1 call derived? | list of repos, `none`, or `not run` | S1 derived set |
-| Q3 | On which references did System 1 abstain, and why? | list of `repo: reason` | S1 abstain set with reason codes |
-| Q4 | How many blocks does the block attribution attribute to each reference? | `repo: n of N` list, or `not run` | per reference `n_attributed`/`n_tested` |
+| Q3 | On which references did System 1 abstain, and with which reason code? | list of `repo: reason code` (codes as printed), `none` or `not run` | S1 abstentions with the P3 code (`no weight evidence`, `out of training range`, `low confidence`), matched exactly (case and spacing aside) |
+| Q4 (critical) | In the section "Block attribution of the published subject (unmodified)", how many blocks are attributed to each reference? | `repo: n of N` list, or `not run` | per reference (role reference) `n_attributed`/`n_tested` of that section; never the retrain trace's counts |
 | Q5 | Which independent control model calibrated the block-attribution test? | repo or `not run` | control repos |
-| Q6 (critical) | Could the subject have been trained by distillation from another model without this report detecting it? | yes/no | yes |
-| Q7 | Does the report treat a shared tokenizer as proof of derivation? | yes/no | no |
-| Q8 (critical) | Does the report say whether the subject may be used or redistributed under the licences shown? | yes/no | no |
-| Q9 (retrain) | Which blocks were retrained, and did their attribution signal drop below the threshold? | block list; yes/no | recipe blocks; outcome success |
-| Q10 (retrain) | Is the retrained checkpoint still derived from the base, according to the report? | yes/no | yes |
-| Q9 (no retrain) | Which sections were not run? | list of section names | sections with a "not run" reason |
-| Q10 (no retrain) | Does "not attributed" for a block mean the block was trained independently? | yes/no | no |
+| Q6 (critical) | Which of these sections were not run: System 1, System 2, block attribution, retrain experiment? | list or `none` | sections with status `not_run` |
+| Q7 | Which licence does the report list for the subject? | licence string or `unknown` | the subject's claimed licence as shown |
+| Q8 | Does the report state whether using, modifying or redistributing the subject is permitted? | yes/no | no (canary D2 makes it yes) |
+| Q9 | According to the report, can weight forensics detect that a model was trained by distillation from another model? | yes/no | no (canary D3 removes the statement) |
+| Q10 | Which blocks were re-initialised and retrained, and was their attribution signal below the threshold at the stop step (or at the last eval step when there was no stop)? | block list; yes/no, or `not run` | recipe blocks; `signal_dropped` of that row (r1 minor: not "outcome == success", which is wrong for `quality_not_recovered`); `not run` without a retrain section |
 
 Each reader also lists **required edits**: statements that are factually wrong, contradict another part of the report,
 or would mislead a reader, each with a quote. Optional style edits are recorded but not scored.
 
-**Pass (per report and reader):** correct `>= 9` of 10, all critical questions correct, required edits `== 0`.
-Scoring is deterministic (T412): repos compared case-sensitively after trimming, shas by prefix, lists as sets, yes/no
-exact, section names case-insensitive.
+**Pass (per report and reading):** correct `>= 9` of 10, all critical questions (Q1, Q2, Q4, Q6) correct, required edits
+`== 0`. Scoring is deterministic (T412): repos compared case-sensitively after trimming, shas by prefix, lists as sets,
+yes/no on the first word (`not stated` is wrong), section names case-insensitive with fixed aliases, reason codes and
+licences exact after case and whitespace folding.
+
+**Negative control: the canary (validation r1 major 4).** A reader that answers from priors or approves anything must
+be caught. At E5 the runner writes `reports/p5/canary.html` = the clean `retrain` report with three frozen defects
+(`reader.make_canary`, visible HTML only; never linted):
+- **D1 contradicted number**: the base's attribution count in `#summary` is changed by one; the `#attribution` table keeps
+  the true value (linked question Q4);
+- **D2 licence answered**: the sentence "Using, modifying and redistributing this model is permitted under the licences
+  listed above." is inserted before the licence question (linked Q8);
+- **D3 distillation disclaimer removed** (linked Q9).
+A reading of the canary is scored against the clean key. It **fails as required** when it does not pass AND at least one
+defect is detected (the linked question answered wrongly, or a required edit quoting at least 20 characters of the
+defect text). A reader that copies the clean answers and requests no edit passes the canary and therefore FAILs C16/C17.
 
 **Readers.**
-- **LLM reader (C16).** One call per report through the P3 `S2Client` seam (`AnthropicS2Client`, default
-  `claude-opus-5-5`, adaptive thinking, effort high, structured output with `READER_SCHEMA`), in a fresh context. The
-  input is the report's **visible text** (HTML to text, the bundle removed) and the questions; the system prompt forbids
-  outside knowledge. Offline, `StubS2Client` answers from fixtures.
+- **LLM reader (C16).** Through the P3 `S2Client` seam (`AnthropicS2Client`, default `claude-opus-5-5`, adaptive
+  thinking, effort high, structured output with `READER_SCHEMA`), one fresh context per call. The input is the file's
+  **visible text** (HTML to text, the bundle removed) and the questions; the system prompt forbids outside knowledge.
+  **Pre-registered k-of-n**: one `read --reader llm` invocation makes 3 independent calls per file (12 in total); a
+  report passes C16 when `>= 2` of its 3 samples pass, the canary when `>= 2` of its 3 samples fail as required. An
+  unavailable sample counts as a failed sample. The invocation is one-shot (§2.1): no resampling. Offline,
+  `StubS2Client` answers from fixtures.
 - **Human reader (C17).** A person who has not seen the plan, the code or any scout output, recorded by name or
-  initials with `blind: true` in the answers file. `reader-form` writes the questions without answers. **Open decision
-  D89**: if no such person is available, the default is that Phase 5 stays open; the human may instead record a logged
-  decision (`--waive-human "<reason>"`) that marks C17 `WAIVED` in the EXIT table, and the phase then closes as "PASS
-  with waiver", listed as such.
+  initials with `blind: true` in the answers file. `reader-form` copies the 4 files under neutral names
+  (`report-A.html`…`report-D.html`, in an order frozen by the key hashes, so the reader cannot tell which is the
+  canary) and writes the questions without answers. One submission: the answers are appended to the ledger before any
+  score is shown. Pass: each report passes and the canary fails as required. **Open decision D89**: if no such person is
+  available, the default is that Phase 5 stays open; the human may instead record a logged decision
+  (`--waive-human "<reason>"`) that marks C17 `WAIVED`, and the phase then closes as "PASS with waiver", listed as such.
+
+**Expected false-fail and false-pass rates (stated, not measured: no API key here; §2.5).** Let p be the probability
+that one LLM sample fails a correct report (a careful reader slipping on 2 of 10 questions, a critical one, or
+requesting an edit), and c the probability that one sample passes the canary. With 2-of-3, a report fails with
+probability `3p²(1−p) + p³` and the canary is missed with `3c²(1−c) + c³`. Planning assumption p, c ≤ 0.10 per sample
+(the critical questions are lookups of one printed value each, and D2 contradicts the always-present licence question
+in the same section): ≤ 0.028 per file, so **≤ 0.11 per E6** over the four files (≤ 0.08 for the three reports alone).
+Single-sample scoring would give ≤ 0.34 per E6 under the same assumption, which is why k-of-n was chosen; nothing here is
+fitted to an observed reading. For the human (one reading) no rate is claimed: a FAIL there goes to the human
+(refreeze with a reason, shown as "PASS after refreeze", or the D89 waiver). The rehearsal shows both directions with
+stubs (T419 `test_rehearsal_reader_fail`, `test_rehearsal_canary_ignored`).
 
 ### 3.9 Black-box behavioural signal: deferred (D90)
 
@@ -596,7 +690,7 @@ Not included. A behavioural signal (comparing generations of the subject and a c
 detect distillation) needs generation on the GPU or through an API for every candidate, a prompt set, and above all a
 labelled set of documented distillation pairs to calibrate against; none exists. An uncalibrated signal would sit
 next to calibrated weight evidence and invite being read as a verdict. The report states the blind spot instead
-(DISCLAIMERS 1; reader Q6 checks that a reader gets it). later.md records the design constraints for a future phase:
+(DISCLAIMERS 1; reader Q9 asks for it, and canary defect D3 removes it to check that a reader notices). later.md records the design constraints for a future phase:
 strictly separate section, never an input to JEV or System 2's verdict, its own calibration set, and never a verdict on
 its own.
 
@@ -634,8 +728,9 @@ schema_version: "card.v4"
 stats: {tensor_stats, spectral_topk, sigma_curves, tokenizer_minhash, anchor_embedding, attribution,
         retrain: retrain.v1}                                                   # NEW slot, the only difference to v3
 ```
-- A Card v4 is the subject's header-scan Card v3 (key, source, scan, model_card, config, pipeline, weights, structure,
-  Parquet) with `stats.attribution` = the job's baseline attribution (the unmodified subject), `stats.retrain` filled,
+- A Card v4 is the subject's header-scan Card (the **parent**: card.v0–v3 without `stats.attribution`, upgraded to v3
+  with `upgrade_to_v3` as P4 `with_attribution` does; never a card.v4; r1, validation major 5) (key, source, scan,
+  model_card, config, pipeline, weights, structure, Parquet) with `stats.attribution` = the job's baseline attribution (the unmodified subject), `stats.retrain` filled,
   and `fetch_log` = the retrain client's log (its scan events, the client's gate/job events and the ingested worker
   events, `disk`, `jobs`), exactly as P4 `with_attribution` composes it.
 - The key is the subject's `(repo, revision_sha, component)`: the Card is about the subject; the retrain record is an
@@ -663,14 +758,18 @@ stats: {tensor_stats, spectral_topk, sigma_curves, tokenizer_minhash, anchor_emb
             flagged: [{index, z, z_adj, z_pair, crit, attributed: bool}],
             ok: bool, reason: str|null},
  reinit: {eval_loss: float, ppl_ratio: float, top1_agreement: float}|null,   # right after re-initialisation (step 0)
+ reinit_digest: str|null,                        # "sha256:<hex>" over the re-initialised flagged tensors (before any step)
  trace: [{step: int, train_loss: float, eval_loss: float, ppl_ratio: float, top1_agreement: float,
           base_status: "tested"|"abstain"|"untestable", null_ok: bool, control_ok: bool,
           flagged: [{index, z: float|null, z_adj: float|null, z_pair: float|null, crit: float|null, attributed: bool}],
           unflagged_attributed: int, unflagged_tested: int, control_hits: int,
           signal_dropped: bool, quality_ok: bool, wall_s: float}],
- outcome: "success"|"signal_persists"|"quality_not_recovered"|"neither"|"refused_baseline"|"refused_forward_check",
- stop_step: int|null, reason: str|null,
- final_attribution: attribution.v1|null,         # at stop_step, or at the last eval step; null when refused
+ outcome: "success"|"signal_persists"|"quality_not_recovered"|"neither"|"unconfirmed"|"refused_baseline"|
+          "refused_forward_check",
+ stop_step: int|null, confirm_step: int|null,    # success: the candidate row and the next eval row (persistence)
+ post_stop_max_z_adj: float|null,                # max flagged z_adj of the confirm row
+ reason: str|null,
+ final_attribution: attribution.v1|null,         # at confirm_step (success), or at the last eval step; null when refused
  retrained_digest: str|null,                     # "sha256:<hex>" over the final flagged tensors; null when refused
  weights_kept: false,
  lineage: {parent: card_key, parent_object: str, relation: "partial-mlp-retrain", statement: RETRAIN_CAVEAT},
@@ -680,11 +779,14 @@ stats: {tensor_stats, spectral_topk, sigma_curves, tokenizer_minhash, anchor_emb
 ```
 - `signal_dropped` = base `tested` and `null_ok` and `control_ok` and no flagged block `attributed`.
 - `quality_ok` = `ppl_ratio <= max_ppl_ratio` and `top1_agreement >= min_top1_agreement`.
-- `outcome` = `success` at the first row with both; otherwise, after `max_steps`, from the last row: `signal_persists`
-  (quality ok, signal not dropped), `quality_not_recovered` (dropped, quality not ok), `neither`.
+- `outcome` = `success` at the first row with both flags whose next row has `signal_dropped` (stop_step = that row,
+  confirm_step = the next, which is the trace's last row); otherwise, after `max_steps`, from the last row:
+  `signal_persists` (quality ok, signal not dropped), `quality_not_recovered` (dropped, quality not ok), `neither`, or
+  `unconfirmed` (both flags at the last row, no confirmation possible).
 - Floats are rounded to 6 decimals. `validate_retrain` (T401) checks every key and type, the enums, that the trace
-  steps are strictly increasing multiples of `eval_every`, that `stop_step` is the first row with both flags when the
-  outcome is `success`, and that `weights_kept is False`.
+  steps are strictly increasing multiples of `eval_every`, the persistence rule (`stop_step`, `confirm_step`,
+  `post_stop_max_z_adj`) when the outcome is `success`, that no row satisfies it otherwise, and that `weights_kept is
+  False`.
 
 ### 4.3 Texts (T401, `scout/caveats.py`; digit-free, tested)
 ```
@@ -730,7 +832,8 @@ by value; `scout/caveats.py` imports nothing from scout, and a test asserts equa
                    schema_version, citation: {ledger: "p3"|"p4"|"p5", seq: int, line_sha256: str}|null}],
           model: {name: str, sha256: str, citation: {...}|null} | null,
           analysis: [{subject_object: str, reference_objects: [str], model_sha256: str}],   # 0 or 1 entries
-          ledgers: [{name, file_name, n_entries, last_seq, last_line_sha256}]},
+          ledgers: [{name, file_name, head_seq: int|null, head_line_sha256: str|null, error: str|null}]},
+          # pinned heads (§3.6): every ledger is read only up to head_seq; nothing about the live file is recorded
  sections: {system1: {status: "run"|"not_run", reason: str|null},
             system2: {status, reason, s2in_sha256: str|null},
             attribution: {status, reason, card_object: str|null},
@@ -761,9 +864,13 @@ READER_SCHEMA (LLM output) = {answers: [{q: "Q1".."Q10", answer: str}],
                               required_edits: [{quote: str, reason: "factually_wrong"|"contradicts_report"|"misleading"|"unreadable"}],
                               optional_edits: [str]}
 human answers file (YAML) = {reader: {id: str, blind: bool, date: YYYY-MM-DD},
-                             reports: {label: {answers: {Q1: str, ..., Q10: str}, required_edits: [{quote, reason}]}}}
+                             reports: {"report-A.html".."report-D.html": {answers: {Q1: str, ..., Q10: str},
+                                                                     required_edits: [{quote, reason}]}}}
+                                                                     # neutral names; the canary is one of the four
 score = {reader: "llm"|"human", label, correct: int, n: 10, critical_ok: bool, required_edits: int,
          per_question: {Q: bool}, passed: bool}
+detection (canary) = {score, detected: ["D1"|"D2"|"D3"], failed_as_required: bool}
+verdict (per file) = {n, n_pass, n_failed_as_required, ok}           # ok by the READER_PARAMS k-of-n rule
 ```
 
 ### 4.8 Frozen parameters (literals; asserted by tests, by C2 and recorded in `P5_FREEZE`)
@@ -782,7 +889,7 @@ RETRAIN_PARAMS = {"version": "retrain.v1", "framework": "torch+transformers",
   "max_ppl_ratio": 1.05, "min_top1_agreement": 0.90, "baseline_ppl_range": [2.0, 60.0],
   "min_unflagged_attributed_frac": 0.95, "data_max_bytes": 33554432, "data_formats": ["parquet:text", "txt"],
   "offline_env": {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
-  "stop_rule": "first eval step with signal_dropped and quality_ok"}
+  "stop_rule": "first eval step with signal_dropped and quality_ok whose next eval step has signal_dropped"}
 REPORT_PARAMS = {"version": "report.v1", "format": "html-selfcontained", "bundle_script_id": "scout-report-bundle",
   "sections": ["header", "summary", "caveats", "subject", "system1", "system2", "attribution", "retrain", "license",
                "provenance"],
@@ -799,10 +906,17 @@ LINT_PARAMS = {"version": "lint.v1", "checks": ["L1", "L2", "L3", "L4", "L5", "L
                    "no license issue"],
   "license_containers": [".license-question", ".caveat"],
   "external_regex": "(?i)(?:\\bsrc\\s*=|<link\\b|@import|url\\()\\s*['\"]?https?:"}
-READER_PARAMS = {"version": "reader.v1", "n_questions": 10, "min_correct": 9, "critical": ["Q1", "Q2", "Q6", "Q8"],
+READER_PARAMS = {"version": "reader.v1", "n_questions": 10, "min_correct": 9, "critical": ["Q1", "Q2", "Q4", "Q6"],
   "max_required_edits": 0, "llm_model": "claude-opus-5-5", "llm_effort": "high", "llm_max_tokens": 8000,
+  "llm_samples": 3, "llm_min_passing": 2, "human_submissions": 1,
   "edit_reasons": ["factually_wrong", "contradicts_report", "misleading", "unreadable"],
-  "questions": <the §3.8 table, verbatim, as {id: {text, format, variant: "all"|"retrain"|"no_retrain", critical}}>}
+  "reason_codes": ["no weight evidence", "out of training range", "low confidence"],
+  "canary": {"source_label": "retrain", "min_detected": 1, "quote_min_chars": 20,
+             "defects": {"D1": {"question": "Q4", "edit": "summary n_attributed of the base -1 (+1 when 0)"},
+                         "D2": {"question": "Q8", "edit": "insert licence_sentence before .license-question"},
+                         "D3": {"question": "Q9", "edit": "delete the #caveats item equal to DISCLAIMERS[0]"}},
+             "licence_sentence": "Using, modifying and redistributing this model is permitted under the licences listed above."},
+  "questions": <the §3.8 table, verbatim, as {id: {text, format, critical, canary_defect: "D1"|"D2"|"D3"|null}}>}
 ```
 The rehearsal budget changes only sizes and step counts; every threshold (`max_ppl_ratio`, `min_top1_agreement`,
 `baseline_ppl_range`, the attribution rule) is the same for both budgets.
@@ -810,20 +924,26 @@ The rehearsal budget changes only sizes and step counts; every threshold (`max_p
 ### 4.9 Ledger `exit/ledger_p5.jsonl` (P3 `p3ledger.v1` line format; kinds `P5_*`; T417)
 ```
 P5_FREEZE    {params: {retrain, report, lint, reader}, params_sha256: {...}, retrain_target, report_targets,
-              pins_sha256, model_sha256, cited_ledgers: {p3: {last_seq, last_line_sha256}, p4: {...}},
+              pins_sha256, model_sha256, cited_ledgers: {p3: {head_seq, head_line_sha256}, p4: {...}},
               refreeze_reason: str|null, git_commit, code_id, code_dirty}
 P5_PREFLIGHT {hello, retrain_env, checks: {name: ok}, git_commit, code_id}
 P5_PLAN      {plan: {plan_id, bytes_planned, bytes_cap, disk_bytes, data_bytes, recipe_digest}, git_commit, code_id}
 P5_ATTEMPT   {plan_id, bytes_cap, confirm_plans, prior_attempts: int, git_commit, code_id}
-P5_RETRAIN   {attempt_seq, passed, failed: [check], error: str|null, evidence: {...§2.3 payload}, card_object: str|null,
-              git_commit, code_id}
+P5_RETRAIN   {attempt_seq, passed, crash: bool (no result message received), failed: [check], error: str|null,
+              evidence: {...§2.3 payload}, card_object: str|null, git_commit, code_id}
 P5_REPORTS   {reports: {label: {file_name, sha256, bytes, lint_ok, lint_rows: [{id, count, ok}], answer_key_sha256,
-              bundle_sha256}}, passed, git_commit, code_id}
-P5_READER    {reader: "llm"|"human", reports_seq: int (the P5_REPORTS entry read), reader_id: str, blind: bool|null, waived: str|null,
-              scores: {label: score}, answers_sha256: str, s2: {requested_model, served_model, request_host,
-              usage}|null, passed, git_commit, code_id}
-P5_EXIT      {passed, failed: [check], rows: [{target, check, expected, actual, ok}], waivers: [str],
-              prior_attempts: int, git_commit, code_id, git_dirty}
+              bundle_sha256, ledger_heads: {name: head_seq}}},
+              canary: {file_name, sha256, source_label, defects: [{id, question, text_sha256}]},
+              neutral: {label_or_canary: "report-A.html"...}, passed, git_commit, code_id}
+P5_READER    {reader: "llm"|"human", reports_seq: int (the P5_REPORTS entry read), reader_id: str, blind: bool|null,
+              waived: str|null, answers_sha256: str,
+              files: {label_or_canary: [{answers, required_edits, score | detection, s2: {requested_model,
+                      served_model, request_host, usage}|null}]},      # 3 samples (llm) or 1 (human) per file
+              verdicts: {label_or_canary: {n, n_pass, n_failed_as_required, ok}}, passed, git_commit, code_id}
+P5_EXIT      {passed, status: "PASS"|"PASS with waiver"|"PASS after refreeze"|"PASS after refreeze, with waiver"|"FAIL",
+              notes: [str], failed: [check], rows: [{target, check, expected, actual, ok}], waivers: [str],
+              refreezes: [{seq, reason, superseded: [seq]}], crash_reruns: [seq], prior_attempts: int, git_commit,
+              code_id, git_dirty}
 ```
 
 ### 4.10 View additions (T413)
@@ -919,6 +1039,12 @@ tests/test_exit_check_p5_offline.py                                             
 | Report with S2 commentary quoting a number that was not in its input | L2c fails | T411 `test_l2c_s2_number` |
 | Licence answered in text | L8 fails | T411 `test_l8_license_answered` |
 | Reader wrong on a critical question / edits requested | score fails | T412 `test_score_*`; T419 `test_rehearsal_reader_fail` |
+| A reader that answers from priors (no reading) | fails the canary row (C16/C17) | T412 `test_canary_detection`; T419 `test_rehearsal_canary_ignored` |
+| A drop seen at one eval only (transient) | not a stop; the next eval must confirm | T401 `test_validate_persistence`; T406 `test_transient_drop_not_a_stop` |
+| Second retrain of the same subject; P3 card.v2 subject Card | parent = newest non-v4 header-scan Card; v0–v2 upgraded | T401 `test_with_retrain_parents`; T408 `test_retrain_twice`, `test_parent_from_p3_card` |
+| Ledger grows after a report was rendered | heads pinned in the bundle; L10b reads the prefix | T409 `test_heads_pinned`; T411 `test_l10b_ledger_append_ignored`; T419 rehearsal E8 |
+| Retry of a gate after a FAIL (rerun, resample, resubmit) | refused (exit 5) without a refreeze; refreeze shown as "PASS after refreeze" | T417 `test_run_one_shot`, `test_read_one_shot`; T416 `test_c18_one_shot`, `test_exit_status`; T419 `test_rehearsal_refreeze_status` |
+| A library writes caches or files during COMPUTE | HOME/TMPDIR/HF_HOME/TORCH_HOME/TRITON_CACHE_DIR/XDG_CACHE_HOME inside the job dir; audited and purged | T407 `test_cache_dirs_in_job_dir` |
 
 ## 8. Risks and how each is tested
 
@@ -944,7 +1070,7 @@ tests/test_exit_check_p5_offline.py                                             
 
 | Earlier contract | Change | Task |
 |---|---|---|
-| `scout/card.py` (P1 T009, P2 T102, P3 T202, P4 T306) | `SUPPORTED_SCHEMA_VERSIONS` += `"card.v4"`; new `RETRAIN_VERSION = "retrain.v1"`, `validate_retrain(r) -> list[str]`, `with_retrain(card, table, attribution, retrain, extra_log, out_dir) -> BuiltCard` (writes `card.v4`); `load_card` accepts v4. `SCHEMA_VERSION`, `build_card`, `with_attribution`, `object_id`, the Parquet schema and every v0–v3 behaviour are unchanged; card.py still imports none of `scout.attrib`, `fullplan`, `gate`, `scan`, `hub`, `sources` (P3 C10), and imports `scout.caveats` only | T401 |
+| `scout/card.py` (P1 T009, P2 T102, P3 T202, P4 T306) | `SUPPORTED_SCHEMA_VERSIONS` += `"card.v4"`; new `RETRAIN_VERSION = "retrain.v1"`, `validate_retrain(r) -> list[str]`, `with_retrain(card, table, attribution, retrain, extra_log, out_dir) -> BuiltCard` (writes `card.v4` from a header-scan parent card.v0–v3, upgraded like `with_attribution`); `load_card` accepts v4. `SCHEMA_VERSION`, `build_card`, `with_attribution`, `object_id`, the Parquet schema and every v0–v3 behaviour are unchanged; card.py still imports none of `scout.attrib`, `fullplan`, `gate`, `scan`, `hub`, `sources` (P3 C10), and imports `scout.caveats` only | T401 |
 | `scout/hub.py` (P1 T005, P4 T302) | `HubSource(..., repo_type: str = "model")`; `"dataset"` uses `GET {endpoint}/api/datasets/{repo}/revision/{rev}` and file URLs `{endpoint}/datasets/{repo}/resolve/{sha}/{path}`; the same logging, preflight, redirects, retries and error mapping; `repo_type="model"` is byte-identical to P4 (no P1–P4 test changes) | T402 |
 | `tests/helpers/fakehub.py` (P1 T003, P4 T302) | `add_repo(..., repo_type: str = "model")`; dataset routes mirror the model routes under `/api/datasets/` and `/datasets/`; default responses byte-identical | T402 |
 | `scout/jobs/spec.py` (P4 T315) | `validate_spec` accepts `kind == "retrain"` by delegating to `scout.retrain.spec.validate_retrain_spec` (imported inside the function); for `kind == "attribute"` behaviour and messages are unchanged; `params_digest()` unchanged | T407 |
@@ -967,7 +1093,7 @@ No P1–P4 test file is edited. No frozen P1–P4 parameter changes.
 | T401 | Card v4 (`stats.retrain`), `retrain.v1` validator, `with_retrain`; `scout/caveats.py` texts | opus | T306, T314, T318 |
 | T402 | Dataset repos in `HubSource` and FakeHub | opus | T003, T005, T302 |
 | T403 | `RETRAIN_PARAMS`, retrain plan (all subject tensors + attribution plan + data files + recipe digest), plan display, subject/data refusals | opus | T310, T401, T402, T404 |
-| T404 | Retrain fixtures: tiny trained Llama family (base, derived, control), WordLevel tokenizer, Markov text dataset (test only); `retrain` extra | sonnet | T003, T212, T313, T314 |
+| T404 | Retrain fixtures: tiny trained tied-embedding Llama family (base, derived, control, redrawn), WordLevel tokenizer, low-entropy Markov text dataset (test only), measured against P4 attribution and re-init damage; `retrain` extra | opus | T003, T212, T313, T314, T317 |
 | T405 | Model build from scratch tensors, data tokenisation, re-init, training step and eval metrics (torch) | opus | T305, T314, T403, T404 |
 | T406 | Retrain loop: baseline check, re-fingerprint via `RetrainProvider`, stop rule, outcomes, `retrain.v1` | opus | T401, T405 |
 | T407 | Worker retrain job (`run_retrain_job`), retrain spec, worker dispatch and `retrain-env`, abort on client death | opus | T315, T316, T402, T406 |
@@ -1016,9 +1142,10 @@ file disjointness across all tasks, and that this table, the waves, §6 and the 
   attribution rule inside the loop (T406), training numerics and invariant 1 in memory (T405), verdict/caveat wording
   and invariant 5 checks (T410, T411), the reader key and scoring that decide an exit row (T412), exit evidence (T416,
   T418, T419).
-- Sonnet, each with every signature, constant and output string given: T404 (fixtures), T413 (view fields, one route,
-  rendering over finished schemas), T414 (CLI plumbing over finished functions), T415 (a line parser and a counting
-  rule).
+- Opus since r1: T404 (the rehearsal fixture is a measured design whose adequacy the T406/T419 exit evidence depends
+  on; validation r1 major 6).
+- Sonnet, each with every signature, constant and output string given: T413 (view fields, one route, rendering over
+  finished schemas), T414 (CLI plumbing over finished functions), T415 (a line parser and a counting rule).
 
 ## 11. Items deferred "to P5" by earlier phases, and their disposition
 

@@ -19,9 +19,11 @@ interface: |
     def guarded_worker_main(argv: list[str]) -> int            # socket guard, then scout.jobs.worker.main(argv)
     # `python -m tests.helpers.p5_rehearsal guarded-worker [worker args]` -> sys.exit(guarded_worker_main(args))
     def answers_from_key(key: dict, questions: list[dict]) -> dict[str, str]  # natural-language answers that score correct
-    def make_reader_stub(keys_by_subject: dict[str, dict], *, wrong: dict[str, str] | None = None) -> StubS2Client
-    def write_human_answers(path: pathlib.Path, keys_by_label: dict[str, tuple[dict, list[dict]]], *, blind: bool = True,
-                            wrong: dict[str, dict[str, str]] | None = None) -> None
+    def make_reader_stub(keys_by_subject: dict[str, dict], *, wrong: dict[str, str] | None = None,
+                         canary_mode: str = "detect") -> StubS2Client
+    def write_human_answers(path: pathlib.Path, keys_by_label: dict[str, tuple[dict, list[dict]]], neutral: dict[str, str],
+                            *, blind: bool = True, wrong: dict[str, dict[str, str]] | None = None,
+                            canary_mode: str = "detect") -> None
 behavior: |
   1. build_world(root):
      a. rt = retrain_fixtures.write_family(root / "rt") (T404: base, derived, control, redrawn, data).
@@ -44,7 +46,7 @@ behavior: |
         entry.object}}} (other keys present with plausible values). pins_p4 = {te_dir: its key sha}.
      e. pins_p5 = {rt derived, rt base, rt control, rt data folder: their key shas} (the three model shas equal pins_p3).
      f. retrain_target = {"label": "retrain", "subject": derived path, "base": base path, "controls": (control path,),
-        "blocks": (2, 5), "budget": "rehearsal", "data": {"repo": data path, "train_file": "data/train.parquet",
+        "blocks": tuple(retrain_fixtures.RT_FLAGGED), "budget": "rehearsal", "data": {"repo": data path, "train_file": "data/train.parquet",
         "eval_file": "data/test.parquet"}, "max_wall_s": 1800, "max_compute_s": 1200, "gate_threshold_bytes": 0}.
      g. report_targets = ({"label": "retrain", "subject": derived path, "component": None, "pins": "p3", "run": ("system1",
         "attribution", "retrain"), "not_run": ("system2",)}, {"label": "te", "subject": te_dir, "component":
@@ -59,13 +61,20 @@ behavior: |
      yes/no -> "Yes."/"No."; "not run"/"none" literal. make_reader_stub: a StubS2Client whose responder finds which
      subject key string occurs in the user message's report_text and returns {"answers": [...], "required_edits": [],
      "optional_edits": []} built by answers_from_key over that report's questions, overriding question ids in `wrong`.
-     write_human_answers writes the plan.md 4.7 YAML (reader id "rehearsal", date "2026-09-29").
+     The canary is recognised by READER_PARAMS["canary"]["licence_sentence"] in the report_text: canary_mode "detect"
+     answers Q8 "Yes, the report says this is permitted." and adds the required edit {quote: that sentence, reason:
+     "contradicts_report"} (a reader that reads: failed_as_required); canary_mode "ignore" answers from the clean key
+     with no edits (a reader that answers from priors: the canary row must FAIL). Every call of the stub is
+     deterministic, so the three llm samples of a file are equal.
+     write_human_answers writes the plan.md 4.7 YAML keyed by the neutral file names (reader id "rehearsal", date
+     "2026-09-29"), the canary entry built as in canary_mode.
 acceptance:
   tests:
     - "test_world_builds: build_world on a fresh dir -> every path exists; CardStore(store_p4) has the te entry with has.attribution; p3_ledger.verify(ledgers['p3']) == [] and verify(ledgers['p4'], kinds=P4_KINDS) == []; pins_p5 model shas equal pins_p3; the JEV model file loads with scout.jev.load"
     - "test_world_cited: for every Card in cards_p3 the SCAN entry's card_files match its file hashes; FREEZE_MODEL sha256 equals the model file; the P4_EXIT object equals the store entry"
     - "test_guarded_worker: `python -m tests.helpers.p5_rehearsal guarded-worker hello --scratch-root tmp` prints a hello line and exits 0; inside guarded_worker_main a socket.create_connection attempt raises OSError"
-    - "test_answers_roundtrip: for a report bundle built by T409 from the world, score(answers_from_key(key, qs), key, qs, [], ...) passes; with wrong={'Q8': 'Yes.'} it fails"
+    - "test_answers_roundtrip: for a report bundle built by T409 from the world, score(answers_from_key(key, qs), key, qs, [], ...) passes; with wrong={'Q6': 'none'} it fails"
+    - "test_canary_stub: for make_canary of that report, the 'detect' stub's answer gives canary_detection failed_as_required True (detected includes D2); the 'ignore' stub's gives False"
     - "test_world_runtime: build_world on a fresh dir finishes within 600 s on 4 CPU cores"
   commands:
     - pytest -q tests/test_p5_rehearsal_world.py
