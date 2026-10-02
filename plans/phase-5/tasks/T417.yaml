@@ -24,7 +24,8 @@ interface: |
     DEFAULTS = {"pins": "exit/pins_p5.json", "pins_p3": "exit/pins_p3.json", "pins_p4": "exit/pins_p4.json",
                 "ledger": "exit/ledger_p5.jsonl", "ledger_p3": "exit/ledger_p3.jsonl", "ledger_p4": "exit/ledger_p4.jsonl",
                 "store": "cards/p5-store", "cards_p3": "cards/p3", "store_p4": "cards/p4-store", "out": "reports/p5",
-                "model": "models/jev_v1.json", "manifest": "library/manifest.yaml", "form": "exit/reader_human.yaml"}
+                "model": "models/jev_v1.json", "manifest": "library/manifest.yaml", "form": "exit/reader_human.yaml",
+                "ack": "exit/p5_ack.json"}
     def worker_retrain_env(backend: Backend, timeout_s: float = 120.0) -> dict   # args ["retrain-env"], one JSON line
     def populate_store(store: CardStore, cards_p3: Path, store_p4: Path, keys_p4: list[dict]) -> dict
         # import_tree(cards_p3); for each key in keys_p4: every entry of store_p4 with that key -> export to a tmp dir ->
@@ -71,8 +72,9 @@ behavior: |
      P5_PREFLIGHT {hello, retrain_env, checks, git_commit, code_id} is appended before P5_PLAN in the same step.
   5. run: one-shot gate first (validation r1 major 3; P3 pattern: refused runs append nothing and exit 5):
      a. the P5_RETRAIN entries after the last P5_FREEZE: one with passed true -> exit 5 "retrain already passed under
-        this freeze"; one with passed false and crash false (the job returned a result and a row FAILed: a finding) ->
-        exit 5 "a completed retrain FAILed: a new run needs a recorded refreeze (freeze --refreeze-reason)".
+        this freeze" (also when it carries a finding, D100); one with passed false and crash false (the job returned a
+        result and a gating row FAILed) -> exit 5 "a completed retrain FAILed: a new run needs a recorded refreeze
+        (freeze --refreeze-reason)".
      b. crash reruns: P5_RETRAIN entries with crash true (no result message: backend or transport error, worker exit
         before `result`, PlanMismatch, DiskSpaceError) do not block, up to MAX_CRASH_RERUNS (2) per freeze; a third
         -> exit 5 "too many crash reruns: refreeze".
@@ -83,12 +85,16 @@ behavior: |
      C6 plus the "data files only" row, C7 plus "no checkpoint written", C14 with scout.view.build_view of the stored
      Card v4). Any exception -> the job's rows FAIL with the error text. Append P5_RETRAIN (always; payload plan.md 4.9
      with the evidence of plan.md 2.3 and crash = (no result message was received)) and print the table and
-     {"step": "RETRAIN", ...}. Exit 0 iff every row ok. Rows C11a, C11b and C12 are evaluated separately (T416), so a
-     FAIL says whether the loop is broken (C11a) or the experiment's finding is negative (C11b/C12).
+     {"step": "RETRAIN", ...} with each row's T416 row_verdict (PASS / FAIL / FINDING). passed = T416
+     gating_ok(rows); finding = the retrain.v1 outcome when an outcome row (C11b, C12) is not ok, else None (D100).
+     Exit 0 iff passed (a FINDING alone exits 0 and prints "FINDING: <outcome>"). A FAIL therefore always means a
+     gating row (the loop, the gate, the job), never a negative experimental result.
   6. reports: requires a P5_RETRAIN with passed true after the last P5_FREEZE (else exit 1 "no passing P5_RETRAIN");
      a P5_REPORTS after the last P5_FREEZE -> exit 5 "reports already built under this freeze" (one-shot).
-     D99 (invariant 1 acknowledgement for report files) is a human decision recorded before E5; until it is recorded
-     the plan's default applies (deferred minor, plan.md 11).
+     D99 precondition (validation r1 minor): exit/p5_ack.json must exist and parse as {"decision": "D99", "by": str
+     non-empty, "date": "YYYY-MM-DD"} (written by the human, not by any script); otherwise exit 5 "D99 acknowledgement
+     missing: record exit/p5_ack.json" and nothing is written or appended. Its sha256 is recorded in P5_REPORTS
+     (field ack_sha256). DEFAULTS gains "ack": "exit/p5_ack.json" (flag --ack).
      For each report target (order of P5_REPORT_TARGETS): target string repo@pin[#component]; inputs = ReportInputs(
      store, model, manifest, pins_p3 file (or a temp file of the keyword dict), ledgers {p3, p4, p5}); bundle =
      build_bundle(target, inputs, generated_at=now(), code_id=code.code_id) (ledger heads = the current heads, so the
@@ -126,10 +132,11 @@ behavior: |
      pinned heads make the lint independent of the entries E5-E7 appended) and compares its sha256 with the P5_REPORTS
      under the last freeze; C16 and C17 from THE P5_READER of each reader for that P5_REPORTS seq (one-shot: there is
      exactly one; its samples are re-scored from the recorded answers); C18 check_one_shot over the whole ledger.
-     (status, notes) = exit_status(entries, rows). Print the table, then every refreeze with its reason and the
-     entries it superseded, every crash rerun, every waiver, and f"EXIT CHECK (P5): {status}"; append P5_EXIT {passed,
-     status, notes, ...} (also after an exception) and print {"step": "EXIT", "phase": 5, "status", ...}. Exit 0 iff
-     every row ok.
+     (status, notes, line) = exit_status(entries, rows, outcome of that P5_RETRAIN) (T416, D100). Print the table with
+     row verdicts (PASS / FAIL / FINDING), then every refreeze with its reason and the entries it superseded, every
+     crash rerun, every waiver, the finding, and `line` as the LAST line (e.g. "EXIT CHECK (P5): PASS after refreeze
+     (<reason>)"); append P5_EXIT {passed, status, finding, notes, ...} (also after an exception) and print {"step":
+     "EXIT", "phase": 5, "status", ...} before the last line. Exit 0 iff status != "FAIL".
   10. Stdin is never read; every confirmation comes from --confirm-plans.
 acceptance:
   tests:
@@ -146,6 +153,8 @@ acceptance:
     - "test_human_locked_before_scores: read --reader human -> the P5_READER line is in the ledger file before the first score line is written to stdout (stdout spy reads the ledger at the first write)"
     - "test_canary_written: reports writes out/canary.html with the three defects (reader.make_canary of retrain.html) and P5_REPORTS lists it with neutral names; reader-form copies 4 files under neutral names and prints no label mapping"
     - "test_exit_status_printed: a ledger with a refreeze after a P5_RETRAIN and otherwise passing rows (fake) -> 'EXIT CHECK (P5): PASS after refreeze' and the reason; P5_EXIT.status records it"
+    - "test_run_finding (D100): a fake backend whose retrain.v1 outcome is signal_persists with every gating row ok -> run exit 0, prints 'FINDING: signal_persists', P5_RETRAIN passed True and finding 'signal_persists'; a second run -> exit 5; reports proceeds"
+    - "test_reports_needs_ack (D99): no exit/p5_ack.json -> reports exit 5, nothing written or appended; with a valid ack -> P5_REPORTS.ack_sha256 equals its sha256"
     - "test_exit_p5_network (tests/test_exit_p5_network.py): @pytest.mark.network; skipped unless SCOUT_P5_CONFIRM_PLANS and SCOUT_SPARK_HOST are set; runs main(['run', '--backend', 'ssh:' + host, '--confirm-plans', value]) == 0"
   commands:
     - pytest -q tests/test_exit_check_p5_units.py tests/test_pin_exit_p5.py

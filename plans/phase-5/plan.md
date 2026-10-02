@@ -1,6 +1,6 @@
 # Phase 5 plan: Product refinement (retrain loop, report export, polish)
 
-Status: r1 (planner REVISE round 1 of 2), 2026-10-01. Responds to `validation.md` r1 (1 blocker, 6 majors, 13 minors);
+Status: r1 (planner REVISE round 1 of 2), 2026-10-02. Responds to `validation.md` r1 (1 blocker, 6 majors, 13 minors);
 see §11. Ready for VALIDATE.
 
 This plan builds on the Phase 1–4 plans (`plans/phase-{1,2,3,4}/plan.md`, tasks T001–T321) and treats them as
@@ -29,10 +29,12 @@ which two blind readers (an LLM and a person) must understand without any edit, 
 2. a fixed set of three report targets (§2.1);
 3. a blind-reader checklist with pass criteria, answered by an LLM reader (C16) and a human reader (C17), plus a
    negative-control canary report with three planted defects that each reader must fail (§3.8);
-4. one full retrain-loop run on a small real model on the Spark with numeric criteria (C3–C14), whose loop-integrity
-   rows (C11a) are kept apart from the empirical outcome rows (C11b, C12);
-5. one-shot gates: every gate (retrain run, reports, each reader) is recorded once per freeze; a retry exists only
-   through a recorded refreeze, and the exit then says "PASS after refreeze", never a plain PASS (C18, §2.1).
+4. one full retrain-loop run on a small real model on the Spark with numeric criteria (C3–C14). The loop-integrity
+   rows (C10, C11a) gate the exit. The empirical outcome rows (C11b signal drop, C12 quality) are reported, not gated.
+   A non-success outcome closes the phase only as **`PASS with finding (<outcome>)`**, never as a plain `PASS` (D100,
+   §2.4);
+5. one-shot gates: every gate (retrain run, reports, each reader) is recorded once per freeze. A retry exists only
+   through a recorded refreeze, and the exit then says `PASS after refreeze (<reason>)`, never a plain PASS (C18, §2.1).
 
 ### 2.1 Targets, pins, freeze (fixed)
 
@@ -151,11 +153,13 @@ python scripts/exit_check_p5.py plan --backend "ssh:$SCOUT_SPARK_HOST" --store c
 
 # E4 the confirmed retrain run (the human copies the CONFIRM WITH line; invariant 2)
 python scripts/exit_check_p5.py run --backend "ssh:$SCOUT_SPARK_HOST" --store cards/p5-store --confirm-plans <id>:<cap>
-# expect exit 0; one job, no prompt; rows C0..C14 PASS (C11a loop integrity, C11b signal drop with persistence, C12
-# quality); the subject Card v4 (stats.retrain) is in the store; ledger gains P5_ATTEMPT (before the job) then
-# P5_RETRAIN. One-shot: a second `run` under this freeze exits 5 unless the first was a crash (§2.1)
+# expect exit 0; one job, no prompt; gating rows C0..C11a, C13, C14 PASS; outcome rows C11b (signal drop with
+# persistence) and C12 (quality) print PASS or FINDING (never FAIL; D100); the subject Card v4 (stats.retrain) is in the
+# store; ledger gains P5_ATTEMPT (before the job) then P5_RETRAIN {passed, finding}. One-shot: a second `run` under this
+# freeze exits 5 unless the first was a crash (§2.1)
 
-# E5 reports (client, 0 network)
+# E5 reports (client, 0 network). Precondition: the human has written exit/p5_ack.json (D99 acknowledgement);
+# without it `reports` exits 5 and appends nothing
 python scripts/exit_check_p5.py reports --store cards/p5-store --out reports/p5
 # expect exit 0; reports/p5/{retrain,te,negative}.html built by the `scout report` code path (build_bundle, render,
 # lint); each lints clean (C15, L1-L10); each pins the ledger heads it cites (the p5 head is the entry before this
@@ -178,16 +182,18 @@ python scripts/exit_check_p5.py read --reader human --answers exit/reader_human.
 
 # E8 exit (client, 0 network): re-verifies every row from the ledger, the store and the report files
 python scripts/exit_check_p5.py exit --store cards/p5-store --out reports/p5
-# expect exit 0; table C0..C18 all PASS; last line exactly "EXIT CHECK (P5): PASS" (or "PASS with waiver" under D89;
-# "PASS after refreeze" when any gate was retried through a refreeze, with every reason listed); ledger gains P5_EXIT
-# {status, notes}; commit the ledger
+# expect exit 0; every gating row PASS; last line exactly "EXIT CHECK (P5): PASS" on a success outcome. Qualified
+# forms (T416 exit_status/status_line): "PASS with finding (<outcome>)" when C11b or C12 is FINDING (D100);
+# "PASS with waiver (<reason>)" under D89; "PASS after refreeze (<reason>; ...)" when any gate was retried through a
+# refreeze; the qualifiers combine in that fixed order, e.g. "PASS after refreeze (<r>), with finding (<o>)".
+# Ledger gains P5_EXIT {status, notes}; commit the ledger
 ```
 
 - Subcommands are mutually exclusive; `run` requires `--confirm-plans`; `read` requires `--reader`; `read --reader
   human` requires `--answers`.
 - `run` repeats the preflight and plan steps and FAILs ("plan changed since P5_PLAN") if the plan id differs.
-- `reports`, `read` and `exit` refuse (exit 1) unless a `P5_RETRAIN` entry with `passed: true` exists after the last
-  `P5_FREEZE`; `read` also needs a `P5_REPORTS` entry whose report and canary sha256 values equal the files on disk.
+- `reports`, `read` and `exit` refuse (exit 1) unless a `P5_RETRAIN` entry with `passed: true` (every gating row
+  passed; a FINDING does not block) exists after the last `P5_FREEZE`; `read` also needs a `P5_REPORTS` entry whose report and canary sha256 values equal the files on disk.
 - Exit codes: 0 pass; 1 a check FAILed or a precondition is missing; 3 a credential or the reader endpoint is missing
   or unreachable (nothing appended); 5 a one-shot or freeze rule refused the step (nothing appended).
 
@@ -208,9 +214,9 @@ C3–C14 are evaluated for the retrain job; C15–C17 per report.
 | C8 | no manual intervention: 1 job submitted, `status == "succeeded"`, exit code 0, stdin never read | true |
 | C9 | resources: wall `<= 7200 s`; COMPUTE `<= 5400 s`; worker `rss_peak_bytes <= 48 GiB` | true |
 | C10 | **baseline** (the unmodified subject, computed in the job before any re-initialisation): base `status == "tested"`, `null_ok`, `control_ok`; base attributed fraction `>= 0.95`; control 0 leave-one-out hits; **every flagged block attributed to the base**; baseline perplexity in `[2.0, 60.0]` (forward-pass sanity) | true |
-| C11a | **loop integrity** (deterministic on a correct build): `validate_retrain == []`; outcome not refused; **re-initialisation changed the forward pass** (`reinit.ppl_ratio > 1.0` or `reinit.top1_agreement < 1.0`); **training changed the weights** (`retrained_digest != reinit_digest`); a trace row at every multiple of `eval_every` up to the last row; every row's flagged z non-null, and the last row's flagged z differ from the baseline's (re-fingerprinted on the live tensors) | true |
-| C11b | **signal drop** (empirical), persistence rule: `outcome == "success"`; at the stop row **and** the confirm row (`confirm_step == stop_step + eval_every <= max_steps`): base `status == "tested"`, `null_ok`, `control_ok` (not an abstention); **0 of the 3 flagged blocks attributed to the base**; unflagged blocks attributed fraction `>= 0.95` (the model is still detected as derived); control 0 hits; `post_stop_max_z_adj` shown | true |
-| C12 | **quality** (empirical) at the stop step: `ppl_ratio = exp(eval_loss − eval_loss_baseline) <= 1.05`; top-1 agreement with the unmodified subject on the eval tokens `>= 0.90` | true |
+| C11a | **loop integrity** (deterministic on a correct build): `validate_retrain == []`; outcome not refused; **re-initialisation changed the forward pass** (`reinit.ppl_ratio > 1.0` or `reinit.top1_agreement < 1.0`); **training changed the weights** (`retrained_digest != reinit_digest`); a trace row at every multiple of `eval_every` up to the last row; every row's flagged z non-null, and the last row's flagged z differ from the baseline's (re-fingerprinted on the live tensors); **at every trace row the unflagged blocks' attributed fraction `>= 0.95`** (localisation; the model is still detected as derived) | true |
+| C11b | **signal drop** (empirical outcome row: PASS or FINDING, D100), persistence rule: `outcome == "success"`; at the stop row **and** the confirm row (`confirm_step == stop_step + eval_every <= max_steps`): base `status == "tested"`, `null_ok`, `control_ok` (not an abstention); **0 of the 3 flagged blocks attributed to the base**; control 0 hits; `post_stop_max_z_adj` shown | true |
+| C12 | **quality** (empirical outcome row: PASS or FINDING, D100) at the stop step (at the last row when there is no stop): `ppl_ratio = exp(eval_loss − eval_loss_baseline) <= 1.05`; top-1 agreement with the unmodified subject on the eval tokens `>= 0.90` | true |
 | C13 | Card v4 and store: the subject Card written by the job has `schema_version == "card.v4"`; `validate_retrain(stats.retrain) == []`; `stats.attribution` is the baseline and validates as `attribution.v1`; `retrain.lineage.parent_object ==` the object id of the header-scan Card the plan used; `retrain.weights_kept is False`; the store holds it; recomputing its object id from the two files gives the stored id | true |
 | C14 | caveats: the `scout retrain` text output and the view of the Card v4 carry the three `DISCLAIMERS`, `ATTRIBUTION_CAVEAT`, `RETRAIN_CAVEAT` and `LICENSE_QUESTION` | true |
 | C15 | **report lint** (per report, §3.7): L1–L10 all at their thresholds; file sha256 `==` the `P5_REPORTS` entry; the sections required by §2.1 present and the others "not run" with a reason | all pass |
@@ -220,8 +226,9 @@ C3–C14 are evaluated for the retrain job; C15–C17 per report.
 
 **E2** evaluates C0 and C2 (freeze only). **E3** evaluates C0–C3 and the plan half of C4. **E4** evaluates C0–C14.
 **E5** evaluates C15; **E6** C16; **E7** C17; **E8** re-evaluates every row from the ledger, the store and the files, adds
-C18, and prints the status (`PASS`, `PASS with waiver`, `PASS after refreeze`, `PASS after refreeze, with waiver`, or
-`FAIL`).
+C18, and prints the status. `FAIL` when any gating row fails; otherwise `PASS`, qualified by `after refreeze`,
+`with finding`, `with waiver` in that order (8 strings, enumerated in §4.9), each qualifier followed in the printed line
+by its reasons or outcome in parentheses. C11b and C12 are the only outcome rows; every other row is gating.
 
 The `P5_RETRAIN` payload records: plan_id, bytes planned/cap, weight bytes, disk peak, wall/compute seconds, rss peak,
 the `retrain-env` report, the baseline (ppl, per-block base z_adj and z_pair), the whole trace (§4.2), the outcome, the
@@ -249,7 +256,8 @@ stop and confirm steps, `post_stop_max_z_adj`, the final flagged-block statistic
   was reached by step 250.
 - **Budget: 2000 steps of 16 × 512 tokens, eval every 250.** 16.4M token presentations, about 5.6 passes over the
   WikiText-2 train split (about 2.9M Qwen tokens, **V**); the stop rule takes the first eval step that meets both
-  criteria, so the budget is a ceiling, not a target. The GPU time bound is §2.5.
+  criteria and is confirmed at the next eval (§3.1 step 5), so the budget is a ceiling, not a target. A candidate can
+  be at most step 1750. The GPU time bound is §2.5.
 - **Measured on a toy (planner scratch `/tmp/p5`, torch 2.14 on CPU; not in the repo).** A word-level LM on the Python
   standard library source (V = 1024 tokens, 2.5M tokens), 8 blocks, hidden 96, GLU intermediate 256, 4 heads, learned
   positions. Base: 2500 steps from scratch. Derivative: the base fine-tuned 300 steps at lr 3e-4 on a disjoint text
@@ -280,16 +288,81 @@ stop and confirm steps, `post_stop_max_z_adj`, the final flagged-block statistic
   | 500 | 1.047 | 0.847 | 1.019 | 0.886 | 0.78 / 0.99 |
   | 1000 | 1.005 | 0.849 | 0.983 | 0.901 | 1.99 / 0.90 |
 
-  What the two toys say for the exit: (1) the signal drops at the first eval point in every run (no flagged block
-  attributed at any step; crit 5.20); (2) perplexity recovers in both; (3) **top-1 agreement is the binding
-  criterion**, and it depends on how much of the MLP stack is removed: 2 of 8 blocks reach 0.91 by step 250, 4 of 8
-  plateau at 0.85 under CE. The exit flags 3 of 24 blocks (12.5 %, half the smaller toy's fraction), which favours
-  C12; but its whole budget presents only about 0.42 training tokens per trainable parameter (16.4M / 39.2M), against
-  3.5 at the smaller toy's step 250 and 1.3 at the harder toy's step 1000. The toys therefore do not establish C12 at
-  exit scale: **C12 is the exit's main risk** (§8). A C12 FAIL is a finding; the 0.90 bound and the budget are not
-  changed after a run. (4) Under CE the flagged z drifts upward with training (max z_adj about 2 by step 1000, still
-  far below crit); see later.md. The KD objective recovers agreement faster but is rejected for the product (§3.4: it
-  pulls the new neurons towards the old function) and is not used.
+- **Measured at the exit's probe count (r1, validation major 1; planner scratch `/tmp/p5r1`, `m2048_retrain.py`,
+  `starved.py`, `p4stat.py`).** A third toy family uses V = 4096 word tokens, 8 blocks, hidden 128 and GLU intermediate
+  2048, so **m = 2048 neurons tested with 2048 probes**, as at the exit. The control has intermediate 2304 and is trained
+  on the same data. The P4 statistic is re-implemented with Bonferroni over 16 tests, giving crit 5.20 (df 7). The
+  baseline z_adj of derived vs base is 42.46 in every block (ceiling √2047 = 45.2), and the control LOO maximum is 0.83.
+  The recipe is the exit's: AdamW 1e-3, warmup 100, cosine to 10 % over 2000 steps, clip 1.0, CE, eval every 250, run
+  to 3000 steps. Batch 32 × 64.
+
+  | flagged | step | ppl ratio | top-1 | flagged z_adj | unflagged attributed (min z_adj) |
+  |---|---|---|---|---|---|
+  | {3} (1 of 8 = 12.5 %, the exit's fraction) | 0 (re-init) | 1.033 | 0.922 | 1.40 | 7/7 (42.48) |
+  | | 250 | 1.008 | 0.949 | −1.52 | 7/7 |
+  | | 500 | 1.006 | 0.936 | 1.25 | 7/7 |
+  | | 1000 / 2000 / 3000 | 1.002 / 0.995 / 0.988 | 0.915 / 0.901 / 0.897 | −1.76 / −1.91 / −0.79 | 7/7 (≥ 38.29) |
+  | {2, 5} (2 of 8) | 0 (re-init) | 1.146 | 0.838 | −1.02, −0.62 | 6/6 |
+  | | 250 | 1.016 | 0.914 | 0.18, 1.05 | 6/6 |
+  | | 500 | 1.009 | 0.900 | −0.88, 0.37 | 6/6 |
+  | | 1000 / 2000 / 3000 | 1.005 / 0.992 / 0.984 | 0.867 / 0.852 / 0.845 | ≤ 0.70 | 6/6 (≥ 40.35) |
+
+  **Token-starved variant** (the same family, quality only, batch 2 or 4 × 64, so the first eval sees 0.04 training
+  tokens per trainable parameter; the exit's whole budget is 0.42 and its first eval 0.05):
+
+  | flagged, batch | tokens/param at step 250 | step 0 | step 125 | step 250 | step 375 | later |
+  |---|---|---|---|---|---|---|
+  | {3}, 2 × 64 | 0.041 | 1.033 / 0.922 | 1.019 / 0.939 | 1.018 / 0.919 | 1.018 / 0.924 | 500: 1.015 / 0.936 |
+  | {2, 5}, 4 × 64 | 0.041 | 1.146 / 0.838 | 1.065 / 0.859 | 1.043 / 0.900 | 1.040 / 0.901 | 500: 1.033 / 0.901; 625: 1.026 / 0.893 |
+
+  (cells are ppl ratio / top-1.)
+
+- **What the measurements say for the exit.**
+  1. **The signal drop is stable at m = 2048 (C11b).** No flagged block was attributed at any of the 39 flagged-block
+     evaluations from re-initialisation to step 3000. z_adj had mean −0.59, sd 0.89 and maximum 1.40, against crit
+     5.20 here and 4.12 at the exit. The validator's concern was that the m = 256 drift (z_adj about 2 by step 1000),
+     rescaled by √(2047/255), would give 4.7–5.7 at the exit. It does not happen: the drift seen at m = 256 was null
+     noise (sd about 1 at any m), not a constant ρ, so it does not grow with √m. The persistence rule (§3.1 step 5)
+     gives `success` with stop 250 and confirm 500 in both m = 2048 runs (post-stop max z_adj 1.25 and 0.37), and stop
+     250 in the m = 256 CE run. A false FINDING from noise at the exit crit is ≤ 0.002 per job (6 block-looks at
+     t.sf(4.12, 23) = 2.1e-4).
+  2. **Unflagged blocks stay attributed (C11a)**: minimum z_adj 38.3 over every row, against crit 5.20.
+  3. **Quality (C12) passes at the first candidate in 3 of 4 configurations.** It passes for 1 of 8 and 2 of 8 at
+     m = 2048 and for 2 of 8 at m = 256. It fails for 4 of 8, which plateaus at top-1 0.85. Token starvation to the
+     exit's ratio did not change the 1-of-8 result. It moved 2 of 8 from 0.914 to 0.900 at step 250, exactly at the
+     bound, with a plateau near 0.90 until step 500 and a decline after it (0.893 at step 625).
+  4. **Agreement peaks early, then declines** (1 of 8: 0.949 at step 250, 0.897 at step 3000). In-domain retraining
+     moves the argmax away from the unmodified model while perplexity keeps falling below 1. The stop rule's earliest
+     confirmed candidate is therefore also the best quality point. A longer budget would not help C12, so no second
+     budget is pre-registered.
+  5. **The difference that remains is the exit model itself.** Its MLP-removed damage for 3 of 24 Qwen blocks is
+     unknown. With 3 blocks it can be larger than one toy block, and the toy damage ranged from top-1 0.92 to 0.58.
+     Hidden 896 against 128 and real text against code tokens can each move it. **Planner's estimate of P(success) on a
+     correct build: 0.5–0.8** (not measured at exit scale; no GPU or Hub here). This is why D100 makes C11b and C12
+     outcome rows: a correct build closes with `PASS` (success) or `PASS with finding (<outcome>)`. The rows that gate
+     are deterministic on a correct build except C10 (≤ 0.003, P4), C16 (≤ 0.08 for the three reports, ≤ 0.03 for the
+     canary, §3.8) and C17 (no rate claimed). The **pass rate of the gating rows on a correct build is ≥ 0.88** (1 − 0.003 − 0.11), with
+     the LLM reader the dominant term.
+  6. The KD objective of the first two toys recovers agreement faster, but it is rejected for the product (§3.4: it
+     pulls the new neurons towards the old function) and is not used.
+
+- **Rehearsal fixture (T404; validation r1 major 6), measured on the frozen recipe** (`rtfam.py`, `rt_measure.py`; P4
+  statistic as above; transformers 5.18, torch 2.14 CPU). The fixture is a tied Llama with 8 blocks, hidden 128 and GLU
+  intermediate 128, trained 400 steps on order-1 Markov text whose top successor has probability 0.7. The control has
+  intermediate 96. Eval ppl: base 3.44, derived 2.93, control 3.34.
+  - Attribution, derived vs base with the control: 8/8 attributed, z_adj 10.6 each (ceiling √127 = 11.3), crit 5.20,
+    control z −1.43…0.98, LOO max 0.80. Redrawn block 3: z_adj −0.31, not attributed, the other 7 attributed. The
+    control as subject: 0 attributed.
+  - Re-initialising `RT_FLAGGED = (1, 2, 5, 6)` gives ppl ratio 1.324 and top-1 0.937, so `quality_ok` is false at
+    step 0 and recovery is exercised.
+  - Rehearsal budget (eval every 50): step 50 has ppl ratio 1.096 (not a candidate). Step 100 has 1.048 / 0.996 and is
+    the candidate (**stop 100**). Step 150 has 1.022 and is the confirmation (**confirm 150**). The maximum flagged
+    z_adj over 400 steps is 1.96.
+  - Rejected variants, each measured: Dirichlet successor probabilities and intermediate 512 (re-init top-1 0.96, then
+    retraining *lowered* it to 0.83: quality_not_recovered); flagging (2, 5) only (re-init 1.075 / 0.991, recovered by
+    the first eval, so recovery is never exercised).
+  - The real T404/T406 code must reproduce these numbers within the stated tolerances; if not, the fixture is a plan
+    revision (T404 notes), never a silent constant edit.
 
 ### 2.5 Environment, access, bytes, time
 
@@ -365,9 +438,12 @@ estimate:
    `post_stop_max_z_adj`. A drop seen at a single look is never a stop (validation r1 major 2). Candidates are considered
    up to `max_steps − eval_every`. If no candidate is confirmed by `max_steps`, the outcome names what failed from the
    last row (`signal_persists`, `quality_not_recovered`, `neither`, or `unconfirmed` when only the last row is a
-   candidate). A margin (for example `z_adj <= crit/2`) was considered and not adopted: on every toy run it would never
-   have bound (the largest flagged `z_adj` at any eval, 2.49 at m = 1024 and 1.76 at m = 2048, is below `crit/2` of
-   both the toy and the exit, §2.4); the confirm row's value is reported instead.
+   candidate). A margin (for example `z_adj <= crit/2 = 2.06`) was considered and not adopted. Under the null, a
+   re-initialised block's `z_adj` behaves like a standard score: measured at m = 2048 over 39 flagged-block evaluations
+   (§2.4), it had mean −0.59, sd 0.89 and maximum 1.40. A `crit/2` margin would be crossed by noise with
+   probability about 0.02 per block-look, so about 0.11 per job over 6 looks (3 blocks × 2 rows), which would add
+   spurious FINDINGs and carry no information. Persistence over two looks costs nothing at the familywise crit (≤ 0.002
+   per job). The confirm row's maximum is reported as `post_stop_max_z_adj` instead.
 
 **What the loop does not claim.** A block that is no longer attributed has lost the matching-test signal; that is not
 evidence of independent training (P4 §3.8). The retrained checkpoint is still derived from the subject: its attention
@@ -929,18 +1005,22 @@ P5_FREEZE    {params: {retrain, report, lint, reader}, params_sha256: {...}, ret
 P5_PREFLIGHT {hello, retrain_env, checks: {name: ok}, git_commit, code_id}
 P5_PLAN      {plan: {plan_id, bytes_planned, bytes_cap, disk_bytes, data_bytes, recipe_digest}, git_commit, code_id}
 P5_ATTEMPT   {plan_id, bytes_cap, confirm_plans, prior_attempts: int, git_commit, code_id}
-P5_RETRAIN   {attempt_seq, passed, crash: bool (no result message received), failed: [check], error: str|null,
+P5_RETRAIN   {attempt_seq, passed (every gating row ok), finding: str|null (the outcome when C11b or C12 is FINDING),
+              crash: bool (no result message received), failed: [check], error: str|null,
               evidence: {...§2.3 payload}, card_object: str|null, git_commit, code_id}
 P5_REPORTS   {reports: {label: {file_name, sha256, bytes, lint_ok, lint_rows: [{id, count, ok}], answer_key_sha256,
               bundle_sha256, ledger_heads: {name: head_seq}}},
               canary: {file_name, sha256, source_label, defects: [{id, question, text_sha256}]},
+              ack_sha256: str (D99 acknowledgement file, a precondition of E5),
               neutral: {label_or_canary: "report-A.html"...}, passed, git_commit, code_id}
 P5_READER    {reader: "llm"|"human", reports_seq: int (the P5_REPORTS entry read), reader_id: str, blind: bool|null,
               waived: str|null, answers_sha256: str,
               files: {label_or_canary: [{answers, required_edits, score | detection, s2: {requested_model,
                       served_model, request_host, usage}|null}]},      # 3 samples (llm) or 1 (human) per file
               verdicts: {label_or_canary: {n, n_pass, n_failed_as_required, ok}}, passed, git_commit, code_id}
-P5_EXIT      {passed, status: "PASS"|"PASS with waiver"|"PASS after refreeze"|"PASS after refreeze, with waiver"|"FAIL",
+P5_EXIT      {passed, status: "PASS"|"PASS with finding"|"PASS with waiver"|"PASS with finding, with waiver"|
+                "PASS after refreeze"|"PASS after refreeze, with finding"|"PASS after refreeze, with waiver"|
+                "PASS after refreeze, with finding, with waiver"|"FAIL", finding: str|null,
               notes: [str], failed: [check], rows: [{target, check, expected, actual, ok}], waivers: [str],
               refreezes: [{seq, reason, superseded: [seq]}], crash_reruns: [seq], prior_attempts: int, git_commit,
               code_id, git_dirty}
@@ -990,7 +1070,8 @@ Assumptions:
 | D96 | Client death during retraining | Abort flag set on any emit `OSError`, checked every step; `finally` purges | A retrain COMPUTE is long; the P4 45-minute bound would become the whole budget |
 | D97 | P5 store | `cards/p5-store`, populated by `import_tree(cards/p3)` and by export/import of the P4 te entries (byte-identical, so P3/P4 ledger hashes still cite them) | Reports need one store; the P3/P4 artifacts stay untouched |
 | D98 | Quality measure | `ppl_ratio` on the eval split `<= 1.05` and top-1 agreement with the unmodified subject `>= 0.90`; both also recorded right after re-initialisation | Perplexity alone is biased by in-domain retraining; agreement measures preserved behaviour; the post-re-init values show what retraining recovered (§2.4) |
-| D99 | Report files and invariant 1 | A report is a user-requested export, like stdout: scout never stores or reads one back (the linter only verifies), `reports/` is gitignored, the exit keeps each file's sha256 in the ledger. **Open for human acknowledgement**, like P3 D36 | It is fully recomputable from Cards, the frozen model and ledgers (L10b proves it) |
+| D99 | Report files and invariant 1 | A report is a user-requested export, like stdout. scout never stores a report or uses one as an input: `report-lint`, `read` and `exit` read a report file back only to verify it. `reports/` is gitignored, and the exit keeps each file's sha256 in the ledger. **Open for human acknowledgement**, like P3 D36. The acknowledgement is a precondition of E5: `reports` exits 5 until `exit/p5_ack.json` records it (T417) | It is fully recomputable from Cards, the frozen model and ledgers (L10b proves it) |
+| D100 | What the exit requires of the retrain outcome (validation r1 major 1) | **Report the outcome honestly.** C10 and C11a (baseline, loop integrity, reinit and training changed the weights, live re-fingerprinting, unflagged blocks still attributed) and every report and reader row gate the exit. C11b (signal drop) and C12 (quality) are outcome rows: PASS or FINDING. A non-success outcome closes the phase as `PASS with finding (<outcome>)`, listed like a waiver. A rerun after a finding needs a refreeze and shows `PASS after refreeze (<reason>)`. **Alternative**: gate on `success`. The planner's pass probability for that is 0.5–0.8 (§2.4), and the only route out of a FAIL is a post-hoc budget change | The phase asks for a loop that *confirms whether* the signal drops. Whether it drops on one model under one frozen budget is a fact about that model, not about the tool. The tool's ability to show a drop is proven deterministically in the rehearsal (T406, T419). Gating on an outcome with an unmeasured pass rate invites exactly the refreeze-until-pass the plan forbids |
 
 ## 6. Architecture (files)
 
@@ -1050,8 +1131,8 @@ tests/test_exit_check_p5_offline.py                                             
 
 | Risk | Mitigation / test |
 |---|---|
-| Retraining recreates the base's neurons, so the signal never drops (exit C11) | Measured on a toy (§2.4). The loop reports `signal_persists` honestly; a FAIL goes to the human, and nothing is re-seeded or re-thresholded. T406 `test_signal_persists` proves the loop reports it |
-| Quality does not recover within the budget (exit C12): **the main exit risk** | Zero-init `down` (step 0 = MLP removed); both quality measures reported per eval step and right after re-initialisation; measured on two toys (§2.4): 2 of 8 blocks reach top-1 0.91 by step 250, 4 of 8 plateau at 0.85, and the exit budget is only about 0.42 tokens per trainable parameter. The bounds and the budget are frozen in `P5_FREEZE`; a FAIL goes to the human with the trace, and changing either needs a refreeze with a recorded reason (C2) |
+| Retraining recreates the base's neurons, so the signal comes back (exit C11b) | Measured at the exit's probe count m = 2048 (§2.4): max flagged z_adj 1.40 over 3000 steps and 3 flagged-block runs (crit 5.20 toy, 4.12 exit); the √m extrapolation of the m = 256 toy does not hold. Under the null, the false-FINDING rate from noise is ≤ 0.002 per job (6 block-looks at t.sf(4.12, 23) ≈ 2e-4). The loop reports `signal_persists` honestly, as `PASS with finding` (D100), and nothing is re-seeded or re-thresholded. T406 `test_signal_persists`; T419 `test_rehearsal_finding` |
+| Quality does not recover within the budget (exit C12): **the main empirical risk** | Zero-init `down` (step 0 = MLP removed). Both quality measures are reported per eval step and right after re-initialisation. Measured (§2.4): at m = 2048 the 1-of-8 toy (the exit's 12.5 %) passes at the first eval, also when token-starved to the exit's 0.04 tokens per trainable parameter; 2 of 8 reaches 0.914 at step 250 (0.900 when starved); 4 of 8 plateaus at 0.85; agreement *declines* after its peak, so the earliest confirmed candidate is the best stop. The planner's estimate of P(success) on a correct build is 0.5–0.8. A non-success outcome is `PASS with finding` (D100), not a FAIL; the bounds and the budget stay frozen (C2) |
 | Retrained weights persist (invariant 1) | No save call exists (static AST test over `scout/retrain`, T405); only scratch tensors of the plan are written (C7 `bytes_written == bytes_planned`); `finally` deletes tensors and purges; weights-free Card (T401 `test_retrain_no_weights`: no numeric list longer than 64 outside `final_attribution.blocks`) |
 | transformers downloads something behind the ByteLog (invariant 2) | `from_config` only; offline env flags; the rehearsal runs COMPUTE with `socket.socket.connect` patched to raise (T419) and T405 `test_no_network_in_compute` |
 | Data bytes bypass the gate | Data ≤ 32 MiB as logged META reads (P1 semantics); the plan display lists them; sha256 checked; C3 and C6 recount them |
@@ -1064,7 +1145,9 @@ tests/test_exit_check_p5_offline.py                                             
 | The answer key is adjusted after seeing answers | Key sha256 in `P5_REPORTS` before any `P5_READER`; code frozen since `P5_FREEZE` (C2) |
 | P1–P4 regressions | `card.v4` written only by `with_retrain`; `SCHEMA_VERSION` unchanged; the job spec keeps kind `attribute` behaviour byte-identical; every task runs the full `pytest -q` |
 | torch absent where P1–P4 run | Imports inside `scout/retrain` functions only; T405 `test_core_imports_without_torch` (subprocess with torch blocked via `sys.modules` poisoning: `import scout.cli, scout.jobs.worker, scout.report` succeeds) |
-| GPU nondeterminism makes a rerun differ | Stated; reruns are recorded (`prior_attempts`); a FAIL is resolved only by a logged human decision and a refreeze with a reason |
+| GPU nondeterminism makes a rerun differ | Stated. Only crash reruns are allowed under one freeze (≤ 2, C18); any other rerun needs a refreeze with a reason and shows as `PASS after refreeze (<reason>)` (T416 `test_exit_status`, T419 `test_rehearsal_refreeze_status`) |
+| A gate is retried until it passes (LLM resampling, human resubmission, run repetition) | One-shot gates (§2.1, validation r1 major 3): k-of-n pre-registered in `READER_PARAMS`, one human submission hashed before scores are shown, `run` refused after a completed retrain; C18 audits the ledger (T416 `test_c18_one_shot`, T417 `test_run_one_shot`, `test_read_one_shot`) |
+| The readers cannot fail (constant keys, lenient LLM) | Content-dependent critical keys (T412 asserts they vary across fixture reports); the canary with three planted defects must FAIL in ≥ 2 of 3 LLM samples and for the human (C16, C17); stated rates in §3.8 |
 
 ## 9. Changes to earlier contracts
 
@@ -1111,7 +1194,7 @@ No P1–P4 test file is edited. No frozen P1–P4 parameter changes.
 | T419 | P5 offline rehearsal: the whole exit on the rehearsal world with real worker subprocesses, plus failure paths | opus | T417, T418 |
 
 Parallel waves (each task in the earliest wave its dependencies allow; no shared files within a wave; checked by
-`/tmp/p5fin/validate_tasks.py`, which also checks YAML parsing, required keys, dependency existence and acyclicity,
+`/tmp/p5r1/validate_tasks.py`, which also checks YAML parsing, required keys, dependency existence and acyclicity,
 file disjointness across all tasks, and that this table, the waves, §6 and the ownership table match the task files):
 1. {T401, T402, T404, T415}
 2. {T403, T409}
@@ -1142,12 +1225,55 @@ file disjointness across all tasks, and that this table, the waves, §6 and the 
   attribution rule inside the loop (T406), training numerics and invariant 1 in memory (T405), verdict/caveat wording
   and invariant 5 checks (T410, T411), the reader key and scoring that decide an exit row (T412), exit evidence (T416,
   T418, T419).
-- Opus since r1: T404 (the rehearsal fixture is a measured design whose adequacy the T406/T419 exit evidence depends
-  on; validation r1 major 6).
+- Opus since r1: T404 (the rehearsal fixture is a measured design that the loop and rehearsal evidence depends on;
+  validation r1 major 6).
 - Sonnet, each with every signature, constant and output string given: T413 (view fields, one route, rendering over
   finished schemas), T414 (CLI plumbing over finished functions), T415 (a line parser and a counting rule).
 
-## 11. Items deferred "to P5" by earlier phases, and their disposition
+## 11. Validation responses — round 1
+
+Answers to `validation.md` r1. Every fix below is checked by `/tmp/p5r1/validate_tasks.py`, which parses the YAML and
+checks deps, waves, file disjointness, plan/task consistency and the r1 items. Measurements are in planner scratch
+`/tmp/p5r1` and are not in the repo.
+
+| Finding | Resolution | Where |
+|---|---|---|
+| **Blocker**: an embedded ledger summary goes stale after later appends | **Ledger heads are pinned.** The bundle records `inputs.ledgers[] = {name, file_name, head_seq, head_line_sha256}`, with no entry count. Every citation is chosen within that prefix. L10b rebuilds with the embedded heads, verifies each chain up to its head and checks the head line hash, and ignores later appends. The E5 reports pin the p5 head just before their own `P5_REPORTS`, so E6–E8 appends never change a rebuild. | §3.6 "Pinned ledger heads", §3.7 L10, §4.5; T409 `read_entries(upto_seq)`, `ledger_heads`, `test_heads_pinned`; T411 `test_l10b_ledger_append_ignored`; T417 behaviors 6 and 9; T419 `test_rehearsal_pass` (lint clean at E8) |
+| **Major 1**: C11 drift and C12 unmeasured at exit scale; refreeze shown as a plain PASS | (a) Measured at the exit's m = 2048 (§2.4). Over 39 flagged-block evaluations to step 3000, no flagged block was attributed: max z_adj 1.40, mean −0.59, sd 0.89, crit 5.20 (4.12 at the exit). The predicted √m growth (4.7–5.7) does not occur, so the C11b noise false-FINDING rate is ≤ 0.002 per job. (b) C12 measured near exit scale (1 of 8 = 12.5 %, m = 2048, starved to 0.04 tokens/param): it passes at the first eval (top-1 0.94). 2 of 8 starved is at the bound (0.900). Agreement declines after its peak, so no fallback budget is pre-registered. Planner P(success) = 0.5–0.8; gating-row pass rate on a correct build ≥ 0.88. (c) **Decision D100: report the outcome honestly.** C11b and C12 are outcome rows (PASS/FINDING). A non-success outcome closes as `PASS with finding (<outcome>)`, and a refreeze shows `PASS after refreeze (<reason>)`, never a plain PASS. Justification: the phase asks for a loop that confirms *whether* the signal drops. Gating on an outcome with an unmeasured pass rate leaves only the forbidden post-hoc budget change as a way out. The loop's ability to show a drop is proven deterministically offline. | §2 items 4–5, §2.2 E4/E8, §2.3 C11a/C11b/C12, §2.4, §4.9, D100, §8; T416 `OUTCOME_ROW_PREFIXES`, `row_verdict`, `exit_status` (8 statuses + printed line), `test_outcome_rows`; T417 behaviors 5 and 9, `test_run_finding`; T418 `finding-worker`; T419 `test_rehearsal_finding`, `test_rehearsal_refreeze_status` (exact line `PASS after refreeze (reader stub fixed)`) |
+| **Major 2**: the stop rule had no persistence | **Persistence:** a candidate row (signal dropped and quality ok) is a stop only when the next eval row also has `signal_dropped`. `stop_step`, `confirm_step` and `post_stop_max_z_adj` are recorded; candidates are considered up to `max_steps − eval_every`; `unconfirmed` is the outcome when only the last row qualifies. A `crit/2` margin was rejected with numbers: noise crosses it with probability 0.02 per look, about 0.11 per job. Measured result: stop 250 / confirm 500 in both m = 2048 runs (post-stop max z_adj 1.25 and 0.37), stop 250 at m = 256, stop 100 / confirm 150 on the rehearsal fixture. | §3.1 step 5, §4.2, §4.8 `stop_rule`; T401 `test_validate_persistence`; T406 behavior 5, `test_transient_drop_not_a_stop`, `test_unconfirmed`; T416 C11b `test_c11b_persistence` |
+| **Major 3**: gates could be retried until they pass | **One-shot gates (P3 pattern).** `run` runs once per freeze; only crash reruns are allowed, ≤ 2. `reports` runs once. `read --reader llm` runs once with pre-registered 2-of-3 samples in one invocation. `read --reader human` takes one submission, appended to the ledger before any score is printed. Every other retry needs `freeze --refreeze-reason` and is shown as `PASS after refreeze (<reason>)`. Refused steps exit 5 and append nothing. C18 audits the whole ledger. | §2.1 "One-shot gates", §2.3 C16–C18, §4.9; T416 `check_one_shot`, `test_c18_one_shot`; T417 behaviors 5, 6 and 8, `test_run_one_shot`, `test_read_one_shot`; T419 `test_rehearsal_reader_fail` (second read → 5), `test_rehearsal_failed_run_needs_refreeze` |
+| **Major 4**: readers shown unable to fail | **Content-dependent critical questions** Q1, Q2, Q4 and Q6 (subject@sha, the S1 derived set, attribution counts per reference, the sections not run). T412 asserts that no critical key is constant across the fixture reports. The fixed-answer Q8 and Q9 are non-critical and are linked to canary defects. Q3 matches the printed reason codes exactly. Q4 is scoped to the section titled "Block attribution of the published subject (unmodified)". Q10 is keyed on the row's `signal_dropped`. **Negative control:** a canary copy of the retrain report with three frozen defects (D1 a contradicted count, D2 a sentence answering the licence question, D3 the distillation disclaimer removed) must FAIL in ≥ 2 of 3 LLM samples and for the human; neutral file names hide it. **Rates:** with p, c ≤ 0.10 per sample, 2-of-3 gives ≤ 0.028 per file, ≤ 0.08 false-fail for the three reports and ≤ 0.03 canary miss (single-sample scoring: ≤ 0.34). | §3.8, §4.7, §4.8 `READER_PARAMS`; T412 `make_canary`, `canary_detection`, `llm_verdict`, `neutral_names`; T416 C16/C17 `test_c16_k_of_n`; T418 stubs (`canary_mode`); T419 `test_rehearsal_canary_ignored` |
+| **Major 5**: a second retrain planned from a card.v4 | **The parent is chosen by role, not recency.** `parent_entry(store, key)` returns the newest entry of the key that is not `card.v4`, has a tokenizer and has no attribution; a fresh header scan is made only when none exists. `with_retrain` refuses a v4 or an attribution Card and upgrades v0–v2 (the P3 `card.v2` subject Card is a valid parent). | §3.3 Client, §4.1; T401 `test_with_retrain_parents`; T408 `parent_entry`, `test_retrain_twice`, `test_parent_from_p3_card`, `test_parent_entry_rules` |
+| **Major 6**: rehearsal fixture unmeasured; T404 on sonnet | **T404 re-routed to opus.** The fixture was measured before freezing RT_* (§2.4 "Rehearsal fixture"): derived vs base 8/8 at z_adj 10.6 (crit 5.20), control 0, redrawn block 3 at z_adj −0.31 not attributed. Re-init of (1, 2, 5, 6) gives ppl ratio 1.324 and top-1 0.937, so recovery is exercised. Stop 100, confirm 150. The order-1 Markov text now uses peaked successors (0.7/0.1/0.1/0.1); the Dirichlet variant failed quality and the 2-block variant never exercised recovery. T404 acceptance runs the real P4 `attribute` (`test_family_attribution`) and `test_reinit_damages_quality`. T406 `test_loop_success` requires reinit quality not ok and a first trace row not ok. A miss is a plan revision, never a silent constant edit. | §2.4, §10 routing; T404; T406 |
+
+**Cheap minors fixed in r1:**
+- L5b: abstaining or untestable reference rows render `.reason` (T410 behavior 9, T411 `test_l5b_reference_reason`).
+- C2 compares the recorded pins sha, model sha and the P3/P4 line at each frozen head at every later step (T416
+  `check_frozen`, `test_c2_freeze_inputs`).
+- C7: HOME, TMPDIR, XDG_CACHE_HOME, HF_HOME, TORCH_HOME, TRITON_CACHE_DIR and `tempfile.tempdir` point into the job dir,
+  so they are audited and purged (T407 `test_cache_dirs_in_job_dir`).
+- C6 dataset row: exactly the API listing, `README.md` and the two data files (T416 `check_dataset_wire`).
+- C11a proves the weights changed: `reinit.ppl_ratio > 1` or `reinit.top1_agreement < 1`, and
+  `retrained_digest != reinit_digest` (T406 records `reinit_digest`; T416 `test_c11a_integrity`).
+
+**Also fixed:**
+- The trace table renders `base_status`, `null_ok`, `control_ok` and `signal_dropped` per row (T410).
+- Q10 is keyed on `signal_dropped`, not on `outcome == success` (T412).
+- D99 wording is corrected, and its acknowledgement (`exit/p5_ack.json`) is a precondition of E5 (T417).
+
+**Deferred minors** (one line each; carried to `later.md` at CHECKPOINT):
+- Data bytes vs the cumulative 64 MiB meta threshold: fail-safe (`ReadThresholdExceeded`); state the budget against
+  the job's cumulative log or lower `data_max_bytes`.
+- `license_deny` is lexical ("allows", "permits", number words pass); low risk, since only templates and model-card
+  strings reach the text.
+- Report fixtures live in T409's test module; move them to `tests/helpers/report_fixtures.py` when T410–T413 need
+  them across modules.
+- The `P4_EXIT targets.<label>.object` key name is assumed; pin it against P4 T321 at implementation, or match any
+  64-hex value.
+- The System 2 report section (L2c) and `GET /api/report` are covered offline only, with no exit row; keep them or
+  move them to later.md at CHECKPOINT.
+
+## 12. Items deferred "to P5" by earlier phases, and their disposition
 
 | Source | Item | Disposition |
 |---|---|---|
@@ -1165,7 +1291,7 @@ file disjointness across all tasks, and that this table, the waves, §6 and the 
 | FUTURE_IMPROVEMENTS P3 | D36 human acknowledgement | Carried to the CHECKPOINT summary with D83, D89 and D99 (no P5 work) |
 | FUTURE_IMPROVEMENTS (all other P1–P4 items) | Minor items tied to P1–P4 files | Not P5 scope; unchanged |
 
-## 12. Out of scope for Phase 5
+## 13. Out of scope for Phase 5
 - Exporting retrained weights (D83), re-initialising attention or whole blocks, retraining quantised, MoE or pipeline
   subjects, multi-GPU or multi-job retraining.
 - Data corpora above 32 MiB (a data byte class and gate), self-distillation data.

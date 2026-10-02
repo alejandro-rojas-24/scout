@@ -14,10 +14,13 @@ interface: |
         pins_p3_file: pathlib.Path; ledgers: dict[str, pathlib.Path]          # {"p3", "p4"}
         pins: dict[str, dict]                                                  # {"p5", "p3", "p4"}: repo-or-path -> key sha
         retrain_target: dict; report_targets: tuple[dict, ...]; rt: dict[str, pathlib.Path]
+        ack: pathlib.Path                                                      # root/"p5_ack.json" (D99 stand-in)
     def build_world(root: pathlib.Path) -> World                # cached: returns at once when root/"WORLD_DONE" exists
     p5_world: a pytest fixture (scope "session") -> build_world(tmp_path_factory.getbasetemp() / "p5_world")
     def guarded_worker_main(argv: list[str]) -> int            # socket guard, then scout.jobs.worker.main(argv)
     # `python -m tests.helpers.p5_rehearsal guarded-worker [worker args]` -> sys.exit(guarded_worker_main(args))
+    def finding_worker_main(argv: list[str]) -> int            # guard + the base-copy patch (behavior 2b), then worker.main
+    # `python -m tests.helpers.p5_rehearsal finding-worker [worker args]` -> sys.exit(finding_worker_main(args))
     def answers_from_key(key: dict, questions: list[dict]) -> dict[str, str]  # natural-language answers that score correct
     def make_reader_stub(keys_by_subject: dict[str, dict], *, wrong: dict[str, str] | None = None,
                          canary_mode: str = "detect") -> StubS2Client
@@ -53,10 +56,19 @@ behavior: |
         "text_encoder", "pins": "p4", "run": ("attribution",), "not_run": ("system1", "system2", "retrain")},
         {"label": "negative", "subject": <the T208 repo 'fb/base' local path>, "component": None, "pins": "p3",
         "run": ("system1",), "not_run": ("system2", "attribution", "retrain")}).
+     g1. ack = root/"p5_ack.json" = {"decision": "D99", "by": "rehearsal", "date": "2026-09-29"} (the rehearsal's
+        stand-in for the human acknowledgement that E5 requires, T417).
      g2. Write root/"WORLD_DONE".
   2. guarded_worker_main: socket.socket.connect and socket.create_connection are replaced by functions raising
      OSError("network disabled in the P5 rehearsal") before scout.jobs.worker.main runs; every rehearsal target is a
      local folder, so a passing job proves COMPUTE (torch/transformers included) made no network attempt.
+  2b. finding_worker_main (D100; a correct loop on a model whose retraining recreates the base's neurons): the guard of
+     behavior 2, then scout.retrain.loop.run_loop is wrapped so that it captures inp.provider and patches
+     scout.retrain.train.Trainer.step: after each real step, for every flagged block b and role in (gate, up), the
+     model parameter is overwritten in place with provider.tensor(1, <the same tensor name>) (the BASE's tensor; same
+     architecture in rt_family) with its rows permuted by numpy.random.default_rng(b).permutation. The loop and every
+     check run unchanged, so the run yields outcome signal_persists or neither (the flagged blocks are attributed), with
+     every gating row ok (retrained_digest != reinit_digest; the flagged z differ from the baseline's).
   3. answers_from_key: repo@sha -> f"{repo}@{sha[:10]}"; sets -> ", ".join(sorted); repo: n of N -> "repo: n of N";
      yes/no -> "Yes."/"No."; "not run"/"none" literal. make_reader_stub: a StubS2Client whose responder finds which
      subject key string occurs in the user message's report_text and returns {"answers": [...], "required_edits": [],

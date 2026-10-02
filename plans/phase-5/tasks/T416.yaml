@@ -54,8 +54,15 @@ interface: |
                      waived: str | None, blind: bool | None, expected_host: str = "api.anthropic.com") -> list[Check]  # C16 / C17
         # samples = per-sample score dicts (real report) or canary_detection dicts (canary); llm: 3 samples, human: 1
     def check_one_shot(entries: list[dict]) -> list[Check]                                                                 # C18
-    def exit_status(entries: list[dict], rows: list[Check]) -> tuple[str, list[str]]
-        # ("PASS" | "PASS after refreeze" | "PASS with waiver" | "PASS after refreeze, with waiver" | "FAIL", notes)
+    OUTCOME_ROW_PREFIXES: tuple[str, ...] = ("C11b", "C12")   # D100: outcome rows; every other row gates
+    def is_outcome_row(row: Check) -> bool                       # row.name.startswith(any OUTCOME_ROW_PREFIXES)
+    def row_verdict(row: Check) -> str                           # "PASS" if ok; "FINDING" if not ok and outcome row; else "FAIL"
+    def gating_ok(rows: list[Check]) -> bool                     # all(row.ok for row in rows if not is_outcome_row(row))
+    STATUSES: tuple[str, ...] = ("PASS", "PASS with finding", "PASS with waiver", "PASS with finding, with waiver",
+        "PASS after refreeze", "PASS after refreeze, with finding", "PASS after refreeze, with waiver",
+        "PASS after refreeze, with finding, with waiver", "FAIL")
+    def exit_status(entries: list[dict], rows: list[Check], outcome: str | None) -> tuple[str, list[str], str]
+        # (status in STATUSES, notes, printed last line); outcome = the retrain.v1 outcome of the passing P5_RETRAIN
     ALLOWED_DATASET_PATHS: tuple[str, ...] = ("api", "README.md", "train_file", "eval_file")   # C6 data rule (below)
 behavior: |
   Each function returns Check(target, name, expected, actual, ok) rows exactly as plan.md 2.3 states:
@@ -106,13 +113,15 @@ behavior: |
      changed the forward pass": reinit.ppl_ratio > 1.0 or reinit.top1_agreement < 1.0; "training changed the weights":
      retrained_digest != reinit_digest; the trace has a row at every multiple of eval_every from eval_every to its last
      step (no gap); every trace row's flagged entries carry non-null z (the re-fingerprint ran on the live tensors);
-     the baseline flagged z values differ from the last row's (the provider served the retrained tensors).
-     C11b signal drop (empirical): outcome == "success"; at the stop row AND the confirm row (persistence rule, plan.md
-     3.1 step 5): base_status "tested", null_ok, control_ok, no flagged block attributed, control_hits == 0,
-     unflagged_attributed / unflagged_tested >= 0.95; confirm_step == stop_step + eval_every <= max_steps;
-     post_stop_max_z_adj shown in actual.
-  9. C12 quality (empirical): the stop row's ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from
-     the frozen literal).
+     the baseline flagged z values differ from the last row's (the provider served the retrained tensors); at EVERY
+     trace row unflagged_attributed / unflagged_tested >= MIN_UNFLAGGED_ATTRIBUTED_FRAC (localisation: frozen blocks
+     keep the signal; measured min z_adj 38.3 vs crit 5.20, plan.md 2.4). Row names start with "C11a".
+     C11b signal drop (OUTCOME row, D100; names start with "C11b"): outcome == "success"; at the stop row AND the confirm
+     row (persistence rule, plan.md 3.1 step 5): base_status "tested", null_ok, control_ok, no flagged block attributed,
+     control_hits == 0; confirm_step == stop_step + eval_every <= max_steps; post_stop_max_z_adj shown in actual. For a
+     non-success outcome the row is not ok and actual names the outcome and the last row's flagged z_adj.
+  9. C12 quality (OUTCOME row, D100; names start with "C12"): the stop row's (the last row's when stop_step is None)
+     ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from the frozen literal).
   10. C13: schema card.v4; validate_retrain == []; validate_attribution(stats.attribution) == []; lineage.parent_object ==
       parent_object; weights_kept is False; store.load(entry) returns the Card; card.object_id of the stored files ==
       entry.object.
@@ -135,11 +144,16 @@ behavior: |
       (d) at most MAX_CRASH_RERUNS (2) crash reruns per freeze. Any violation -> FAIL naming the entries
       (the runner refuses them, so a violation means a hand-edited ledger or a runner bug). actual lists every
       refreeze reason, every crash rerun and every waiver.
-  15. exit_status(entries, rows): "FAIL" if any row not ok; else "PASS after refreeze" when some P5_FREEZE follows a
-      P5_ATTEMPT, P5_REPORTS or P5_READER entry (the earlier evidence was superseded, whatever its result), with the
-      reasons as notes; "PASS with waiver" when C17 is waived; both -> "PASS after refreeze, with waiver"; else "PASS".
-      The runner prints f"EXIT CHECK (P5): {status}" and the notes, and records status in P5_EXIT. A refreeze is never
-      shown as a plain PASS.
+  15. exit_status(entries, rows, outcome) (D100, validation r1 majors 1 and 3): "FAIL" if not gating_ok(rows).
+      Otherwise three qualifiers, in this fixed order: refreeze = some P5_FREEZE follows a P5_ATTEMPT, P5_REPORTS or
+      P5_READER entry (the earlier evidence was superseded, whatever its result); finding = some outcome row is not ok;
+      waiver = C17 waived. status = "PASS" + (" after refreeze" if refreeze) + the remaining qualifiers "with finding",
+      "with waiver" joined as in STATUSES (", " after "after refreeze", " " otherwise, ", " between them); it is always
+      one of STATUSES. notes = every refreeze reason, the outcome, the waiver reason. Printed line =
+      "EXIT CHECK (P5): " + status with each qualifier followed by its detail in parentheses:
+      "after refreeze (<reason>; <reason>)", "with finding (<outcome>)", "with waiver (<reason>)", e.g.
+      "EXIT CHECK (P5): PASS after refreeze (gpu node rebooted), with finding (signal_persists)". FAIL prints
+      "EXIT CHECK (P5): FAIL" and the failed gating rows. A refreeze or a finding is never shown as a plain PASS.
 acceptance:
   tests:
     - "test_literals: every FROZEN_* equals the plan.md 4.8 literal and the module constant it mirrors; P5_RETRAIN_TARGET and P5_REPORT_TARGETS equal the plan.md 2.1 tables"
@@ -154,7 +168,9 @@ acceptance:
     - "test_c11b_persistence: success record whose confirm row has control_ok False -> FAIL; confirm_step > max_steps -> FAIL"
     - "test_c16_k_of_n: llm samples 2 of 3 passed -> PASS; 1 of 3 -> FAIL; canary 2 of 3 failed_as_required -> PASS, 1 of 3 -> FAIL; 2 samples given -> FAIL"
     - "test_c18_one_shot: a P5_ATTEMPT after a non-crash failed P5_RETRAIN without an intervening refreeze -> FAIL; with a refreeze -> PASS; two P5_READER llm for one reports_seq -> FAIL; two P5_REPORTS under one freeze -> FAIL; three crash reruns -> FAIL"
-    - "test_exit_status: all rows ok and no refreeze -> 'PASS'; a P5_FREEZE after a P5_RETRAIN -> 'PASS after refreeze' with its reason; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one FAIL row -> 'FAIL'"
+    - "test_exit_status: all rows ok and no refreeze -> 'PASS' and line 'EXIT CHECK (P5): PASS'; a P5_FREEZE (reason 'r1') after a P5_RETRAIN -> 'PASS after refreeze' and line 'EXIT CHECK (P5): PASS after refreeze (r1)'; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one gating FAIL row -> 'FAIL'; all 8 qualifier combinations produce exactly the 8 non-FAIL STATUSES"
+    - "test_outcome_rows (D100): a signal_persists record -> C11b row not ok, row_verdict 'FINDING', gating_ok True, exit_status 'PASS with finding' and line ending 'with finding (signal_persists)'; a C11a row not ok -> row_verdict 'FAIL' and status 'FAIL'; C12 with stop_step None evaluates the last row"
+    - "test_c11a_unflagged: a trace row with unflagged 20/21 -> PASS (0.952); 19/21 -> FAIL (C11a, gating)"
   commands:
     - pytest -q tests/test_exit_expectations_p5.py
     - pytest -q

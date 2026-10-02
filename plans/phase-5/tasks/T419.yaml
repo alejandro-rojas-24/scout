@@ -13,7 +13,7 @@ interface: |
   require_clean=False), require_cuda=False, budget="rehearsal", require_ledger=True), s2_client_factory=<reader stub>,
   expected_reader_host="stub.invalid", allow_local_targets=True, code_state=<the real code_identity unless a test
   overrides it>) with --ledger, --ledger-p3, --ledger-p4, --store, --cards-p3, --store-p4, --out, --model,
-  --library-manifest and --form pointing into a per-test tmp copy of the world's ledgers and outputs.
+  --library-manifest, --ack (world.ack) and --form pointing into a per-test tmp copy of the world's ledgers and outputs.
 behavior: |
   1. Only test-only keywords are overridden (targets, pins, Env5 host facts, budget name "rehearsal", reader host,
      backend argv); every threshold is the frozen one. A rehearsal FAIL goes to the human (no fixture constant is tuned
@@ -29,9 +29,11 @@ acceptance:
     - "test_rehearsal_report_edited: after reports, change one digit inside a <data> element of retrain.html -> read exits 1 ('reports changed since P5_REPORTS'); exit -> C15 FAIL (L2b, L10a, sha mismatch)"
     - "test_rehearsal_reader_fail: stub reader answering Q6 wrongly for the te report -> read llm exit 1, C16 FAIL for te only; a second read --reader llm -> exit 5 (one-shot); exit -> FAIL"
     - "test_rehearsal_canary_ignored: stub with canary_mode 'ignore' (answers from priors) -> read llm exit 1, C16 FAIL for the canary row only"
-    - "test_rehearsal_refreeze_status: on its own world copy, the flow of test_rehearsal_reader_fail (read llm FAILs); then run again -> exit 5 (retrain already passed under this freeze); freeze --refreeze-reason 'reader stub fixed' -> 0; plan, run, reports, read llm (correct stub), read human, exit -> 0 and the last line is 'EXIT CHECK (P5): PASS after refreeze' with the reason listed (never a plain PASS)"
+    - "test_rehearsal_refreeze_status: on its own world copy, the flow of test_rehearsal_reader_fail (read llm FAILs); then run again -> exit 5 (retrain already passed under this freeze); freeze --refreeze-reason 'reader stub fixed' -> 0; plan, run, reports, read llm (correct stub), read human, exit -> 0 and the last line is exactly 'EXIT CHECK (P5): PASS after refreeze (reader stub fixed)' (never a plain PASS)"
     - "test_rehearsal_failed_run_needs_refreeze: retrain_target with max_compute_s 1 (keyword override of the rehearsal target only) -> run exit 1 (C9 FAIL, crash False); run again -> exit 5 and nothing appended"
-    - "test_rehearsal_human_waiver: read --reader human --waive-human 'no independent reader' -> 0; exit -> 0 with 'EXIT CHECK (P5): PASS with waiver' and the table lists 'WAIVED: no independent reader'"
+    - "test_rehearsal_finding (D100, validation r1 major 1): backend argv_prefix [sys.executable, '-m', 'tests.helpers.p5_rehearsal', 'finding-worker'] -> run exit 0 printing 'FINDING: <outcome>' with outcome in {signal_persists, neither}; C11a PASS, C11b FINDING; P5_RETRAIN passed True, finding set; reports, read llm, read human -> 0 (the retrain report renders the negative outcome and its readers pass); exit -> 0 and the last line is exactly 'EXIT CHECK (P5): PASS with finding (<outcome>)' (never a plain PASS); a second run -> exit 5"
+    - "test_rehearsal_no_ack (D99): world copy without p5_ack.json -> reports exit 5, nothing appended"
+    - "test_rehearsal_human_waiver: read --reader human --waive-human 'no independent reader' -> 0; exit -> 0 with last line 'EXIT CHECK (P5): PASS with waiver (no independent reader)' and the table lists 'WAIVED: no independent reader'"
   commands:
     - pytest -q tests/test_exit_check_p5_offline.py
     - pytest -q
