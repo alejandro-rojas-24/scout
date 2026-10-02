@@ -72,14 +72,17 @@ behavior: |
       z_adj f1, attributed str), right after re-initialisation (ppl_ratio f3, top1_agreement f3), trace table (one row
       per trace row: step int, ppl_ratio f3, top1_agreement f3, then per flagged block one cell with its z_adj f1 and
       its attributed boolean str; unflagged_attributed int of unflagged_tested int under the header LABELS["trace_unflagged"] == "unflagged blocks
-      still attributed (retrained copy)"; control_hits int; base_status str, null_ok str, control_ok str and
-      signal_dropped str, each its own cell (validation r1 minor: an abstention row must not read as a drop); quality_ok
-      str), outcome str, stop step int and confirm step int (or LABELS["none"] == "none" when null), post_stop_max_z_adj f1,
+      still attributed (retrained copy)"; control_hits int; base_status str (cls "attrib-status": the value can be "abstain",
+      which L4b would otherwise count outside every verdict container; validation r2 minor), null_ok str, control_ok
+      str and signal_dropped str, each its own cell (validation r1 minor: an abstention row must not read as a drop);
+      quality_ok str), outcome str, stop step int and confirm step int (or LABELS["none"] == "none" when null), post_stop_max_z_adj f1,
       reinit digest id, retrained digest id, "weights kept: no" (static), <p class="caveat">RETRAIN_CAVEAT</p>. Only
       stored fields are rendered: no count, maximum or ratio is computed by the renderer (every data_el must satisfy
       format_value(resolved) == text, so a derived number would be untraceable).
   11. license: table (model title, licence str or LABELS["unknown"]) for subject, references and data; then
-      <p class="license-question">LICENSE_QUESTION</p>.
+      <p class="license-question">LICENSE_QUESTION</p>. A reference row with missing true (an attribution reference
+      whose Card is not in the store, T409 behavior 7) renders its title from the attribution Card pointer and
+      LABELS["no_card"] == "unknown (no Card for this model in the store)" in place of a licence (validation r2 major 5).
   12. provenance: table of Cards (role, repo@sha id, component, object id, schema, citation ledger/seq/line_sha256
       as data_els into card or ledger sources, or LABELS["no_ledger"]); model sha and its citation; the ledgers table;
       and the report metadata (generated_at, scout_version, code_id, params_digest, regenerate command) as data_els with
@@ -95,8 +98,9 @@ acceptance:
     - "fixtures: bundles from the T409 test fixtures (full bundle; a bundle with every section not_run except subject; a bundle with S2 via StubS2Client)"
     - "test_deterministic: render(b) == render(copy.deepcopy(b)) byte for byte; changing generated_at changes only the header time and the bundle script"
     - "test_digit_free_templates: every string in SUMMARY_TEMPLATES, SECTION_TITLES, LABELS and CSS-free visible text of a render of a bundle whose data values are all non-numeric contains no digit (templates.py constants checked directly; CSS may contain digits but is inside <style>)"
-    - "test_no_stray_verdict_words: SUMMARY_TEMPLATES, SECTION_TITLES and LABELS have no match of the plan.md 4.8 verdict_regex; in a full render, every verdict_regex match in visible text lies inside one of the plan.md 4.8 verdict_containers (both as literals in the test: scout.report.lint is T411) (a bundle whose attribution reference has status 'abstain' included)"
-    - "test_trace_flags_rendered (validation r1 minor): a trace row with base_status abstain renders base_status, null_ok, control_ok and signal_dropped cells for that row, each a data element resolving to the stored value"
+    - "test_no_stray_verdict_words: SUMMARY_TEMPLATES, SECTION_TITLES and LABELS have no match of the plan.md 4.8 verdict_regex; in a full render, every verdict_regex match in visible text lies inside one of the plan.md 4.8 verdict_containers (both as literals in the test: scout.report.lint is T411) (a bundle whose attribution reference has status 'abstain' included, and a retrain bundle whose trace contains a row with base_status 'abstain' (validation r2 minor))"
+    - "test_trace_flags_rendered (validation r1 minor): a trace row with base_status abstain renders base_status, null_ok, control_ok and signal_dropped cells for that row, each a data element resolving to the stored value; the base_status data element has class 'attrib-status'"
+    - "test_license_missing_reference (validation r2 major 5): a bundle whose licence reference row has missing True -> that row shows LABELS['no_card'] and a title data element resolving into the attribution Card; LABELS['no_card'] is digit-free and has no verdict_regex or license_deny match"
     - "test_every_value_traced: every digit of a full render's visible text lies inside a <data> element or inside #system2 prose (parsed with html.parser)"
     - "test_data_elements_resolve: for every <data> element: format_value(resolve_in_bundle(bundle, src), fmt) == element text and json.loads(value) == the resolved value"
     - "test_model_sources: every data-src starting with 'model:' is one of model:<inputs.model.sha256>#/params/calibration_note, #/thresholds/hi, #/thresholds/lo; resolve_in_bundle with another sha -> KeyError"

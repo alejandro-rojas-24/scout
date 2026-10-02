@@ -51,16 +51,27 @@ interface: |
     def check_caveats(text: str, view: dict) -> list[Check]                                                                # C14
     def check_report(target: dict, lint_result: dict, file_sha256: str, reports_entry: dict | None, bundle: dict) -> list[Check]   # C15
     def check_reader(label: str, samples: list[dict], *, reader: str, canary: bool, s2_metas: list[dict] | None,
-                     waived: str | None, blind: bool | None, expected_host: str = "api.anthropic.com") -> list[Check]  # C16 / C17
+                     waived: str | None, blind: bool | None, expected_host: str = "api.anthropic.com",
+                     discarded: list[int] = ()) -> list[Check]                                              # C16 / C17
+        # discarded = seqs of P5_READ_ATTEMPT entries of this reader for this P5_REPORTS with no P5_READER (C16 FAIL)
         # samples = per-sample score dicts (real report) or canary_detection dicts (canary); llm: 3 samples, human: 1
     def check_one_shot(entries: list[dict]) -> list[Check]                                                                 # C18
     OUTCOME_ROW_PREFIXES: tuple[str, ...] = ("C11b", "C12")   # D100: outcome rows; every other row gates
     def is_outcome_row(row: Check) -> bool                       # row.name.startswith(any OUTCOME_ROW_PREFIXES)
     def row_verdict(row: Check) -> str                           # "PASS" if ok; "FINDING" if not ok and outcome row; else "FAIL"
     def gating_ok(rows: list[Check]) -> bool                     # all(row.ok for row in rows if not is_outcome_row(row))
-    STATUSES: tuple[str, ...] = ("PASS", "PASS with finding", "PASS with waiver", "PASS with finding, with waiver",
-        "PASS after refreeze", "PASS after refreeze, with finding", "PASS after refreeze, with waiver",
-        "PASS after refreeze, with finding, with waiver", "FAIL")
+    QUALIFIERS: tuple[str, ...] = ("after refreeze", "after rerun", "with finding", "with waiver")   # fixed order
+    STATUSES: tuple[str, ...]   # 17 strings: for every subset c of QUALIFIERS (in QUALIFIERS order, subsets
+        # enumerated by the bitmask 0..15 with bit i = QUALIFIERS[i]): "PASS" if not c else "PASS " + ", ".join(c);
+        # then "FAIL". E.g. "PASS", "PASS after refreeze", "PASS after rerun", "PASS after refreeze, after rerun",
+        # "PASS with finding", ..., "PASS after refreeze, after rerun, with finding, with waiver", "FAIL"
+    def crash_attempts(entries: list[dict]) -> list[dict]
+        # under the LAST P5_FREEZE: every P5_RETRAIN with crash true, plus every P5_ATTEMPT that no P5_RETRAIN names
+        # in attempt_seq (the client was killed before it could record a result; validation r2 minor) -> one dict
+        # {seq, kind: "crash" | "client killed"} each, in ledger order
+    def read_attempts(entries: list[dict]) -> list[dict]
+        # every P5_READ_ATTEMPT with {seq, reports_seq, reader, recorded: seq of the P5_READER with attempt_seq == its
+        # seq or None, unreachable: bool (that P5_READER has unreachable true)}
     def exit_status(entries: list[dict], rows: list[Check], outcome: str | None) -> tuple[str, list[str], str]
         # (status in STATUSES, notes, printed last line); outcome = the retrain.v1 outcome of the passing P5_RETRAIN
     ALLOWED_DATASET_PATHS: tuple[str, ...] = ("api", "README.md", "train_file", "eval_file")   # C6 data rule (below)
@@ -79,8 +90,9 @@ behavior: |
      equal the exit_expectations_p2/p3 frozen literals (the comparisons p4.check_frozen makes, without its P4_PLAN
      clause); ledger order: a P5_FREEZE exists, the last P5_FREEZE
      precedes every P5_PLAN/P5_ATTEMPT/P5_REPORTS/P5_READER counted for this step, and every entry after it has code_id
-     == its code_id == client_code["code_id"]; each P5_FREEZE after a P5_ATTEMPT or P5_REPORTS has a non-empty
-     refreeze_reason (listed in actual); the freeze payload's params equal the literals and its targets equal
+     == its code_id == client_code["code_id"]; each P5_FREEZE after a P5_ATTEMPT, P5_REPORTS, P5_READ_ATTEMPT or
+     P5_READER has a non-empty refreeze_reason (listed in actual; validation r2 minor: the same entry set as T417
+     behavior 2 and exit_status below); the freeze payload's params equal the literals and its targets equal
      P5_RETRAIN_TARGET / P5_REPORT_TARGETS; env.require_clean (p4 Env) -> client_code dirty False.
      Freeze inputs (validation r1 minor; plan.md 2.1): at every step after the freeze, inputs_now.pins_sha256 == the
      last P5_FREEZE's pins_sha256, inputs_now.model_sha256 == its model_sha256, and for p3 and p4 the line sha256 at
@@ -133,27 +145,39 @@ behavior: |
   13. C16/C17 (plan.md 3.8; validation r1 majors 3 and 4): one row per file (three reports and the canary).
       llm: len(samples) == READER_PARAMS["llm_samples"] and reader.llm_verdict(samples, canary=...) ok (a real report:
       >= 2 of 3 samples passed; the canary: >= 2 of 3 samples failed_as_required); every s2_meta has served_model
-      non-null and request_host == expected_host (the rehearsal passes "stub.invalid"); unavailable samples count as
-      failed samples. human: exactly one sample per file; a real report passed, the canary failed_as_required; blind
+      non-null, request_host == expected_host (the rehearsal passes "stub.invalid") and requested_model ==
+      FROZEN_READER_PARAMS["llm_model"] (validation r2 minor: the measuring instrument is the frozen one; a mismatch is
+      a FAIL that only a refreeze can follow); unavailable samples count as failed samples; a non-empty `discarded`
+      -> FAIL "reading started at seq <s> was not recorded" (validation r2 major 4). human: exactly one sample per file; a real report passed, the canary failed_as_required; blind
       is True. waived non-empty -> a single row "C17 waived" with ok True and actual "WAIVED: <reason>" (listed in
       P5_EXIT waivers).
   14. C18 one-shot protocol (validation r1 major 3; P3 one-shot pattern): over the ledger since the FIRST P5_FREEZE:
       (a) after every P5_RETRAIN that is not a crash (payload crash False) and did not pass, the next P5_ATTEMPT is
       preceded by a P5_FREEZE with a refreeze_reason; after a passing P5_RETRAIN no further P5_ATTEMPT exists under the
       same freeze; (b) at most one P5_REPORTS per P5_FREEZE; (c) at most one P5_READER per (reports_seq, reader);
-      (d) at most MAX_CRASH_RERUNS (2) crash reruns per freeze. Any violation -> FAIL naming the entries
-      (the runner refuses them, so a violation means a hand-edited ledger or a runner bug). actual lists every
-      refreeze reason, every crash rerun and every waiver.
-  15. exit_status(entries, rows, outcome) (D100, validation r1 majors 1 and 3): "FAIL" if not gating_ok(rows).
-      Otherwise three qualifiers, in this fixed order: refreeze = some P5_FREEZE follows a P5_ATTEMPT, P5_REPORTS or
-      P5_READER entry (the earlier evidence was superseded, whatever its result); finding = some outcome row is not ok;
-      waiver = C17 waived. status = "PASS" + (" after refreeze" if refreeze) + the remaining qualifiers "with finding",
-      "with waiver" joined as in STATUSES (", " after "after refreeze", " " otherwise, ", " between them); it is always
-      one of STATUSES. notes = every refreeze reason, the outcome, the waiver reason. Printed line =
-      "EXIT CHECK (P5): " + status with each qualifier followed by its detail in parentheses:
-      "after refreeze (<reason>; <reason>)", "with finding (<outcome>)", "with waiver (<reason>)", e.g.
-      "EXIT CHECK (P5): PASS after refreeze (gpu node rebooted), with finding (signal_persists)". FAIL prints
-      "EXIT CHECK (P5): FAIL" and the failed gating rows. A refreeze or a finding is never shown as a plain PASS.
+      (d) at most MAX_CRASH_RERUNS (2) crash reruns per freeze, counting crash_attempts (crash P5_RETRAIN entries AND
+      P5_ATTEMPT entries without a P5_RETRAIN: a killed client is a crash, validation r2 minor); (e) read attempts
+      (validation r2 major 4): every P5_READER of reader llm has attempt_seq naming an earlier P5_READ_ATTEMPT with
+      the same reports_seq and reader; a P5_READ_ATTEMPT without its P5_READER (killed or raised after the attempt
+      was recorded) is a CONSUMED reading: any later P5_READ_ATTEMPT or P5_READER for the same (reports_seq, reader)
+      under the same freeze -> FAIL; a P5_READER with unreachable true (every call failed before any response) does
+      not consume the reading, and must have no sample with a non-null served_model; (c) counts consuming P5_READER
+      entries and unrecorded P5_READ_ATTEMPT entries together. Any violation -> FAIL naming the entries (the runner
+      refuses them, so a violation means a hand-edited ledger or a runner bug). actual lists every refreeze reason,
+      every crash rerun (with its kind), every unrecorded or unreachable read attempt and every waiver.
+  15. exit_status(entries, rows, outcome) (D100, validation r1 majors 1 and 3, r2 minor): "FAIL" if not
+      gating_ok(rows). Otherwise four qualifiers, in QUALIFIERS order: "after refreeze" = some P5_FREEZE follows a
+      P5_ATTEMPT, P5_REPORTS, P5_READ_ATTEMPT or P5_READER entry (the earlier evidence was superseded, whatever its
+      result; the same entry set as C2); "after rerun" = crash_attempts(entries) is non-empty (a crash rerun under the
+      last freeze, a killed client included: the operator may have watched the live eval notes before the rerun, so a
+      rerun is never shown as a plain PASS); "with finding" = some outcome row is not ok; "with waiver" = C17 waived.
+      status = "PASS" if none, else "PASS " + ", ".join(present qualifiers); it is always one of STATUSES. notes =
+      every refreeze reason, every crash attempt, the outcome, the waiver reason. Printed line = "EXIT CHECK (P5): " +
+      status with each qualifier followed by its detail in parentheses: "after refreeze (<reason>; <reason>)", "after
+      rerun (<kind> at seq <s>; ...)", "with finding (<outcome>)", "with waiver (<reason>)", e.g.
+      "EXIT CHECK (P5): PASS after rerun (crash at seq 6)" or "EXIT CHECK (P5): PASS after refreeze (gpu node
+      rebooted), with finding (signal_persists)". FAIL prints "EXIT CHECK (P5): FAIL" and the failed gating rows. A
+      refreeze, a rerun or a finding is never shown as a plain PASS.
 acceptance:
   tests:
     - "test_literals: every FROZEN_* equals the plan.md 4.8 literal and the module constant it mirrors; P5_RETRAIN_TARGET and P5_REPORT_TARGETS equal the plan.md 2.1 tables"
@@ -168,7 +192,11 @@ acceptance:
     - "test_c11b_persistence: success record whose confirm row has control_ok False -> FAIL; confirm_step > max_steps -> FAIL"
     - "test_c16_k_of_n: llm samples 2 of 3 passed -> PASS; 1 of 3 -> FAIL; canary 2 of 3 failed_as_required -> PASS, 1 of 3 -> FAIL; 2 samples given -> FAIL"
     - "test_c18_one_shot: a P5_ATTEMPT after a non-crash failed P5_RETRAIN without an intervening refreeze -> FAIL; with a refreeze -> PASS; two P5_READER llm for one reports_seq -> FAIL; two P5_REPORTS under one freeze -> FAIL; three crash reruns -> FAIL"
-    - "test_exit_status: all rows ok and no refreeze -> 'PASS' and line 'EXIT CHECK (P5): PASS'; a P5_FREEZE (reason 'r1') after a P5_RETRAIN -> 'PASS after refreeze' and line 'EXIT CHECK (P5): PASS after refreeze (r1)'; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one gating FAIL row -> 'FAIL'; all 8 qualifier combinations produce exactly the 8 non-FAIL STATUSES"
+    - "test_exit_status: all rows ok and no refreeze -> 'PASS' and line 'EXIT CHECK (P5): PASS'; a P5_FREEZE (reason 'r1') after a P5_RETRAIN -> 'PASS after refreeze' and line 'EXIT CHECK (P5): PASS after refreeze (r1)'; a P5_FREEZE (reason 'r2') after a P5_READER only -> 'PASS after refreeze'; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one gating FAIL row -> 'FAIL'; all 16 qualifier combinations produce exactly the 16 non-FAIL STATUSES, len(STATUSES) == 17"
+    - "test_after_rerun (validation r2 minor): under one freeze a P5_RETRAIN crash true (seq 6) then a passing P5_RETRAIN -> 'PASS after rerun' and line 'EXIT CHECK (P5): PASS after rerun (crash at seq 6)'; a P5_ATTEMPT (seq 5) with no P5_RETRAIN naming it, then a passing attempt -> 'PASS after rerun' and the detail 'client killed at seq 5'; three crash attempts of either kind -> C18 FAIL"
+    - "test_c18_read_attempts (validation r2 major 4): P5_READ_ATTEMPT (llm, reports 9) then its P5_READER -> PASS; P5_READ_ATTEMPT without P5_READER then a second P5_READ_ATTEMPT for the same reports_seq -> FAIL naming both; P5_READ_ATTEMPT + P5_READER unreachable true (all served_model null), then a second attempt + P5_READER -> PASS; an unreachable P5_READER with one non-null served_model -> FAIL; a P5_READER without attempt_seq -> FAIL"
+    - "test_c16_frozen_model_and_discarded: a sample meta with requested_model 'claude-other' -> C16 FAIL; discarded [12] -> C16 FAIL naming seq 12"
+    - "test_c2_refreeze_after_reader (validation r2 minor): a P5_FREEZE without refreeze_reason after a P5_READER (no P5_ATTEMPT or P5_REPORTS after the previous freeze) -> C2 FAIL"
     - "test_outcome_rows (D100): a signal_persists record -> C11b row not ok, row_verdict 'FINDING', gating_ok True, exit_status 'PASS with finding' and line ending 'with finding (signal_persists)'; a C11a row not ok -> row_verdict 'FAIL' and status 'FAIL'; C12 with stop_step None evaluates the last row"
     - "test_c11a_unflagged: a trace row with unflagged 20/21 -> PASS (0.952); 19/21 -> FAIL (C11a, gating)"
   commands:

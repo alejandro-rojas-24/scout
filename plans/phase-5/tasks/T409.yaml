@@ -27,6 +27,9 @@ interface: |
     def parse_subject(target: str, pins: dict[str, str]) -> dict      # card key; unpinned repo -> pins lookup, else ValueError
     def select_cards(store: CardStore, key: dict) -> dict
         # {"analysis": StoreEntry|None, "attribution": StoreEntry|None, "retrain": StoreEntry|None}
+    def attribution_reference_cards(store: CardStore, attribution_card: dict) -> list[tuple[dict, StoreEntry | None]]
+        # one (reference record, entry) per stats.attribution.references[] (role reference or control) in that order;
+        # entry = store.find(*card_key) (newest, P4 find semantics) or None when the store has no Card for the key
     def cite(entry_files: tuple[str, str], object_id: str, key: dict, ledgers: dict[str, list[dict]]) -> dict | None
     def cite_model(model_sha256: str, ledgers: dict[str, list[dict]]) -> dict | None
     def line_sha256(entry: dict) -> str                # sha256 of p3_ledger.canonical(entry) (the line without "\n")
@@ -40,7 +43,10 @@ interface: |
     def bundle_sha256(bundle: dict) -> str             # sha256 of canonical JSON (sort_keys, separators (",", ":"), ASCII)
 behavior: |
   1. select_cards(store, key): entries = store.entries(repo, sha) with component == key.component and the current
-     params_digest (P4 find semantics). analysis = newest with has.sigma or has.anchors; attribution = newest with
+     params_digest (P4 find semantics). analysis = newest with has.sigma or has.anchors among the entries whose
+     schema_version != "card.v4"; only when there is none, the newest card.v4 with them (validation r2 minor: a card.v4
+     copies its parent's stats but carries the retrain client's fetch_log, so System 1 reads the P3 Card that the P3
+     SCAN entry cites; plan.md 2.1); attribution = newest with
      has.attribution; retrain = newest whose schema_version == "card.v4". "Newest" = P4 find's rule (created_at, then
      object id).
   2. Sections: system1 = "run" iff analysis entry exists and model_path is given, else "not_run" with reason "the
@@ -58,7 +64,21 @@ behavior: |
   4. System 2 (optional): s2in = system2.build_input(report, subject, references); s2 = system2.run_system2(report,
      subject, references, inp.s2_client, inp.s2_config); data.s2 = s2, data.s2in = s2in, sections.system2.s2in_sha256 =
      sha256 of canonical s2in.
-  5. data.cards[object] for every Card used (subject section Cards and references): the subset of plan.md 4.5 copied
+  4b. Attribution reference Cards (validation r2 major 5; plan.md 3.6 "Attribution reference Cards"). When the
+     attribution section runs, for each (ref, entry) of attribution_reference_cards(store, attribution Card):
+     - entry present -> inputs.cards gains {role: "attribution-reference", card_key: ref.card_key, object:
+       entry.object, schema_version, citation: null, via: <the attribution Card's object id>} (deduplicated by
+       object; a Card already listed under another role keeps that role and gains no row), and data.cards[object]
+       the subset below. Such a Card contributes only its identity (title) and its claimed licence; every number
+       about it comes from the attribution Card, which carries the ledger citation. Its citation is therefore
+       inherited ("cited via" the attribution Card, which lists its card_key) and it needs no ledger entry of its own.
+     - entry None -> no inputs.cards row; inputs.skipped gains {repo: ref.card_key.repo, reason: "no Card for this
+       attribution reference in the store"}; the licence row (behavior 7) has license null and missing true. Building
+       never fails for this reason (product use); the exit makes it impossible by importing the Cards and FAILing C0
+       when one is missing (T417 behavior 3).
+     inputs.cards rows of every other role carry via: null.
+  5. data.cards[object] for every Card used (subject section Cards, System 1 references and attribution reference
+     Cards): the subset of plan.md 4.5 copied
      from the Card JSON with the same key paths, so a JSON pointer into the subset resolves exactly as into the full
      Card. Model mirror (system1 run only): sha = sha256 of the model file bytes (lowercase hex); doc = the parsed file;
      data.models = {sha: {"params": {"calibration_note": doc["params"]["calibration_note"]}, "thresholds": {"hi":
@@ -84,10 +104,13 @@ behavior: |
        == object id; else the latest P5 `P5_RETRAIN` whose payload.card_object == object id; else None.
      - the model: the latest P3 `FREEZE_MODEL` with payload.sha256 == sha256(model file).
      - citation = {ledger, seq, line_sha256}; data.ledger_entries[f"{ledger}:{seq}"] = the full entry.
-  7. Licences: {"subject": licence of the subject Card, "references": [{title, license}] for every reference Card of
-     system1 and every attribution reference (deduplicated by card key, order of first use), "data":
+  7. Licences: {"subject": licence of the subject Card, "references": [{title, license, source, missing}] for every
+     reference Card of system1 and every attribution reference (deduplicated by card key, order of first use), "data":
      retrain.recipe.data.license when the retrain section runs}. Licence = model_card.license, or license_name when
-     license is "other".
+     license is "other". source = the card:<object>#/model_card/license pointer of the Card it came from, or, for an
+     attribution reference whose Card is absent, null; title is then taken from the attribution Card
+     (card:<attribution object>#/stats/attribution/references/j/title) and missing = true (rendered by T410 as
+     LABELS["no_card"]); missing = false otherwise.
   8. summary: list of {template, slots} in this order (templates are rendered by T410): "subject" {subject};
      per system1 pair "s1_pair" {reference: analysis:0#/pairs/i/reference/title, verdict: .../system1/verdict,
      p: .../system1/p_derived}; "s1_not_run" {reason}; per attribution reference "attrib_ref" {reference title, role,
@@ -108,6 +131,8 @@ acceptance:
     - "test_citations: each Card is cited by the matching ledger entry (P3 SCAN card_files, P4_EXIT object, P5_RETRAIN card_object); the model by FREEZE_MODEL; a tampered ledger -> recorded error and no citation"
     - "test_pointer_equivalence: for every summary slot pointer card:<obj>#<ptr>, resolving ptr in data.cards[obj] equals resolving it in the full Card JSON from the store"
     - "test_model_mirror: data.models has exactly one key, equal to sha256 of the model file and to inputs.model.sha256; for each of /params/calibration_note, /thresholds/hi, /thresholds/lo the pointer resolves to the same value in data.models[sha] and in the parsed model file; all-not-run bundle -> data.models == {} and inputs.model is None"
+    - "test_attribution_reference_cards (validation r2 major 5; te-style fixture: a card.v3 attribution Card of a component subject whose stats.attribution lists a base (role reference), an independent candidate (role reference) and a control, built with with_attribution and make_attribution, plus header-scan Cards of the three references in the store): inputs.cards has three rows with role 'attribution-reference', citation null and via == the attribution Card's object; data.cards holds the three; the licence rows carry each Card's model_card.license with missing False; removing the control's Card from the store -> build_bundle succeeds, no inputs.cards row for it, inputs.skipped names it, its licence row has license None, missing True and the title from the attribution Card"
+    - "test_analysis_prefers_non_v4: a store with the P3-style card.v2 subject Card and a newer card.v4 of the same key -> select_cards()['analysis'] is the card.v2 entry; with the card.v2 removed -> the card.v4"
     - "test_s2_optional: with StubS2Client -> sections.system2 run, data.s2 validates as s2.v1, s2in_sha256 set; without -> not_run 'not requested'"
     - "test_no_network_no_weights: build_bundle under an httpx transport that raises and a socket guard -> succeeds; scout.report.bundle does not import scout.hub/sources/scan/gate (AST walk, transitive over scout.*)"
     - "test_deterministic: build_bundle twice with the same generated_at and code_id -> equal bundle_sha256"

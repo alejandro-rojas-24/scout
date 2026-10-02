@@ -21,10 +21,12 @@ interface: |
     # `python -m tests.helpers.p5_rehearsal guarded-worker [worker args]` -> sys.exit(guarded_worker_main(args))
     def finding_worker_main(argv: list[str]) -> int            # guard + the base-copy patch (behavior 2b), then worker.main
     # `python -m tests.helpers.p5_rehearsal finding-worker [worker args]` -> sys.exit(finding_worker_main(args))
-    def answers_from_key(key: dict, questions: list[dict]) -> dict[str, str]  # natural-language answers that score correct
-    def make_reader_stub(keys_by_subject: dict[str, dict], *, wrong: dict[str, str] | None = None,
-                         canary_mode: str = "detect") -> StubS2Client
-    def write_human_answers(path: pathlib.Path, keys_by_label: dict[str, tuple[dict, list[dict]]], neutral: dict[str, str],
+    def answers_from_key(key: dict, questions: list[dict], titles: dict[str, str]) -> dict[str, str]
+        # answers in the form the report PRINTS (titles from reader.printed_titles(bundle)); they must score correct
+    def make_reader_stub(keys_by_subject: dict[str, tuple[dict, dict[str, str]]], *, wrong: dict[str, str] | None = None,
+                         canary_mode: str = "detect") -> StubS2Client     # subject title -> (key, titles)
+    def write_human_answers(path: pathlib.Path, keys_by_label: dict[str, tuple[dict, list[dict], dict[str, str]]],
+                            neutral: dict[str, str],
                             *, blind: bool = True, wrong: dict[str, dict[str, str]] | None = None,
                             canary_mode: str = "detect") -> None
 behavior: |
@@ -69,24 +71,35 @@ behavior: |
      architecture in rt_family) with its rows permuted by numpy.random.default_rng(b).permutation. The loop and every
      check run unchanged, so the run yields outcome signal_persists or neither (the flagged blocks are attributed), with
      every gating row ok (retrained_digest != reinit_digest; the flagged z differ from the baseline's).
-  3. answers_from_key: repo@sha -> f"{repo}@{sha[:10]}"; sets -> ", ".join(sorted); repo: n of N -> "repo: n of N";
-     yes/no -> "Yes."/"No."; "not run"/"none" literal. make_reader_stub: a StubS2Client whose responder finds which
-     subject key string occurs in the user message's report_text and returns {"answers": [...], "required_edits": [],
-     "optional_edits": []} built by answers_from_key over that report's questions, overriding question ids in `wrong`.
-     The canary is recognised by READER_PARAMS["canary"]["licence_sentence"] in the report_text: canary_mode "detect"
-     answers Q8 "Yes, the report says this is permitted." and adds the required edit {quote: that sentence, reason:
-     "contradicts_report"} (a reader that reads: failed_as_required); canary_mode "ignore" answers from the clean key
-     with no edits (a reader that answers from priors: the canary row must FAIL). Every call of the stub is
+  3. answers_from_key answers in the PRINTED form (validation r2 major 2: the rehearsal must exercise the normaliser on
+     what a reader copies from the report, never on bare repos): Q1 -> titles[subject repo] verbatim (for the te
+     subject "<te_dir>@<sha12> / text_encoder"); repo items of Q2, Q3, Q4 and Q5 -> titles[repo] (e.g.
+     "<repo>@<sha12>: 8 of 8" for Q4, "<repo>@<sha12>: low confidence" for Q3); sets -> ", ".join(sorted); yes/no ->
+     "Yes."/"No."; "not run"/"none" literal; section names as "System 1", "block attribution", ... . make_reader_stub:
+     a StubS2Client whose responder finds which subject title occurs in the user message's report_text and returns
+     {"answers": [...], "required_edits": [], "optional_edits": []} built by answers_from_key over that report's
+     questions and titles, overriding question ids in `wrong`. The canary is recognised by
+     READER_PARAMS["canary"]["licence_sentence"] in the report_text: canary_mode "detect" answers Q8 "Yes, the report
+     says this is permitted." and adds the required edit {quote: that sentence, reason: "contradicts_report"} (a reader
+     that reads: failed_as_required); canary_mode "ignore" answers from the clean key with no edits (a reader that
+     answers from priors: detected [] and the canary row must FAIL); canary_mode "careful" answers what the canary text
+     says, with no edits: Q4 the edited #attribution count of the base, Q8 "Yes.", Q9 "not stated", every other
+     question from the clean key (validation r2 major 3: detected D1, D2 and D3, failed_as_required). make_canary
+     comes from scripts.p5_canary (T412). Every call of the stub is
      deterministic, so the three llm samples of a file are equal.
      write_human_answers writes the plan.md 4.7 YAML keyed by the neutral file names (reader id "rehearsal", date
-     "2026-09-29"), the canary entry built as in canary_mode.
+     "2026-09-29"), answers in the printed form as above, the canary entry built as in canary_mode.
+  4. Attribution reference Cards (validation r2 major 5): the P4 stand-in's attribute() call stores the header-scan
+     Cards of te_base and control in store_p4 (P4 T317 cached scans); the world asserts it, so T417 populate_store can
+     import them and the te report cites them through the attribution Card (plan.md 3.6).
 acceptance:
   tests:
     - "test_world_builds: build_world on a fresh dir -> every path exists; CardStore(store_p4) has the te entry with has.attribution; p3_ledger.verify(ledgers['p3']) == [] and verify(ledgers['p4'], kinds=P4_KINDS) == []; pins_p5 model shas equal pins_p3; the JEV model file loads with scout.jev.load"
     - "test_world_cited: for every Card in cards_p3 the SCAN entry's card_files match its file hashes; FREEZE_MODEL sha256 equals the model file; the P4_EXIT object equals the store entry"
     - "test_guarded_worker: `python -m tests.helpers.p5_rehearsal guarded-worker hello --scratch-root tmp` prints a hello line and exits 0; inside guarded_worker_main a socket.create_connection attempt raises OSError"
-    - "test_answers_roundtrip: for a report bundle built by T409 from the world, score(answers_from_key(key, qs), key, qs, [], ...) passes; with wrong={'Q6': 'none'} it fails"
-    - "test_canary_stub: for make_canary of that report, the 'detect' stub's answer gives canary_detection failed_as_required True (detected includes D2); the 'ignore' stub's gives False"
+    - "test_answers_roundtrip: for report bundles built by T409 from the world (the retrain-style subject and the te subject), score(answers_from_key(key, qs, reader.printed_titles(bundle)), key, qs, [], ...) passes; the te Q1 answer ends with ' / text_encoder' and every repo answer contains '@'; with wrong={'Q6': 'none'} it fails"
+    - "test_world_reference_cards: for every reference and control card_key in the te attribution Card's stats.attribution.references, CardStore(store_p4).find(...) returns an entry"
+    - "test_canary_stub: for make_canary of that report, the 'detect' stub's answer gives canary_detection failed_as_required True (detected includes D2); the 'careful' stub's gives detected ['D1', 'D2', 'D3'] and True; the 'ignore' stub's gives detected [] and False"
     - "test_world_runtime: build_world on a fresh dir finishes within 600 s on 4 CPU cores"
   commands:
     - pytest -q tests/test_p5_rehearsal_world.py

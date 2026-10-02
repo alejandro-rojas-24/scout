@@ -46,7 +46,7 @@ P5 is the last roadmap phase, so everything here is unscheduled. Each item says 
   input to JEV or to System 2's verdict; its own labelled calibration set of documented distillation pairs (teacher,
   student, method) and documented negatives; generation through a gated, logged path (API calls or GPU jobs) with the
   prompt set pinned; and it must be able to abstain. Until then the report states the blind spot (DISCLAIMERS 1, reader
-  Q6).
+  Q9).
 
 ## UI (usage-notes queue; seeded in `docs/usage-notes.md`)
 - Subtree collapse/expand in the module graph (P1).

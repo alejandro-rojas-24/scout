@@ -67,4 +67,15 @@ This file collects non-blocking review findings per phase for a later wave.
 
 ## Phase 5
 
-_pending planning_
+- **Retrain success rate at exit scale is unmeasured** (plan §2.4/§8, D100). The planner estimates P(success) at 0.5–0.8. Signal drop and quality are reported as PASS/FINDING outcomes and do not gate the exit. Measure on the Spark, then decide whether to pre-register a budget. Source: r1 major 1.
+- **LLM reader error rate is assumed, not measured** (§3.8). Per-sample error ≤ 0.10 is assumed, which gives a false-fail rate ≤ 0.08 and a canary miss ≤ 0.03. Measure once an API key is available. Source: r1 major 4.
+- **Human reader can spot the canary** (T412). It is near-identical to the retrain report. Consider shuffling, or a canary built from a different report. Source: r2 minor.
+- **T408 plan-only spy scope** (T408). Scope the spy to the two data files. Source: r2 minor.
+- **Shared report fixtures** (T409). Move them to `tests/helpers/report_fixtures.py`. Source: r1/r2 minor.
+- **T404 runtime test margin** (T404). The 180 s fixture timing test is tight. Source: r2 minor.
+- **System 2 report section has no exit row** (T410/T416). Keep the section and add an exit row, or cut the section. The web report route also has no exit row. Source: r1/r2 minor.
+- **Data bytes vs the cumulative 64 MiB threshold** (T403). This fails safe; clarify the accounting. Source: r1 minor.
+- **Licence deny-list is purely lexical** (T409/T411). Source: r1 minor.
+- **Pin the `P4_EXIT targets.<label>.object` key name** (T417). Source: r1 minor.
+- **Exporting retrained weights** (D83, later.md). This requires amending invariant 1 first. A design sketch is in later.md. Source: planner.
+- **D99 human acknowledgement**. Report files are treated as user-requested exports outside invariant 1. The orchestrator accepted this provisionally, and the human should confirm it (like P3 D36). Source: planner.

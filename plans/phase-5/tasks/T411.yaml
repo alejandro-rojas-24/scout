@@ -52,9 +52,15 @@ behavior: |
      untestable minus rendered reference rows with a .reason; (c) untestable blocks minus rendered block rows with a
      .reason; (d) sections with status not_run without a p.not-run .reason. Each difference counted in absolute value.
   7. L6: for every inputs.cards entry: card_key repo and 40-hex revision present; object exists in the store and
-     card.object_id(json bytes, parquet bytes) == object; with require_ledger a citation with seq <= that ledger's pinned
+     card.object_id(json bytes, parquet bytes) == object; with require_ledger, for every role except
+     "attribution-reference", a citation with seq <= that ledger's pinned
      head_seq whose ledger entry exists (read with bundle.read_entries(path, upto_seq=head_seq)),
-     whose line sha256 matches and whose payload names this Card (same rule as T409 behavior 6); model sha256 equals the
+     whose line sha256 matches and whose payload names this Card (same rule as T409 behavior 6). Role
+     "attribution-reference" (validation r2 major 5; plan.md 3.6): citation null and cited VIA the attribution Card:
+     via names an inputs.cards row with role "subject-attribution" that itself passes the citation rule (with
+     require_ledger), and this row's card_key equals one stats.attribution.references[].card_key of that Card
+     (loaded from the store); each failed condition counts 1. A missing reference Card (inputs.skipped) is not an L6
+     failure: the licence row says so (T410); model sha256 equals the
      file and (require_ledger) a FREEZE_MODEL citation; code_id is 64 hex; scout_version and regenerate non-empty. Count
      = number of failed conditions.
   8. L7: matches of external_regex in the raw HTML, plus <script> elements other than the one bundle script.
@@ -97,6 +103,7 @@ acceptance:
     - "test_l10b_ledger_append_ignored (validation r1 blocker): render the full bundle with require_ledger; then append to the P5 ledger a P5_REPORTS, a P5_READER and a P5_RETRAIN whose card_object equals the cited card.v4 object (scripts.p3_ledger.append) -> every row count 0 (L6 and L10b included)"
     - "test_l10b_ledger_rewritten_below_head: rewrite the P5 ledger so the entry at the pinned head differs (a valid new chain) -> L10b 1 with detail 'changed below the pinned head'"
     - "test_l5b_reference_reason (validation r1 minor): a bundle whose attribution reference has status 'abstain' (retrain_records.make_attribution(base_status='abstain', base_reason='independent control ... attributed at block ...: the in-run null is not homogeneous')) -> clean render L5 0 (the reference row carries its .reason, T410 behavior 9); removing that row's .reason span -> L5 1"
+    - "test_l6_attribution_reference (validation r2 major 5): te-style fixture of T409 test_attribution_reference_cards, require_ledger True, the attribution Card cited by a P4_EXIT entry -> L6 0 although the three reference Cards have no ledger entry; a bundle edited so that one attribution-reference row's via names an object not in inputs.cards -> L6 1; one whose card_key is not among the attribution Card's references -> L6 1; the control's Card removed from the store before rendering -> L6 0 and the clean render lints clean"
     - "test_bundle_source_restricted: a <data data-src='bundle:#/data/cards/...'> -> L2b 1"
   commands:
     - pytest -q tests/test_report_lint.py
