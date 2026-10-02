@@ -37,3 +37,23 @@ Non-blocking minor findings from every phase are collected in `/FUTURE_IMPROVEME
 - **P1: a queued message caused two planners to edit T015 at once.** A SendMessage to an idle subagent was queued and delivered late. A second, fresh planner had been spawned for the same fix in the meantime, so both edited T015 concurrently. The merged result was verified by the orchestrator.
   - Lesson: after an agent finishes, don't message it again; spawn a new agent instead.
 - **P1: the validators kept finding new majors while their count shrank** (r1 5 → r2 1 → r3 1). Each fresh validator found a different class of hole. The ceiling on revise rounds is what stopped the loop.
+- **P2–P5: the classifier went down again several times.** In P2 one validator ran while the classifier was down, so the orchestrator checked that it had only written `validation.md`. In P3 the planner could not run its own task check; the orchestrator read the script, then ran it once the classifier recovered.
+- **P5: API session limits (429) cut off two planners partway through.** For the initial draft, a fresh planner finished the consistency pass. For revision round 1, the same agent was resumed with SendMessage; it picked up its own partial edits and completed them. Resuming a *finished* agent worked here, which contrasts with the queued-message problem in P1.
+- **Validators ran numbers, not just reviewed text.** From P2 on, validators re-simulated the statistics in numpy and found real defects:
+  - P2: d_eff and the edge-block null
+  - P4: a depth-local and a depth-spiked null
+  - P3: SDK incompatibility, confirmed by downloading the wheels
+
+  The planners then re-measured before changing thresholds. This was the main source of value in each round.
+
+## Wave summary
+
+| Phase | Tasks | Validator rounds | Blockers / majors per round | Open human acknowledgements |
+|---|---|---|---|---|
+| 1 | 16 (T001–T016) | 3 | r1 0/5 · r2 0/1 · r3 0/1 | — |
+| 2 | 16 (T101–T116) | 2 | r1 1/3 · r2 0/1 | — |
+| 3 | 18 (T201–T218) | 2 | r1 1/4 · r2 0/4 | D36 (anchor Gram is not weights) |
+| 4 | 21 (T301–T321) | 2 | r1 0/6 · r2 0/3 | — |
+| 5 | 19 (T401–T419) | 2 | r1 1/6 · r2 0/5 | D99 (report files are user exports) |
+
+No phase reached APPROVE from a validator. Every phase was closed by the orchestrator under the directive once the revision cap was reached; the last round's majors were fixed but not re-validated. The implementation wave should therefore treat the reviewer step as the first independent check of each final revision.
