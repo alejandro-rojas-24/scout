@@ -224,10 +224,14 @@ def write_card(built: BuiltCard) -> CardPaths:
     """Parquet first, then JSON; each via its own mkstemp temp file + os.replace.
 
     The JSON payload is encoded before any file is touched, so after the Parquet's
-    os.replace only IO can fail; in that case the Parquet is removed again.
+    os.replace only IO can fail. In that case the Parquet is removed again only if
+    no JSON existed before this call and none exists now: on a rescan the existing
+    JSON points at that Parquet name, and the new table for the same key is
+    identical, so keeping it leaves the existing Card intact.
     """
     paths = built.paths
     payload = _encode_card(built.card)
+    json_existed = paths.json_path.exists()
     paths.json_path.parent.mkdir(parents=True, exist_ok=True)
     temps: list[str] = []
     parquet_placed = False
@@ -252,7 +256,7 @@ def write_card(built: BuiltCard) -> CardPaths:
         temps.remove(tmp)
     except BaseException:
         leftovers = list(temps)
-        if parquet_placed:
+        if parquet_placed and not json_existed and not paths.json_path.exists():
             leftovers.append(str(paths.parquet_path))
         for p in leftovers:
             try:

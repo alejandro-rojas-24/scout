@@ -160,6 +160,27 @@ def test_atomic_json_failure_leaves_no_temp(dense, monkeypatch):
     assert _files_under(out) == []
 
 
+def test_failed_rewrite_keeps_existing_card(dense, monkeypatch):
+    _, built, out = dense
+    write_card(built)
+    real_replace = card_mod.os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(".card.json"):
+            raise OSError("json replace failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(card_mod.os, "replace", replace)
+    with pytest.raises(OSError):
+        write_card(built)
+    monkeypatch.setattr(card_mod.os, "replace", real_replace)
+    card, table = load_card(built.paths.json_path)
+    assert card == built.card
+    assert table.equals(built.table, check_metadata=True)
+    assert not list(out.glob("**/*.tmp"))
+    assert _files_under(out) == sorted([built.paths.json_path, built.paths.parquet_path])
+
+
 def test_lone_surrogate_in_config_refused(tmp_path):
     write_dense_repo(tmp_path / "repo", n_shards=1)
     (tmp_path / "repo" / "config.json").write_text('{"model_type": "x", "bad": "\\ud800"}')
