@@ -36,3 +36,6 @@ Unscheduled
   cdn-lfs*.hf.co and cas-bridge.xethub.hf.co. Allowlisting them would let EXIT run here.
 - Local folder inside an HF cache `snapshots/<sha>/`: optionally use that SHA as the key after verifying blob hashes (validation round 1, rejected for P1).
 - Reuse the CDN/Xet Location from the 8-byte read for the [8, 8+N) read, re-resolving on 403/expiry, to save one hop per file (validation round 2, deferred: not needed for the 10 s budget).
+T006: >1 non-canonical index with exactly one single file returns the single file; decide whether that should be AmbiguousWeightsError.
+- LocalSource FIFO race (T004 review nit 4): a path swapped for a FIFO between resolve() and a read blocks in open() before the fstat check; fix with os.open(O_RDONLY|O_NONBLOCK) + S_ISREG check on the fd.
+- LocalSource alias limitation (T004 review): an extensionless weight blob linked under a non-weight name, with no weight-named sibling on the same inode, is classified as meta (ByteLog classifies by name; content sniffing deferred).

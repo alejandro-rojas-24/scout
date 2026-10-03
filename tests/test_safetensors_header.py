@@ -8,7 +8,7 @@ import pytest
 
 from scout.bytelog import ByteLog
 from scout.errors import AmbiguousWeightsError, HeaderError, NoSafetensorsError
-from scout.safetensors_header import parse_index, read_header, select_weight_files
+from scout.safetensors_header import MAX_HEADER_LEN, parse_index, read_header, select_weight_files
 from scout.sources import LocalSource, RepoFile
 from tests.helpers.st_fixtures import write_safetensors
 
@@ -41,6 +41,8 @@ def test_read_header_ok(tmp_path):
     begins = [(t.data_begin, t.data_end) for t in h.tensors]
     assert begins == sorted(begins) and begins[0][0] == 0
     assert h.data_bytes == 12 + 4 + 0 + 20
+    ranges = [e.range for e in log.events if e.event == "fetch" and e.path == "m.safetensors"]
+    assert ranges == [(0, 8), (8, 8 + n)]
     t = log.totals
     assert t["header"] == 8 + n and t["weight"] == 0
 
@@ -76,9 +78,10 @@ def test_corrupt_len(tmp_path):
 
 def test_len_exceeds_file(tmp_path):
     (tmp_path / "m.safetensors").write_bytes((100).to_bytes(8, "little") + b"x" * 16)
-    s, _ = _src(tmp_path)
-    with pytest.raises(HeaderError):
+    s, log = _src(tmp_path)
+    with pytest.raises(HeaderError, match="exceeds file size"):
         read_header(s, "m.safetensors", 24)
+    assert log.totals["header"] == 8 and log.totals["weight"] == 0
 
 
 def test_noncontiguous(tmp_path):
@@ -94,7 +97,7 @@ def test_dtype_size_mismatch(tmp_path):
     hdr = {"a": {"dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 4]}}
     (tmp_path / "m.safetensors").write_bytes(_raw(hdr, b"\0" * 4))
     s, _ = _src(tmp_path)
-    with pytest.raises(HeaderError, match="a"):
+    with pytest.raises(HeaderError, match=r"'a'"):
         read_header(s, "m.safetensors", None)
 
 
@@ -126,6 +129,51 @@ def test_bad_json_and_non_dict(tmp_path):
         s, _ = _src(tmp_path)
         with pytest.raises(HeaderError):
             read_header(s, "m.safetensors", None)
+
+
+def test_recursion_bomb(tmp_path):
+    body = b"[" * 200000 + b"]" * 200000
+    (tmp_path / "m.safetensors").write_bytes(len(body).to_bytes(8, "little") + body)
+    s, log = _src(tmp_path)
+    with pytest.raises(HeaderError):
+        read_header(s, "m.safetensors", None)
+    assert log.totals["header"] == 8 + len(body) and log.totals["weight"] == 0
+    with pytest.raises(HeaderError):
+        parse_index(body, "")
+
+
+def test_duplicate_key(tmp_path):
+    body = b'{"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    (tmp_path / "m.safetensors").write_bytes(len(body).to_bytes(8, "little") + body + b"\0")
+    s, _ = _src(tmp_path)
+    with pytest.raises(HeaderError, match="duplicate key"):
+        read_header(s, "m.safetensors", None)
+    with pytest.raises(HeaderError, match="duplicate key"):
+        parse_index(b'{"weight_map":{"a":"x","a":"y"}}', "")
+
+
+def _u8(b, e):
+    return {"dtype": "U8", "shape": [e - b], "data_offsets": [b, e]}
+
+
+@pytest.mark.parametrize("hdr", [
+    {"a": _u8(0, 3), "b": _u8(2, 4)},
+    {"a": _u8(0, 2), "b": _u8(0, 2)},
+])
+def test_hostile_offsets(tmp_path, hdr):
+    (tmp_path / "m.safetensors").write_bytes(_raw(hdr, b"\0" * 4))
+    s, _ = _src(tmp_path)
+    with pytest.raises(HeaderError):
+        read_header(s, "m.safetensors", None)
+
+
+@pytest.mark.parametrize("n", [0, MAX_HEADER_LEN + 1])
+def test_hostile_len(tmp_path, n):
+    (tmp_path / "m.safetensors").write_bytes(n.to_bytes(8, "little") + b"x" * 16)
+    s, log = _src(tmp_path)
+    with pytest.raises(HeaderError):
+        read_header(s, "m.safetensors", None)
+    assert log.totals["header"] == 8 and log.totals["weight"] == 0
 
 
 def _files(*paths):
@@ -168,3 +216,17 @@ def test_parse_index():
         parse_index(b'{"x": 1}', "")
     with pytest.raises(HeaderError):
         parse_index(b"nope", "")
+
+
+@pytest.mark.parametrize("v", [1, "", "/etc/x.safetensors", "../x.safetensors", "a\\b.safetensors"])
+def test_parse_index_bad_entry(v):
+    raw = json.dumps({"weight_map": {"k": v}}).encode()
+    with pytest.raises(HeaderError, match="bad weight_map entry for 'k'"):
+        parse_index(raw, "")
+
+
+@pytest.mark.parametrize("t", [-1, True, "12", 1.5, [1]])
+def test_parse_index_bad_total(t):
+    raw = json.dumps({"metadata": {"total_size": t}, "weight_map": {"k": "a.safetensors"}}).encode()
+    with pytest.raises(HeaderError):
+        parse_index(raw, "")

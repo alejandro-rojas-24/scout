@@ -52,6 +52,15 @@ def _is_int(v: object) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _no_dups(pairs: list[tuple[str, object]]) -> dict:
+    d: dict = {}
+    for k, v in pairs:
+        if k in d:
+            raise HeaderError(f"duplicate key {k!r}")
+        d[k] = v
+    return d
+
+
 def _join(subdir: str, name: str) -> str:
     return name if subdir == "" else f"{subdir}/{name}"
 
@@ -66,8 +75,10 @@ def read_header(source: Source, path: str, file_size: int | None) -> Safetensors
     source.log.set_header_len(path, n)  # before the next read, or preflight refuses it
     hb = source.read_range(path, 8, n)
     try:
-        header = json.loads(hb.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+        header = json.loads(hb.decode("utf-8"), object_pairs_hook=_no_dups)
+    except HeaderError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise HeaderError(f"{path}: invalid header JSON: {exc}") from exc
     if not isinstance(header, dict):
         raise HeaderError(f"{path}: header is not a JSON object")
@@ -140,16 +151,21 @@ def select_weight_files(files: list[RepoFile], subdir: str) -> WeightSelection:
 
 def parse_index(raw: bytes, subdir: str) -> tuple[list[str], int | None]:
     try:
-        j = json.loads(raw)
-    except (UnicodeDecodeError, ValueError) as exc:
+        j = json.loads(raw, object_pairs_hook=_no_dups)
+    except HeaderError:
+        raise
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise HeaderError(f"invalid index JSON: {exc}") from exc
     wm = j.get("weight_map") if isinstance(j, dict) else None
     if not isinstance(wm, dict):
         raise HeaderError("index has no weight_map object")
+    for k, v in wm.items():
+        if (not isinstance(v, str) or not v or v.startswith("/") or "\\" in v
+                or ".." in v.split("/")):
+            raise HeaderError(f"bad weight_map entry for {k!r}")
     files = sorted({_join(subdir, v) for v in wm.values()})
     meta = j.get("metadata") or {}
     total = meta.get("total_size") if isinstance(meta, dict) else None
-    try:
-        return files, (int(total) if total is not None else None)
-    except (TypeError, ValueError) as exc:
-        raise HeaderError(f"bad total_size {total!r}") from exc
+    if total is not None and (not _is_int(total) or total < 0):
+        raise HeaderError(f"bad total_size {total!r}")
+    return files, total
