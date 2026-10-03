@@ -81,7 +81,7 @@ def parse_model_card(raw: bytes | None) -> ModelCardInfo:
         return _empty_card(True, "unterminated front matter")
     try:
         data = yaml.safe_load("\n".join(lines[first + 1:end]))
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, ValueError, TypeError) as e:
         return _empty_card(True, f"{type(e).__name__}: {e}")
     if not isinstance(data, dict):
         return _empty_card(True, "front matter is not a mapping")

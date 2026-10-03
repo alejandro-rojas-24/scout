@@ -87,3 +87,9 @@ def test_model_index_invalid():
         parse_model_index(b"{bad")
     with pytest.raises(ValueError):
         parse_model_index(b"[]")
+
+
+def test_card_invalid_date_no_exception():
+    c = parse_model_card(b"---\nd: 2024-02-30\n---\n")
+    assert c.present is True
+    assert c.parse_error and c.parse_error.startswith("ValueError: ")

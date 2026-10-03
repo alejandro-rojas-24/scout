@@ -95,7 +95,15 @@ behavior: |
      Exceptions raised by on_event propagate.
   6. note(event, note, path): event must be in {"error","refused","card_written"}; emits a 0-byte event.
   7. to_card_dict returns JSON-serializable data only.
-decisions: []
+decisions:
+  - "ReadThresholdExceeded.__init__(requested, total, threshold, message=None): message defaults to the spec's threshold text; __reduce__ added so it pickles. Other errors use plain Exception(*args); exit_code is a class attribute (1 unless the spec says otherwise)."
+  - "events_since(seq) returns events with seq strictly greater than seq (so events_since(0) is everything and polling with the last seen seq gives only new events)."
+  - "totals always has exactly the three keys meta/header/weight; no aggregate key."
+  - "preflight refused events (weight and threshold) are logged with source/url/range/status None, bytes 0 and path set; the threshold refusal event is appended in the same critical section as the budget check, and on_event runs after the lock is released."
+  - "on_event is called outside the lock after each append. With one thread the callback order equals seq order; with concurrent writers the callbacks can arrive out of seq order (events/events_since are always in seq order). If on_event raises, the event is already recorded and counted."
+  - "record raises ValueError for nbytes < 0 (validated before any state change, like the event-name check). path None is classified as meta (treated as '')."
+  - "classify_range uses the header length as given; it does not validate header_len >= 0. The threshold budget counts meta + header + open reservations; weight bytes recorded honestly do not consume the non-weight budget."
+  - "stage() accepts an int and coerces it via Stage(stage)."
 acceptance:
   tests:
     - "classify_range table: safetensors with N=None: [0,8)->header 8, [0,16)-> header 8 + weight 8; with N=100: [8,108) all header, [100,120) -> header 8 + weight 12; model.bin [0,4) -> weight 4; config.json -> meta; model.safetensors.index.json -> meta; MODEL.SAFETENSORS is treated case-insensitively"
