@@ -62,7 +62,18 @@ behavior: |
      files and re-raise. Write nothing else, anywhere.
   5. load_card: json.load plus pyarrow.parquet.read_table(json_path.parent / card["tensors_parquet"]). Raise ScoutError if
      schema_version != "card.v0".
-decisions: []
+decisions:
+  - "PARQUET_SCHEMA list columns (shape, stat_spectral_topk, stat_sigma_curve) use a child field named 'element' (pa.list_(pa.field('element', t))). pyarrow renames list children to 'element' on a Parquet round trip, so with 'item' the loaded table would not equal the built one. The arrow types are otherwise exactly plan 4.3."
+  - "Columns not marked '(nullable)' in plan 4.3 are nullable=False in PARQUET_SCHEMA; stack_prefix, block_index, expert_index and all stat_* are nullable. Parquet preserves this on round trip."
+  - "Row sort key is (file, data_begin, data_end, name). The tie-breakers only matter for zero-size tensors that share data_begin, and they keep the order deterministic."
+  - "card_paths raises ScoutError if the repo slug, revision_sha or component slug is '', '.', '..' or contains '/', '\\' or NUL. Component names come from model_index.json keys, which a hostile repo controls, so without this check a key such as '../x' could write outside out_dir. load_card applies the same check to card['tensors_parquet']."
+  - "build_card raises ScoutError if structure.n_tensors != the total tensor count across headers, or if a header tensor is missing from structure.places. Without these checks the Card and the Parquet could silently disagree."
+  - "scan.elapsed_s is coerced with float(). metadata in weights.files is copied into a new dict."
+  - "write_card fsyncs each temp file before os.replace. On any exception (BaseException) only the still-unreplaced temp files are removed. If the JSON step fails after the Parquet was already replaced, that Parquet stays: another concurrent writer's JSON may point at it, and T010 removes already-written Cards on failure. The JSON is never left pointing at a missing Parquet."
+  - "Temp files keep mkstemp's 0600 mode. They are not chmod-ed to the umask, because reading the umask (os.umask set/restore) is not thread-safe. This tool is used by one person, and the server runs as the same user."
+  - "load_card raises ScoutError if the JSON is not an object, if schema_version != card.v0, or if tensors_parquet is not a plain file name. OSError and JSON decode errors propagate unchanged."
+  - "tests/helpers/cards.py::build_fixture_card reads model_index.json (if present) during RESOLVE and sets has_weights per component by trying select_weight_files. It uses scanned_at='2026-01-01T00:00:00Z' and elapsed_s=0.0 and only passes file_sizes for the selected shard files."
+  - "Extra tests beyond the acceptance list: test_pipeline_component, test_atomic_json_failure_leaves_no_temp, test_load_rejects_wrong_version, and in test_paths a '../evil' component that must be refused."
 acceptance:
   tests:
     - "tests/helpers/cards.py: def build_fixture_card(root: Path, out_dir: Path, component: str | None = None) -> BuiltCard. It uses LocalSource + ByteLog (stages RESOLVE, HEADERS, META, REPORT) + select_weight_files/parse_index + read_header + parse_config/parse_model_card + analyze + build_card, with no scan.py. T011 reuses it."

@@ -571,8 +571,8 @@ def test_retry_repreflight_within_budget(env):
 def test_hook_read_inmemory_still_counted(env):
     # A response hook that pre-reads an in-memory (FakeHub) body: the ByteStream fallback counts it exactly.
     client = env.hub.client()
-    client.event_hooks["response"] = [lambda r: r.read()]
     src, log = _src(env.hub, client=client)
+    client.event_hooks["response"].append(lambda r: r.read())  # after construction: bypasses the __init__ guard
     src.resolve()
     data = src.read_file("config.json")
     assert data == (env.root / "config.json").read_bytes()
@@ -591,9 +591,10 @@ def test_hook_read_real_stream_fails_closed():
             return httpx.Response(200, content=api)
         return httpx.Response(200, stream=_Chunks(cfg))
 
-    client = httpx.Client(transport=httpx.MockTransport(h), event_hooks={"response": [lambda r: r.read()]})
+    client = httpx.Client(transport=httpx.MockTransport(h))
     log = ByteLog()
     src = HubSource(REPO, None, log, client=client, endpoint=HUB, sleep=lambda s: None)
+    client.event_hooks["response"].append(lambda r: r.read())  # after construction: bypasses the __init__ guard
     src.resolve()
     meta0 = log.totals["meta"]
     t0 = time.monotonic()
@@ -648,4 +649,133 @@ def test_error_mapping_conflicting_signals(env):
     src, log = _src(env.hub, client=_wrap(env.hub, fn))
     with pytest.raises(GatedRepoError):
         src.resolve()
+    assert log.reserved == 0
+
+
+# ---------------------------------------------------------------------------- escalation: response hooks
+
+class _Counted(httpx.SyncByteStream):
+    """A real (non in-memory) stream that counts every byte it serves into box[0]."""
+
+    def __init__(self, data: bytes, box: list[int]) -> None:
+        self._data = data
+        self._box = box
+
+    def __iter__(self):
+        for i in range(0, len(self._data), 7):
+            chunk = self._data[i:i + 7]
+            self._box[0] += len(chunk)
+            yield chunk
+
+
+def _drain(r: httpx.Response) -> None:
+    r.read()
+
+
+def _sum(log) -> int:
+    t = log.totals
+    return t["meta"] + t["header"] + t["weight"]
+
+
+def test_init_rejects_client_with_response_hooks(env):
+    client = httpx.Client(transport=env.hub.transport(), event_hooks={"response": [_drain]})
+    with pytest.raises(ValueError, match="client response hooks are not supported"):
+        HubSource(REPO, None, ByteLog(), client=client, endpoint=HUB)
+    # request hooks cannot see response bytes, so they stay allowed
+    ok = httpx.Client(transport=env.hub.transport(), event_hooks={"request": [lambda r: None]})
+    HubSource(REPO, None, ByteLog(), client=ok, endpoint=HUB)
+
+
+def _hooked_source(file_handler, cfg: bytes):
+    """HubSource over a MockTransport (in-memory API body, file URLs from file_handler), resolved,
+    with a draining response hook appended after construction (bypassing the __init__ guard)."""
+    api = _api_body({"config.json": cfg})
+    requests = []
+
+    def h(req):
+        requests.append(req)
+        if req.url.path.startswith("/api/models/"):
+            return httpx.Response(200, content=api)
+        return file_handler(req)
+
+    client = httpx.Client(transport=httpx.MockTransport(h))
+    log = ByteLog()
+    src = HubSource(REPO, None, log, client=client, endpoint=HUB, sleep=lambda s: None)
+    src.resolve()
+    client.event_hooks["response"].append(_drain)
+    return src, log, requests
+
+
+def test_hook_bypass_content_encoding_logged():
+    cfg = b'{"model_type": "qwen3", "pad": "' + b"y" * 300 + b'"}'
+    gz = gzip.compress(cfg)
+    box = [0]
+    src, log, _ = _hooked_source(
+        lambda req: httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=_Counted(gz, box)), cfg)
+    before = _sum(log)
+    with pytest.raises(NetworkError, match="consumed outside HubSource"):
+        src.read_file("config.json")
+    assert box[0] == len(gz) > 0
+    assert _sum(log) - before == box[0]  # exactly the bytes served, once
+    ev = _events(log, "fetch", "config.json")
+    assert len(ev) == 1 and ev[0].bytes == box[0] and ev[0].range == (0, box[0])
+    assert _events(log, "retry") == []
+    assert log.reserved == 0
+
+
+def test_hook_gzip_records_raw_byte_count():
+    cfg = b'{"model_type": "qwen3", "pad": "' + b"z" * 5000 + b'"}'
+    gz = gzip.compress(cfg)
+    assert len(gz) < len(cfg)
+    box = [0]
+    src, log, _ = _hooked_source(
+        lambda req: httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=_Counted(gz, box)), cfg)
+    meta0 = log.totals["meta"]
+    with pytest.raises(NetworkError):
+        src.read_file("config.json")
+    ev = _events(log, "fetch", "config.json")
+    assert len(ev) == 1 and ev[0].bytes == len(gz) == box[0]  # raw wire bytes, not the decoded length
+    assert log.totals["meta"] - meta0 == len(gz)
+    assert log.reserved == 0
+
+
+def test_hook_bypass_error_preflight_refused_logged():
+    cfg = b'{"model_type": "qwen3"}'
+    body = b"Service Unavailable " * 10
+    box = [0]
+    src, log, requests = _hooked_source(lambda req: httpx.Response(503, stream=_Counted(body, box)), cfg)
+    # room for the config.json reservation, but not for the @error reservation (ERROR_BODY_MAX_BYTES)
+    log.threshold_bytes = _sum(log) + len(cfg) + 100
+    before = _sum(log)
+    n0 = len(requests)
+    with pytest.raises(NetworkError, match="consumed outside HubSource"):
+        src.read_file("config.json")
+    assert len(requests) == n0 + 1  # no retry
+    assert box[0] == len(body)
+    assert _sum(log) - before == box[0]
+    ev = _events(log, "error", ERROR_PATH)
+    assert len(ev) == 1 and ev[0].bytes == box[0] and ev[0].status == 503
+    assert _events(log, "refused") == []  # checked before the @error preflight
+    assert log.reserved == 0
+
+
+def test_hook_bypass_redirect_preflight_refused_logged():
+    cfg = b'{"model_type": "qwen3"}'
+    body = b"Found. Redirecting " * 10
+    box = [0]
+    src, log, requests = _hooked_source(
+        lambda req: httpx.Response(302, headers={"Location": "/cache/config.json"}, stream=_Counted(body, box)),
+        cfg)
+    # room for the config.json reservation, but not for the @redirect reservation (REDIRECT_MAX_BYTES)
+    log.threshold_bytes = _sum(log) + len(cfg) + 100
+    before = _sum(log)
+    n0 = len(requests)
+    with pytest.raises(NetworkError, match="consumed outside HubSource"):
+        src.read_file("config.json")
+    assert len(requests) == n0 + 1  # the redirect was not followed
+    assert box[0] == len(body)
+    assert _sum(log) - before == box[0]
+    ev = _events(log, "fetch", REDIRECT_PATH)
+    assert len(ev) == 1 and ev[0].bytes == box[0] and ev[0].status == 302
+    assert _events(log, "refused") == []
     assert log.reserved == 0

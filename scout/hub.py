@@ -93,6 +93,8 @@ class HubSource:
             raise ValueError(f"invalid Hub repo id {repo_id!r} (expected owner/name)")
         if attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts}")
+        if client is not None and client.event_hooks.get("response"):
+            raise ValueError("client response hooks are not supported: bytes could escape the ByteLog")
         self.repo = repo_id
         self.requested_revision = revision
         self.revision_sha = ""
@@ -219,7 +221,7 @@ class HubSource:
                 status: int | None = None
                 final_url: str | None = None
                 try:
-                    resp = self._follow(httpx.URL(url), headers)
+                    resp = self._follow(httpx.URL(url), headers, logged_path, start, mode)
                     try:
                         status = resp.status_code
                         final_url = str(resp.request.url)
@@ -290,12 +292,14 @@ class HubSource:
         finally:
             self.log.release(cur)
 
-    def _follow(self, url: httpx.URL, headers: dict[str, str] | None) -> httpx.Response:
+    def _follow(self, url: httpx.URL, headers: dict[str, str] | None, logged_path: str,
+                start: int | None, mode: str) -> httpx.Response:
         """Send GET with manual redirects; returns the final (non-redirect) response, still streaming."""
         hops = 0
         while True:
             request = self._client.build_request("GET", url, headers=self._headers_for(url, headers))
             resp = self._client.send(request, stream=True, follow_redirects=False)
+            self._check_hop(resp, logged_path, start, mode)
             if resp.status_code not in _REDIRECT_STATUSES:
                 return resp
             try:
@@ -310,6 +314,42 @@ class HubSource:
             if hops > MAX_REDIRECTS:
                 raise self._fail(NetworkError(f"{url}: more than {MAX_REDIRECTS} redirects"), None)
             url = target
+
+    def _check_hop(self, resp: httpx.Response, logged_path: str, start: int | None, mode: str) -> None:
+        """Defence in depth against bodies drained outside HubSource (e.g. a client response hook
+        added after __init__). Runs once per hop, before any status branch or preflight, so no
+        refused preflight or early close can leave already-received bytes unrecorded.
+
+        An in-memory httpx.ByteStream (Response(content=...), MockTransport) is re-iterable raw
+        bytes and is counted normally later. Any other consumed stream: record the raw bytes
+        httpx downloaded (num_bytes_downloaded, before any decoding) under the path this body
+        belongs to, then raise NetworkError (not retried).
+        """
+        if not resp.is_stream_consumed:
+            return
+        stream = resp.stream
+        inner = getattr(stream, "_stream", stream)
+        if isinstance(stream, httpx.ByteStream) or isinstance(inner, httpx.ByteStream):
+            return
+        status = resp.status_code
+        if status in _REDIRECT_STATUSES:
+            event, path, at = "fetch", REDIRECT_PATH, None
+        elif not 200 <= status < 300:
+            event, path, at = "error", ERROR_PATH, None
+        elif mode == _RANGE and status == 200:
+            event, path, at = "fetch", logged_path, 0  # Range ignored: the body starts at offset 0
+        elif mode == _RANGE and status == 206:
+            event, path, at = "fetch", logged_path, self._content_range_start(resp, start)
+        else:
+            event, path, at = "fetch", logged_path, start
+        msg = "response body consumed outside HubSource; bytes cannot be counted"
+        try:
+            self.log.record(
+                event=event, source=_SOURCE, path=path, url=str(resp.request.url), start=at,
+                nbytes=resp.num_bytes_downloaded, status=status, note=f"{msg} ({status} for {logged_path})")
+        finally:
+            resp.close()
+        raise self._fail(NetworkError(msg), logged_path)
 
     def _log_redirect_body(self, resp: httpx.Response, req_url: httpx.URL, target: httpx.URL | None) -> None:
         t0 = time.monotonic()
@@ -454,9 +494,10 @@ class HubSource:
           Response(content=...) as consumed, e.g. MockTransport): that stream is re-iterable
           raw bytes, so it is read and counted the same way.
         - Consumed any other way (e.g. a client event hook called r.read()): the bytes were
-          received outside HubSource and cannot be counted by offset. len(resp.content) is
-          recorded when available (path/start of this body, so classification stays
-          honest), then NetworkError is raised. Never retried.
+          received outside HubSource and cannot be counted by offset. resp.num_bytes_downloaded
+          (raw, undecoded bytes) is recorded at the path/start of this body, so classification
+          stays honest, then NetworkError is raised. Never retried. (_check_hop normally
+          catches this first, right after send.)
         """
         if not resp.is_stream_consumed:
             yield from resp.iter_raw()
@@ -466,7 +507,7 @@ class HubSource:
         if isinstance(stream, httpx.ByteStream) or isinstance(inner, httpx.ByteStream):
             yield from stream
             return
-        nbytes = len(resp.content) if hasattr(resp, "_content") else 0
+        nbytes = resp.num_bytes_downloaded
         self.log.record(
             event=event, source=_SOURCE, path=path, url=str(resp.request.url), start=start,
             nbytes=nbytes, status=resp.status_code,
