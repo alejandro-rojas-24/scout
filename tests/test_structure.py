@@ -297,3 +297,14 @@ def test_empty_stack_prefix():
 def test_leading_zero_restore(lit):
     st = analyze(_infos({f"head.{lit}.w": _w(2)}))
     assert st.places[f"head.{lit}.w"] == TensorPlace(f"head.{lit}.w", None, None, None)
+    assert st.warnings == []
+    # inside a real stack, distinct literals for the same int merge into one block and warn
+    n = int(lit)
+    st2 = analyze(_infos({f"l.{n}.w": _w(2), f"l.{lit}.b": _w(3), "l.9.w": _w(2)}))
+    assert st2.stacks[0].indices == [n, 9]
+    assert st2.stacks[0].block_params == [5, 2]
+    alias = [w for w in st2.warnings if "index alias" in w]
+    if lit == str(n):
+        assert alias == []
+    else:
+        assert alias == [f"l: index alias {sorted({str(n), lit})} -> {n}"]
