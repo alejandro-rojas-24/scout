@@ -14,7 +14,9 @@ from scout.card import (
 )
 from scout.errors import ScoutError
 from tests.helpers.cards import build_fixture_card
-from tests.helpers.st_fixtures import write_dense_repo, write_moe_repo, write_pipeline_repo
+from tests.helpers.st_fixtures import (
+    write_dense_repo, write_moe_repo, write_pipeline_repo, write_sharded,
+)
 
 CARD_KEYS = [
     "schema_version", "key", "source", "scan", "model_card", "config", "pipeline",
@@ -142,15 +144,40 @@ def test_atomic(dense, monkeypatch):
 
 def test_atomic_json_failure_leaves_no_temp(dense, monkeypatch):
     _, built, out = dense
+    real_replace = card_mod.os.replace
 
-    def boom(*a, **k):
-        raise RuntimeError("json fail")
+    def replace(src, dst):
+        if str(dst).endswith(".card.json"):
+            raise OSError("json replace failed")
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(card_mod.json, "dump", boom)
-    with pytest.raises(RuntimeError):
+    monkeypatch.setattr(card_mod.os, "replace", replace)
+    with pytest.raises(OSError):
         write_card(built)
     assert not list(out.glob("**/*.tmp"))
     assert not list(out.glob("**/*.card.json"))
+    assert not list(out.glob("**/*.parquet"))
+    assert _files_under(out) == []
+
+
+def test_lone_surrogate_in_config_refused(tmp_path):
+    write_dense_repo(tmp_path / "repo", n_shards=1)
+    (tmp_path / "repo" / "config.json").write_text('{"model_type": "x", "bad": "\\ud800"}')
+    out = tmp_path / "out"
+    with pytest.raises(ScoutError, match="unencodable"):
+        build_fixture_card(tmp_path / "repo", out)
+    assert not out.exists() or _files_under(out) == []
+
+
+def test_lone_surrogate_in_tensor_name_refused(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config.json").write_text("{}")
+    write_sharded(repo, {"model.\ud800.weight": ("F32", (2,)), "lm_head.weight": ("F32", (2,))}, 1)
+    out = tmp_path / "out"
+    with pytest.raises(ScoutError):
+        build_fixture_card(repo, out)
+    assert not out.exists() or _files_under(out) == []
 
 
 def test_fetch_log_embedded(dense):
