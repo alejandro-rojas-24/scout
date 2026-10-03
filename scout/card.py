@@ -198,11 +198,22 @@ def build_card(*, source: Source, component: str | None, pipeline: PipelineInfo 
         "fetch_log": log.to_card_dict(),
         "tensors_parquet": paths.parquet_path.name,
     }
-    table = _build_table(source.repo, source.revision_sha, component, headers, structure)
+    _encode_card(card)  # fail here, before any file exists, on unencodable text
+    try:
+        table = _build_table(source.repo, source.revision_sha, component, headers, structure)
+    except (UnicodeError, pa.ArrowException) as exc:
+        raise ScoutError(f"tensor table cannot be built: {exc}") from exc
     return BuiltCard(card=card, table=table, paths=paths)
 
 
 # ---------------------------------------------------------------------- write / load
+
+
+def _encode_card(card: dict) -> bytes:
+    try:
+        return json.dumps(card, indent=2, ensure_ascii=False).encode("utf-8")
+    except UnicodeError as exc:
+        raise ScoutError(f"card contains unencodable text: {exc}") from exc
 
 
 def _mkstemp_for(target: pathlib.Path) -> tuple[int, str]:
@@ -210,10 +221,16 @@ def _mkstemp_for(target: pathlib.Path) -> tuple[int, str]:
 
 
 def write_card(built: BuiltCard) -> CardPaths:
-    """Parquet first, then JSON; each via its own mkstemp temp file + os.replace."""
+    """Parquet first, then JSON; each via its own mkstemp temp file + os.replace.
+
+    The JSON payload is encoded before any file is touched, so after the Parquet's
+    os.replace only IO can fail; in that case the Parquet is removed again.
+    """
     paths = built.paths
+    payload = _encode_card(built.card)
     paths.json_path.parent.mkdir(parents=True, exist_ok=True)
     temps: list[str] = []
+    parquet_placed = False
     try:
         fd, tmp = _mkstemp_for(paths.parquet_path)
         temps.append(tmp)
@@ -223,19 +240,23 @@ def write_card(built: BuiltCard) -> CardPaths:
             os.fsync(f.fileno())
         os.replace(tmp, paths.parquet_path)
         temps.remove(tmp)
+        parquet_placed = True
 
         fd, tmp = _mkstemp_for(paths.json_path)
         temps.append(tmp)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(built.card, f, indent=2, ensure_ascii=False)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, paths.json_path)
         temps.remove(tmp)
     except BaseException:
-        for tmp in temps:
+        leftovers = list(temps)
+        if parquet_placed:
+            leftovers.append(str(paths.parquet_path))
+        for p in leftovers:
             try:
-                os.unlink(tmp)
+                os.unlink(p)
             except FileNotFoundError:
                 pass
         raise
