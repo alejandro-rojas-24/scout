@@ -46,3 +46,4 @@ T006: >1 non-canonical index with exactly one single file returns the single fil
 - T005 (r3 review, PRIORITY): a caller-supplied client with a request event hook or a client-level `Authorization` header could still put the HF token on CDN requests. Fix: in HubSource.__init__, refuse request hooks and client-level Authorization too.
 - T005 (r3 review): if a caller drains `resp.stream` directly (not read()/iter_*), num_bytes_downloaded stays 0; HubSource still fails closed but logs 0 bytes. Undetectable externally; document in code.
 - Process: reviewer/implementer probe scripts in the shared scratchpad were overwritten by other agents; future evidence should be self-contained probes with task-specific names, or committed tests.
+- T009 (r3 review): concurrent first-writer window can leave a JSON pointing at a missing Parquet until the next rescan (load fails cleanly). Fix in P4 with a per-key lock or content-addressed store.
