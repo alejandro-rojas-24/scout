@@ -161,11 +161,16 @@ def parse_index(raw: bytes, subdir: str) -> tuple[list[str], int | None]:
         raise HeaderError("index has no weight_map object")
     for k, v in wm.items():
         if (not isinstance(v, str) or not v or v.startswith("/") or "\\" in v
-                or ".." in v.split("/")):
+                or any(seg in ("", ".", "..") for seg in v.split("/"))):
             raise HeaderError(f"bad weight_map entry for {k!r}")
     files = sorted({_join(subdir, v) for v in wm.values()})
     meta = j.get("metadata") or {}
     total = meta.get("total_size") if isinstance(meta, dict) else None
-    if total is not None and (not _is_int(total) or total < 0):
-        raise HeaderError(f"bad total_size {total!r}")
+    if total is not None:
+        if isinstance(total, float) and total.is_integer() and total >= 0:
+            total = int(total)
+        elif isinstance(total, str) and total.isascii() and total.isdigit():
+            total = int(total)
+        elif not _is_int(total) or total < 0:
+            raise HeaderError(f"bad total_size {total!r}")
     return files, total

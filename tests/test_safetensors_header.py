@@ -218,15 +218,22 @@ def test_parse_index():
         parse_index(b"nope", "")
 
 
-@pytest.mark.parametrize("v", [1, "", "/etc/x.safetensors", "../x.safetensors", "a\\b.safetensors"])
+@pytest.mark.parametrize("v", [1, "", "/etc/x.safetensors", "../x.safetensors", "a\\b.safetensors", "./x.safetensors", "a//b.safetensors"])
 def test_parse_index_bad_entry(v):
     raw = json.dumps({"weight_map": {"k": v}}).encode()
     with pytest.raises(HeaderError, match="bad weight_map entry for 'k'"):
         parse_index(raw, "")
 
 
-@pytest.mark.parametrize("t", [-1, True, "12", 1.5, [1]])
+@pytest.mark.parametrize("t", [-1, True, "-1", "1.5", "", 1.5, -2.0, [1], {}])
 def test_parse_index_bad_total(t):
     raw = json.dumps({"metadata": {"total_size": t}, "weight_map": {"k": "a.safetensors"}}).encode()
     with pytest.raises(HeaderError):
         parse_index(raw, "")
+
+
+@pytest.mark.parametrize("t,want", [("123", 123), (1.6e10, 16000000000), (0, 0), (7, 7)])
+def test_parse_index_total_accepted(t, want):
+    raw = json.dumps({"metadata": {"total_size": t}, "weight_map": {"k": "a.safetensors"}}).encode()
+    total = parse_index(raw, "")[1]
+    assert total == want and type(total) is int
