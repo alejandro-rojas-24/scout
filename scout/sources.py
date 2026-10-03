@@ -19,10 +19,38 @@ from scout.bytelog import WEIGHT_EXTENSIONS, ByteLog
 from scout.errors import HeaderError, ScoutError, WeightReadRefused
 
 STAT_PATH: str = "@local/stat"
+MAX_SYMLINK_HOPS: int = 40  # same as Linux MAXSYMLINKS
+MAX_NOTE_LINKS: int = 20  # symlink entries listed in the persisted @local/stat note
 
 
 def _is_weight_name(name: str) -> bool:
     return name.lower().endswith(WEIGHT_EXTENSIONS)
+
+
+def _weight_ext(name: str) -> str | None:
+    low = name.lower()
+    for ext in WEIGHT_EXTENSIONS:
+        if low.endswith(ext):
+            return ext
+    return None
+
+
+def _link_chain(full: str, rel: str) -> list[str]:
+    """Basenames of every hop target of the symlink chain starting at `full` (empty if not a link).
+
+    Follows os.readlink hop by hop (relative targets are joined to the link's directory and left
+    unnormalised so the OS resolves `..` physically). More than MAX_SYMLINK_HOPS hops, or a cycle,
+    raises ScoutError("symlink chain too long ..."). A readlink failure raises OSError.
+    """
+    hops: list[str] = []
+    cur = full
+    while os.path.islink(cur):
+        if len(hops) >= MAX_SYMLINK_HOPS:
+            raise ScoutError(f"symlink chain too long {rel} (more than {MAX_SYMLINK_HOPS} hops)")
+        target = os.readlink(cur)
+        cur = os.path.join(os.path.dirname(cur), target)
+        hops.append(os.path.basename(target.rstrip("/\\")))
+    return hops
 
 
 @dataclass(frozen=True)
@@ -76,6 +104,7 @@ class LocalSource:
         self._files: list[RepoFile] | None = None
         self._stats: dict[str, tuple[int, int]] = {}  # rel -> (size, mtime_ns) at resolve()
         self._idents: dict[str, tuple[int, int]] = {}  # rel -> (st_dev, st_ino) at resolve()
+        self._nlinks: dict[str, int] = {}  # rel -> st_nlink at resolve()
         self._effective: dict[str, str] = {}  # rel -> classification name
 
     # ------------------------------------------------------------------ resolve
@@ -83,7 +112,10 @@ class LocalSource:
     def resolve(self) -> None:
         stats: dict[str, tuple[int, int]] = {}
         idents: dict[str, tuple[int, int]] = {}  # rel -> (st_dev, st_ino) of the target
+        nlinks: dict[str, int] = {}  # rel -> st_nlink of the target
         reals: dict[str, str] = {}  # rel -> realpath
+        hops: dict[str, list[str]] = {}  # rel -> basenames of every symlink hop target
+        hidden_names: dict[tuple[int, int], set[str]] = {}  # (dev, ino) -> hidden alias names
         links: list[str] = []
 
         def _onerror(exc: OSError) -> None:
@@ -92,11 +124,20 @@ class LocalSource:
         for dirpath, dirnames, filenames in os.walk(self._root, onerror=_onerror, followlinks=False):
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
             for name in sorted(filenames):
-                if name.startswith("."):
-                    continue
                 full = os.path.join(dirpath, name)
                 rel = Path(os.path.relpath(full, self._root)).as_posix()
+                if name.startswith("."):
+                    # Never listed, but a hidden weight-named link to a listed file's inode
+                    # still taints it. Errors here are ignored: hidden files never fail resolve().
+                    try:
+                        chain = _link_chain(full, rel)
+                        hst = os.stat(full)
+                    except (OSError, ScoutError):
+                        continue
+                    hidden_names.setdefault((hst.st_dev, hst.st_ino), set()).update([name, *chain])
+                    continue
                 try:
+                    chain = _link_chain(full, rel)
                     st = os.stat(full)  # follows symlinks (HF cache snapshots -> ../blobs/)
                 except OSError as exc:
                     if os.path.islink(full):
@@ -106,51 +147,91 @@ class LocalSource:
                     continue  # fifos, sockets, devices: never listed, never read
                 stats[rel] = (st.st_size, st.st_mtime_ns)
                 idents[rel] = (st.st_dev, st.st_ino)
+                nlinks[rel] = st.st_nlink
                 reals[rel] = os.path.realpath(full)
-                if os.path.islink(full):
+                hops[rel] = chain
+                if chain:
                     links.append(rel)
 
         rels = sorted(stats)
         key = "\n".join(f"{rel}\t{stats[rel][0]}\t{stats[rel][1]}" for rel in rels)
         self._stats = stats
         self._idents = idents
-        self._effective = self._classification_names(rels, idents, reals)
+        self._nlinks = nlinks
+        self._effective = self._classification_names(rels, idents, reals, hops, hidden_names)
         self._files = [RepoFile(rel, stats[rel][0]) for rel in rels]
         self.revision_sha = hashlib.sha256(key.encode()).hexdigest()
-        note = f"{len(rels)} files"
-        if links:
-            note += "; symlinks: " + "; ".join(f"{rel} -> {reals[rel]}" for rel in sorted(links))
         self.log.record(
             event="fetch", source="local", path=STAT_PATH, url=None, start=None,
-            nbytes=0, status=None, note=note,
+            nbytes=0, status=None, note=self._stat_note(len(rels), sorted(links), reals),
         )
+
+    def _stat_note(self, n: int, links: list[str], reals: dict[str, str]) -> str:
+        """The @local/stat note. It is persisted in the Card, so it never holds an absolute path:
+        targets are relative to root, or "<outside>/basename" outside root/../.."""
+        note = f"{n} files"
+        if not links:
+            return note
+        anchor = str(self._root.parent.parent)
+        entries = []
+        for rel in links[:MAX_NOTE_LINKS]:
+            real = reals[rel]
+            try:
+                inside = os.path.commonpath([real, anchor]) == anchor
+            except ValueError:
+                inside = False
+            target = (Path(os.path.relpath(real, self._root)).as_posix() if inside
+                      else f"<outside>/{os.path.basename(real)}")
+            entries.append(f"{rel} -> {target}")
+        if len(links) > MAX_NOTE_LINKS:
+            entries.append(f"(+{len(links) - MAX_NOTE_LINKS} more)")
+        return note + "; symlinks: " + "; ".join(entries)
 
     @staticmethod
     def _classification_names(
-        rels: list[str], idents: dict[str, tuple[int, int]], reals: dict[str, str]
+        rels: list[str],
+        idents: dict[str, tuple[int, int]],
+        reals: dict[str, str],
+        hops: dict[str, list[str]],
+        hidden_names: dict[tuple[int, int], set[str]],
     ) -> dict[str, str]:
         """rel -> the name passed to preflight/record.
 
-        ByteLog classifies by name, so a non-weight name that aliases weight bytes (a symlink
-        to a weight file, or a hard link / second link to the same inode as a weight-named
-        file) must be classified by its weight-class alias. If the file's own name is already
-        weight-class it is used unchanged (safetensors header semantics apply). Otherwise, if
-        any alias is weight-class, the effective name is f"{rel} -> {alias}", which ends with
-        the alias's weight extension and is therefore refused by preflight; .safetensors
-        aliases are refused outright in _effective_name (no header semantics on an alias).
+        ByteLog classifies by name, so every name that reaches a file's bytes counts. The
+        aliases of a listed file are all names attached to its target inode: the basename of
+        each listed file on that inode, every symlink hop target of those files (followed with
+        readlink, so readme.md -> model.bin -> <hash> yields model.bin), the realpath basename,
+        and hidden files in walked directories on the same inode.
+
+        - Own name non-weight: if any alias is weight-class, the effective name is
+          f"{rel} -> {alias}" (ends with the alias's weight extension, so preflight refuses
+          it); .safetensors aliases are preferred and refused outright in _effective_name.
+        - Own name .safetensors: if any alias has a different weight extension (.bin, .pt, ...),
+          the effective name is f"{rel} -> {alias}", which preflight refuses (no safetensors
+          header semantics over another format). Extensionless aliases (HF blobs) and other
+          .safetensors names keep the own name.
+        - Own name any other weight extension: unchanged (already refused).
         """
-        by_inode: dict[tuple[int, int], list[str]] = {}
+        names: dict[tuple[int, int], set[str]] = {}
         for rel in rels:
-            by_inode.setdefault(idents[rel], []).append(rel)
+            bucket = names.setdefault(idents[rel], set())
+            bucket.add(os.path.basename(rel))
+            bucket.add(os.path.basename(reals[rel]))
+            bucket.update(hops[rel])
+        for ident, hidden in hidden_names.items():
+            if ident in names:
+                names[ident].update(hidden)
         out: dict[str, str] = {}
         for rel in rels:
-            if _is_weight_name(rel):
-                out[rel] = rel
-                continue
-            aliases = [os.path.basename(reals[rel])]
-            aliases += [os.path.basename(o) for o in by_inode[idents[rel]] if o != rel]
-            weighty = sorted({a for a in aliases if _is_weight_name(a)},
-                             key=lambda a: (not a.lower().endswith(".safetensors"), a))
+            own_ext = _weight_ext(rel)
+            aliases = names[idents[rel]]
+            if own_ext is None:
+                weighty = sorted((a for a in aliases if _is_weight_name(a)),
+                                 key=lambda a: (not a.lower().endswith(".safetensors"), a))
+            elif own_ext == ".safetensors":
+                weighty = sorted(a for a in aliases if _weight_ext(a) not in (None, ".safetensors"))
+            else:
+                weighty = []
             out[rel] = f"{rel} -> {weighty[0]}" if weighty else rel
         return out
 
@@ -166,7 +247,11 @@ class LocalSource:
 
     def _check_unchanged(self, f: typing.BinaryIO, path: str) -> None:
         st = os.fstat(f.fileno())
-        if (st.st_size, st.st_mtime_ns) != self._stats[path] or (st.st_dev, st.st_ino) != self._idents[path]:
+        if (
+            (st.st_size, st.st_mtime_ns) != self._stats[path]
+            or (st.st_dev, st.st_ino) != self._idents[path]
+            or st.st_nlink != self._nlinks[path]  # a hard link (possibly weight-named) was added
+        ):
             raise ScoutError(f"{path} changed since resolve(); re-run resolve")
 
     def read_file(self, path: str) -> bytes | None:

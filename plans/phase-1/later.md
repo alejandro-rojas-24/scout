@@ -39,3 +39,4 @@ Unscheduled
 T006: >1 non-canonical index with exactly one single file returns the single file; decide whether that should be AmbiguousWeightsError.
 - LocalSource FIFO race (T004 review nit 4): a path swapped for a FIFO between resolve() and a read blocks in open() before the fstat check; fix with os.open(O_RDONLY|O_NONBLOCK) + S_ISREG check on the fd.
 - LocalSource alias limitation (T004 review): an extensionless weight blob linked under a non-weight name, with no weight-named sibling on the same inode, is classified as meta (ByteLog classifies by name; content sniffing deferred).
+- LocalSource symlink-after-resolve (T004 review r2): a new symlink (hidden or not) pointing at a listed file, created after resolve(), does not change the file's stat, so reads keep the resolve-time classification; re-resolve before reads if the tree may change.
