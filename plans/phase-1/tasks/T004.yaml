@@ -49,7 +49,18 @@ behavior: |
      record(start=start, nbytes=len(data), release=r); log.release(r) in finally. If len(data) < length raise HeaderError(f"short read {path}").
      Return data.
   5. Never write any file. Never read a byte that preflight did not approve.
-decisions: []
+decisions:
+  - "resolve() does not call log.stage(); the caller enters RESOLVE (T010 does log.stage(RESOLVE) before source.resolve()). 'logs under RESOLVE' means the @local/stat event lands in whatever stage the caller set. resolve() may be called repeatedly; each call re-walks, re-hashes and logs one more 0-byte @local/stat event (record with start=None, so range is None)."
+  - "files(), read_file() and read_range() before resolve() raise ScoutError (no implicit resolve)."
+  - "Symlinks (plan r3-m10): os.walk(followlinks=False) lists a symlink to a directory under dirnames, so it is silently not descended into. File symlinks are stat'ed with os.stat (follows), may point outside root (HF cache ../../blobs/), and are opened normally. Any OSError from os.stat on a path that is a symlink (missing target, ELOOP) -> ScoutError(f'broken symlink {rel}'); an OSError on a non-symlink re-raises unchanged."
+  - "Non-regular files after following links (fifos, sockets, devices) are skipped from files() so a read can never block on them."
+  - "Hidden filter applies at every depth (any dir or file name starting with '.', e.g. .git/, sub/.cache/, .hidden.json); hidden paths are not in files(), so read_file returns None and read_range raises ScoutError for them."
+  - "Reads check that the file has not changed since resolve(): after open, os.fstat (no bytes read) must match the (st_size, st_mtime_ns) captured by resolve(), else ScoutError('<path> changed since resolve(); re-run resolve'). This keeps read bytes consistent with revision_sha and with the size preflight approved. read_file reads at most the resolved size (f.read(size)), never more than preflight approved; if fewer bytes arrive it records them and raises ScoutError('short read ...')."
+  - "read_range: path not in files() -> ScoutError. The record() happens before the short-read check, so bytes actually read are logged even when HeaderError('short read {path}') is raised. Negative start/length surface as ValueError from preflight's classify_range, before any open."
+  - "Both reads call log.release(r) in finally even after record(release=r); release is idempotent, so this covers every exit path (refusal raises inside preflight and creates no reservation)."
+  - "Reads use the builtin open() (looked up at call time) so tests can spy/monkeypatch builtins.open. elapsed_ms is perf_counter time from just before open to after read."
+  - "Source is a plain typing.Protocol (not runtime_checkable) to match the interface as written. The @local/stat pseudo-path is exposed as module constant STAT_PATH."
+  - "Built against the T002 follow-ups: no LogEvent dict is mutated, and set_header_len is called once per path in tests."
 acceptance:
   tests:
     - "test_resolve_no_reads: monkeypatch builtins.open to fail on anything under root during resolve(); resolve succeeds; files and sizes are correct; revision_sha is 64-hex and stable across two calls; touching a file (mtime) changes it"
