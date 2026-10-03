@@ -1,5 +1,10 @@
+import copy
 import json
 
+import pytest
+
+from scout.card import load_card, write_card
+from scout.errors import ScoutError
 from scout.view import DISCLAIMERS, build_view
 from tests.helpers.cards import build_fixture_card
 from tests.helpers.st_fixtures import (
@@ -97,3 +102,97 @@ def test_wan_vae_bound(tmp_path):
     assert nodes[""]["params"] == built.card["weights"]["params_total"]
     assert nodes[""]["label"] == "vae"
     assert view["title"].endswith(" / vae")
+
+
+# ---------------------------------------------------------------- T011 amendments
+
+def _custom_view(tmp_path, tensors):
+    root = tmp_path / "r"
+    write_sharded(root, tensors, 1)
+    (root / "config.json").write_text(json.dumps({"model_type": "custom"}))
+    (root / "README.md").write_text(DEFAULT_README)
+    return _view(tmp_path, root)
+
+
+def _depth(card, prefix):
+    return {s["prefix"]: s["depth"] for s in card["structure"]["stacks"]}[prefix]
+
+
+def test_consecutive_markers_unet_input_blocks(tmp_path):
+    # input_blocks.0 has one sub-module, the other 11 have two: 12 x up to 2.
+    t = {}
+    for i in range(12):
+        for j in range(1 if i == 0 else 2):
+            t[f"model.diffusion_model.input_blocks.{i}.{j}.weight"] = ("F16", (4, 4))
+    built, view = _custom_view(tmp_path, t)
+    n = _by_id(view)["model.diffusion_model.input_blocks[#][#]"]
+    assert _depth(built.card, "model.diffusion_model.input_blocks") == 12
+    assert n["kind"] == "stack" and n["count"] == 12
+    assert n["label"] == "input_blocks ×12 ×2"
+    assert n["parent"] == "model.diffusion_model"
+
+
+def test_consecutive_markers_count_is_card_depth(tmp_path):
+    t = {f"x.a.{i}.{j}.weight": ("F32", (2,)) for i in range(2) for j in range(3)}
+    built, view = _custom_view(tmp_path, t)
+    n = _by_id(view)["x.a[#][#]"]
+    assert _depth(built.card, "x.a") == 2
+    assert n["kind"] == "stack" and n["count"] == 2 and n["label"] == "a ×2 ×3"
+
+
+def test_root_level_stack(tmp_path):
+    t = {f"{i}.weight": ("F32", (3, 3)) for i in range(5)}
+    built, view = _custom_view(tmp_path, t)
+    nodes = _by_id(view)
+    n = nodes["[#]"]
+    assert n["kind"] == "stack" and n["count"] == 5 and n["parent"] == "" and n["label"] == "×5"
+    leaf = nodes["[#].weight"]
+    assert leaf["kind"] == "tensor" and leaf["parent"] == "[#]" and leaf["shape"] == [3, 3]
+    assert nodes[""]["params"] == built.card["weights"]["params_total"] == 45
+    assert len(view["nodes"]) == 3
+
+
+def test_mixed_dtypes_same_shape(tmp_path):
+    t = {
+        "l.0.w": ("BF16", (4, 2)), "l.1.w": ("F16", (4, 2)),     # dtypes differ, shape equal
+        "l.0.b": ("F32", (4,)), "l.1.b": ("F32", (2,)),          # shapes differ, dtype equal
+        "l.0.c": ("F16", (4,)), "l.1.c": ("BF16", (2,)),         # both differ
+    }
+    _, view = _custom_view(tmp_path, t)
+    nodes = _by_id(view)
+    assert nodes["l[#].w"]["dtype"] == "varies" and nodes["l[#].w"]["shape"] == [4, 2]
+    assert nodes["l[#].b"]["dtype"] == "F32" and nodes["l[#].b"]["shape"] is None
+    assert nodes["l[#].c"]["dtype"] == "varies" and nodes["l[#].c"]["shape"] is None
+
+
+def test_card_parquet_mismatch_raises(tmp_path):
+    write_moe_repo(tmp_path / "r", n_layers=3, n_experts=4)
+    built = build_fixture_card(tmp_path / "r", tmp_path / "out")
+    bad_stack = copy.deepcopy(built.card)
+    bad_stack["structure"]["stacks"][0]["prefix"] = "nope"
+    with pytest.raises(ScoutError, match="stack"):
+        build_view(bad_stack, built.table)
+    bad_group = copy.deepcopy(built.card)
+    bad_group["structure"]["expert_groups"][0]["template"] = "nope.*"
+    with pytest.raises(ScoutError, match="expert"):
+        build_view(bad_group, built.table)
+
+
+def test_persisted_round_trip(tmp_path):
+    write_moe_repo(tmp_path / "r", n_layers=3, n_experts=4)
+    built = build_fixture_card(tmp_path / "r", tmp_path / "out")
+    paths = write_card(built)
+    card, table = load_card(paths.json_path)
+    assert build_view(card, table) == build_view(built.card, built.table)
+
+
+def test_uneven_inner_indices(tmp_path):
+    t = {
+        "d.blocks.0.resnets.0.w": ("F32", (2,)), "d.blocks.0.resnets.2.w": ("F32", (2,)),
+        "d.blocks.1.resnets.0.w": ("F32", (2,)), "d.blocks.1.resnets.1.w": ("F32", (2,)),
+    }
+    _, view = _custom_view(tmp_path, t)
+    nodes = _by_id(view)
+    n = nodes["d.blocks[#].resnets[#]"]
+    assert n["kind"] == "stack" and n["count"] == 3 and n["label"] == "resnets ×3"
+    assert nodes["d.blocks[#]"]["count"] == 2

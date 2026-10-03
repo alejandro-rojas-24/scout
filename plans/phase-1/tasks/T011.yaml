@@ -64,3 +64,13 @@ amendments:
   - "2026-10-03 orchestrator: a leading integer segment (root-level Card stack, prefix '') uses the root as predecessor: id '[#]', parent '', kind 'stack', count = Card depth, label '×N'."
   - "2026-10-03 orchestrator: a tensor node's dtype is 'varies' whenever the dtypes of its rows differ, independent of shape. shape is None only when shapes differ."
   - "2026-10-03 orchestrator: if a Parquet stack_prefix or expert template has no matching Card structure entry, raise ScoutError (no silent count=1)."
+
+decisions:
+  - "Each merged segment carries an ordered list of marker origins (card/lit/exp), one per marker. Per node and marker position, view.py records a fixed count (Card stack depth or n_experts) and/or a set of distinct literal indices. A marker's count is the fixed count if one exists, else the number of distinct literals. Literals never override a Card count."
+  - "Node count = the FIRST marker's count. Node kind also comes from the FIRST marker ('#' or literal -> stack, '*' -> expert_group), so kind and count stay consistent. This differs from rule 3 ('last segment ends with') only for the theoretical '[*][#]' case (experts.N.M); '[#][*]' cannot occur because '*' always follows a literal 'experts' segment."
+  - "Label = the segment without its markers, then ' ×N' for each marker in order (e.g. 'input_blocks ×12 ×2'). With an empty base (root-level stack), the label is '×N' with no leading space."
+  - "Leading marker: any leading '#', literal digit or '*' merges into an empty predecessor, so the ids are '[#]' / '[*]' with parent ''. Amendment 2 is applied to literal leading digits too, not only to the Card stack with prefix ''."
+  - "Rule 6 as amended: shape = None iff the shapes differ; dtype = 'varies' iff the dtypes differ. A shape mismatch with equal dtypes now keeps the common dtype (previously it forced 'varies')."
+  - "Mismatch (amendment 4): a '#' row whose stack_prefix (including None) has no Card stack, or a '*' template with no Card expert group, raises ScoutError naming the row's collapsed_name and the missing key. No count=1 fallback for Card markers. A literal-only marker with no literals cannot occur, but falls back to 1."
+  - "If several rows reach the same node and marker position with different fixed counts (only possible with >9-digit literal segments, which structure.py does not treat as indices but view.py does), the max is used."
+  - "New tests build custom repos via write_sharded(n_shards=1) + config.json + DEFAULT_README through build_fixture_card. The round-trip test uses the MoE fixture (stacks + expert group) and compares the full view dicts with ==."

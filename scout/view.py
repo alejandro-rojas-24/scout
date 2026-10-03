@@ -9,6 +9,8 @@ import copy
 
 import pyarrow as pa
 
+from scout.errors import ScoutError
+
 DISCLAIMERS: tuple[str, str, str] = (
     "Distillation is invisible to weight forensics: a model trained on another model's outputs leaves no trace in its weights.",
     "Tokenizer reuse alone is not proof of derivation.",
@@ -17,17 +19,24 @@ DISCLAIMERS: tuple[str, str, str] = (
 
 _STACK = "[#]"
 _EXPERT = "[*]"
+_MARK_LEN = len(_STACK)
+
+# A marker origin: ("card", stack_prefix) for "#", ("lit", index) for a literal digit,
+# ("exp", template) for "*".
+Origin = tuple[str, str | None]
 
 
 def _is_digits(seg: str) -> bool:
     return seg.isascii() and seg.isdigit()
 
 
-def _segments(collapsed_name: str, stack_prefix: str | None) -> list[tuple[str, tuple | None]]:
-    """Apply the segment rule. Each segment carries its origin:
-    ("card", stack_prefix) for "#", ("lit", index) for a literal digit, ("exp", template) for "*"."""
+def _segments(collapsed_name: str, stack_prefix: str | None) -> list[tuple[str, list[Origin]]]:
+    """Apply the segment rule. Each merged segment carries one origin per marker, in order.
+
+    A marker with no predecessor (a root-level stack) merges into an empty segment, so
+    "#.weight" -> ["[#]", "weight"]."""
     orig = collapsed_name.split(".")
-    out: list[tuple[str, tuple | None]] = []
+    out: list[tuple[str, list[Origin]]] = []
     for k, seg in enumerate(orig):
         if seg == "#":
             mark, info = _STACK, ("card", stack_prefix)
@@ -36,14 +45,29 @@ def _segments(collapsed_name: str, stack_prefix: str | None) -> list[tuple[str, 
         elif _is_digits(seg):
             mark, info = _STACK, ("lit", seg.lstrip("0") or "0")
         else:
-            out.append((seg, None))
+            out.append((seg, []))
             continue
-        if not out:  # nothing to merge into: keep the segment as it is
-            out.append((seg, None))
-            continue
-        prev, _ = out[-1]
-        out[-1] = (prev + mark, info)
+        if not out:
+            out.append(("", []))
+        prev, markers = out[-1]
+        out[-1] = (prev + mark, markers + [info])
     return out
+
+
+class _Marker:
+    """What one marker position of one node has seen across rows."""
+
+    __slots__ = ("kind", "fixed", "literals")
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind                 # "stack" | "expert_group" (from the first origin seen)
+        self.fixed: int | None = None    # Card stack depth / expert group n_experts
+        self.literals: set[str] = set()  # distinct literal indices (inner stack)
+
+    def count(self) -> int:
+        if self.fixed is not None:       # a Card count is never overridden by a literal
+            return self.fixed
+        return len(self.literals) or 1
 
 
 def build_view(card: dict, table: pa.Table) -> dict:
@@ -53,23 +77,36 @@ def build_view(card: dict, table: pa.Table) -> dict:
     stack_depth = {s["prefix"]: s["depth"] for s in structure["stacks"]}
     group_experts = {g["template"]: g["n_experts"] for g in structure["expert_groups"]}
 
+    def resolve(info: Origin, name: str) -> int:
+        what, ref = info
+        if what == "card":
+            if ref not in stack_depth:
+                raise ScoutError(
+                    f"tensor table row {name!r}: stack_prefix {ref!r} has no matching Card stack")
+            return stack_depth[ref]
+        if ref not in group_experts:
+            raise ScoutError(
+                f"tensor table row {name!r}: expert template {ref!r} has no matching Card expert group")
+        return group_experts[ref]
+
     key = card["key"]
     nodes: dict[str, dict] = {
         "": {"id": "", "label": key.get("component") or key["repo"], "kind": "root", "parent": None,
              "params": 0, "count": 1, "shape": None, "dtype": None},
     }
-    card_count: dict[str, int] = {}          # id -> count from a Card stack / expert group
-    literals: dict[str, set[str]] = {}       # id -> distinct literal indices (inner stacks)
-    last_seg: dict[str, str] = {}
+    markers: dict[str, list[_Marker]] = {}   # id -> one entry per marker of its last segment
+    base_seg: dict[str, str] = {}            # id -> last segment without its markers
     leaf_rows: dict[str, list[tuple[list[int], str]]] = {}
     strict_prefix: set[str] = set()
 
     for i in range(len(cols["collapsed_name"])):
         numel = cols["numel"][i]
-        segs = _segments(cols["collapsed_name"][i], cols["stack_prefix"][i])
+        name = cols["collapsed_name"][i]
+        segs = _segments(name, cols["stack_prefix"][i])
         nodes[""]["params"] += numel
         parent = ""
         for L in range(1, len(segs) + 1):
+            seg, infos = segs[L - 1]
             nid = ".".join(s for s, _ in segs[:L])
             if L > 1:
                 strict_prefix.add(parent)
@@ -78,42 +115,38 @@ def build_view(card: dict, table: pa.Table) -> dict:
                 node = {"id": nid, "label": "", "kind": "module", "parent": parent, "params": 0,
                         "count": 1, "shape": None, "dtype": None}
                 nodes[nid] = node
-                last_seg[nid] = segs[L - 1][0]
+                base_seg[nid] = seg[: len(seg) - _MARK_LEN * len(infos)]
+                markers[nid] = [_Marker("expert_group" if what == "exp" else "stack")
+                                for what, _ in infos]
             node["params"] += numel
-            info = segs[L - 1][1]
-            if info is not None:
-                if info[0] == "card":
-                    card_count[nid] = stack_depth.get(info[1], 1)
-                elif info[0] == "lit":
-                    literals.setdefault(nid, set()).add(info[1])
+            for m, info in zip(markers[nid], infos):
+                if info[0] == "lit":
+                    m.literals.add(info[1])
                 else:
-                    card_count[nid] = group_experts.get(info[1], 1)
+                    c = resolve(info, name)
+                    m.fixed = c if m.fixed is None else max(m.fixed, c)
             parent = nid
         leaf_rows.setdefault(parent, []).append((cols["shape"][i], cols["dtype"][i]))
 
     for nid, node in nodes.items():
         if nid == "":
             continue
-        last = last_seg[nid]
-        if last.endswith(_STACK):
-            node["kind"] = "stack"
-        elif last.endswith(_EXPERT):
-            node["kind"] = "expert_group"
+        ms = markers[nid]
+        if ms:
+            node["kind"] = ms[0].kind
+            node["count"] = ms[0].count()
         elif nid in leaf_rows and nid not in strict_prefix:
             node["kind"] = "tensor"
-        if nid in card_count:
-            node["count"] = card_count[nid]
-        elif nid in literals:
-            node["count"] = len(literals[nid])
-        node["label"] = last.replace(_STACK, f" ×{node['count']}").replace(
-            _EXPERT, f" ×{node['count']}")
+        parts = [base_seg[nid]] if base_seg[nid] else []
+        parts.extend(f"×{m.count()}" for m in ms)
+        node["label"] = " ".join(parts)
         if node["kind"] == "tensor":
             rows = leaf_rows[nid]
             first_shape, first_dtype = rows[0]
-            if any(s != first_shape for s, _ in rows):
-                node["shape"], node["dtype"] = None, "varies"
-            else:
-                node["shape"], node["dtype"] = list(first_shape), first_dtype
+            same_shape = all(s == first_shape for s, _ in rows)
+            same_dtype = all(d == first_dtype for _, d in rows)
+            node["shape"] = list(first_shape) if same_shape else None
+            node["dtype"] = first_dtype if same_dtype else "varies"
 
     strips = [
         {
