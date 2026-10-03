@@ -140,3 +140,51 @@ def test_error_codes(tmp_path):
     assert code(c.get(_url("missing.bin"))) == "EntryNotFound"
     r = c.get(_url("config.json", repo="Org/Gated"))
     assert r.status_code == 401 and code(r) == "GatedRepo"
+
+
+def test_dotfiles_skipped(tmp_path):
+    root = tmp_path / "d"
+    write_dense_repo(root)
+    (root / ".cache").mkdir()
+    (root / ".cache" / "x.bin").write_bytes(b"x")
+    (root / ".hidden").write_bytes(b"x")
+    (root / "sub").mkdir()
+    (root / "sub" / "ok.txt").write_bytes(b"x")
+    hub = FakeHub()
+    hub.add_repo(REPO, root, sha=SHA)
+    names = [s["rfilename"] for s in hub.client().get(f"{HUB}/api/models/{REPO}/revision/main").json()["siblings"]]
+    assert "sub/ok.txt" in names
+    assert not any(n.startswith(".") or "/." in n for n in names)
+
+
+def test_inject_thread_safe(env):
+    import threading
+    hub, root = env
+    name = _st(root)
+    hub.inject(name, "reset", times=4, after_bytes=2)
+    results, errors = [], []
+
+    def work():
+        try:
+            r = hub.client().get(_url(name), headers={"Range": "bytes=0-15"})
+            results.append(len(r.content))
+        except httpx.ReadError:
+            results.append("reset")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=work) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors
+    assert results.count("reset") == 4
+    assert results.count(16) == 4
+
+
+def test_range_416(env):
+    hub, root = env
+    name = _st(root)
+    size = (root / name).stat().st_size
+    r = hub.client().get(_url(name), headers={"Range": f"bytes={size}-{size + 5}"})
+    assert r.status_code == 416
+    assert r.headers["content-range"] == f"bytes */{size}"

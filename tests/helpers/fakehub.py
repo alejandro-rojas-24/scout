@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import threading
 
 import httpx
 
@@ -37,7 +38,7 @@ class _Repo:
             if not p.is_file():
                 continue
             rel = p.relative_to(self.root)
-            if any(part.startswith(".") for part in rel.parts[-1:]) or p.name.startswith("."):
+            if any(part.startswith(".") for part in rel.parts):
                 continue
             out[rel.as_posix()] = p
         return out
@@ -52,6 +53,7 @@ class FakeHub:
     def __init__(self) -> None:
         self._repos: dict[str, _Repo] = {}
         self._injections: dict[str, list[dict]] = {}
+        self._lock = threading.Lock()
         self.requests: list[httpx.Request] = []
         self.cdn_reads: list[tuple[str, str | None, int]] = []
 
@@ -73,7 +75,8 @@ class FakeHub:
 
     # ---- internals ----
     def _handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
+        with self._lock:
+            self.requests.append(request)
         host = request.url.host
         segs = [s for s in request.url.path.split("/") if s != ""]
         if request.method != "GET":
@@ -146,30 +149,35 @@ class FakeHub:
         rng = request.headers.get("Range")
         inj = self._take_injection(path)
         if inj is not None and inj["mode"] == "503":
-            self.cdn_reads.append((path, rng, 0))
+            with self._lock:
+                self.cdn_reads.append((path, rng, 0))
             return httpx.Response(503, content=b"")
         if inj is not None and inj["mode"] == "ignore_range":
-            self.cdn_reads.append((path, rng, len(data)))
+            with self._lock:
+                self.cdn_reads.append((path, rng, len(data)))
             return httpx.Response(200, content=data)
         status, headers, body = self._range(data, rng)
         if inj is not None and inj["mode"] == "reset":
             sent = body[:inj["after_bytes"]]
-            self.cdn_reads.append((path, rng, len(sent)))
+            with self._lock:
+                self.cdn_reads.append((path, rng, len(sent)))
             headers = dict(headers)
             headers["Content-Length"] = str(len(body))
             return httpx.Response(206, headers=headers, stream=_ResetStream(sent))
-        self.cdn_reads.append((path, rng, len(body)))
+        with self._lock:
+            self.cdn_reads.append((path, rng, len(body)))
         return httpx.Response(status, headers=headers, content=body)
 
     def _take_injection(self, path: str) -> dict | None:
-        lst = self._injections.get(path)
-        if not lst:
-            return None
-        inj = lst[0]
-        inj["times"] -= 1
-        if inj["times"] <= 0:
-            lst.pop(0)
-        return inj
+        with self._lock:
+            lst = self._injections.get(path)
+            if not lst:
+                return None
+            inj = lst[0]
+            inj["times"] -= 1
+            if inj["times"] <= 0:
+                lst.pop(0)
+            return dict(inj)
 
     @staticmethod
     def _range(data: bytes, rng: str | None) -> tuple[int, dict, bytes]:
@@ -178,6 +186,8 @@ class FakeHub:
             return 200, {}, data
         a = int(m.group(1))
         b = int(m.group(2)) if m.group(2) else len(data) - 1
+        if a >= len(data):
+            return 416, {"Content-Range": f"bytes */{len(data)}"}, b""
         body = data[a:b + 1]
         return 206, {"Content-Range": f"bytes {a}-{min(b, len(data) - 1)}/{len(data)}"}, body
 

@@ -24,3 +24,4 @@
 {"ts":"2026-10-03T03:31:38Z","agent":"implementer-sonnet","model":"sonnet","step":"REVIEW","task_id":"T007","status":"DONE","note":"approved widening applied (ValueError/TypeError -> parse_error); 12 passed (orchestrator re-ran)"}
 {"ts":"2026-10-03T03:31:38Z","agent":"implementer-opus","model":"opus","step":"ROUTE","task_id":"T002","status":"DONE","note":"39 tests; orchestrator returned it pre-review to emit on_event in seq order under RLock (pulls P4 T301 contract fix into P1)"}
 {"ts":"2026-10-03T03:32:15Z","agent":"reviewer","model":"opus","step":"REVIEW","task_id":"T003","status":"PASS","note":"3 minor: dot-dir filter, thread lock for injections (T010 thread pool), 416 past-EOF; sent back to implementer"}
+{"ts":"2026-10-03T03:32:25Z","agent":"implementer-sonnet","model":"sonnet","step":"REVIEW","task_id":"T003","status":"DONE","note":"follow-ups applied; 12 passed (orchestrator re-ran)"}
