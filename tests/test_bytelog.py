@@ -563,3 +563,64 @@ def test_reentrant_record_from_on_event_concurrent():
     # each fetch is immediately followed by its nested note
     kinds = [e.event for e in log.events]
     assert kinds == ["fetch", "error"] * 800
+
+
+# --------------------------------------------------------------------------- review fixes
+
+
+def test_event_mappings_are_immutable():
+    log = ByteLog()
+    log.record(event="fetch", source=None, path="config.json", url=None,
+               start=0, nbytes=5, status=200)
+    before = json.dumps(log.to_card_dict(), sort_keys=True)
+    ev = log.events[0]
+    with pytest.raises(TypeError):
+        ev.bytes_by_class["meta"] = 999  # type: ignore[index]
+    with pytest.raises(TypeError):
+        ev.totals["weight"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del ev.totals["meta"]  # type: ignore[attr-defined]
+    # mutating to_dict() output is also harmless
+    d = ev.to_dict()
+    d["bytes_by_class"]["meta"] = 999
+    d["totals"]["meta"] = 999
+    assert json.dumps(log.to_card_dict(), sort_keys=True) == before
+    assert ev.bytes_by_class == c(meta=5)
+
+
+def test_set_header_len_conflict_raises():
+    log = ByteLog()
+    log.set_header_len("a.safetensors", 100)
+    log.set_header_len("a.safetensors", 100)  # same value is a no-op
+    with pytest.raises(ValueError):
+        log.set_header_len("a.safetensors", 101)
+    assert log.header_len("a.safetensors") == 100
+
+
+def test_set_header_len_negative_raises():
+    log = ByteLog()
+    with pytest.raises(ValueError):
+        log.set_header_len("a.safetensors", -1)
+    assert log.header_len("a.safetensors") is None
+    log.set_header_len("b.safetensors", 0)
+    assert log.header_len("b.safetensors") == 0
+
+
+def test_emit_lock_released_after_on_event_raises():
+    calls: list[int] = []
+
+    def cb(ev):
+        calls.append(ev.seq)
+        if ev.seq == 1:
+            raise RuntimeError("boom")
+
+    log = ByteLog(on_event=cb)
+    with pytest.raises(RuntimeError):
+        log.record(event="fetch", source=None, path="x.json", url=None,
+                   start=0, nbytes=1, status=200)
+
+    result: list[LogEvent] = []
+    # a different thread: would block forever if the emit RLock were still held
+    _run_with_timeout(lambda: result.append(log.note("error", "after")), timeout=5.0)
+    assert result[0].seq == 2
+    assert calls == [1, 2]

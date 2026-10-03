@@ -10,7 +10,9 @@ from __future__ import annotations
 import enum
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Callable
 
 from scout.errors import ReadThresholdExceeded, StageOrderError, WeightReadRefused
@@ -84,11 +86,11 @@ class LogEvent:
     range: tuple[int, int] | None
     status: int | None
     bytes: int
-    bytes_by_class: dict[str, int]
+    bytes_by_class: Mapping[str, int]  # read-only MappingProxyType over a private copy
     attempt: int
     elapsed_ms: float
     note: str | None
-    totals: dict[str, int]
+    totals: Mapping[str, int]  # read-only MappingProxyType over a private snapshot
 
     def to_dict(self) -> dict:
         return {
@@ -166,11 +168,12 @@ class ByteLog:
     def _append_locked(self, **fields) -> LogEvent:
         """Build and append an event. Caller must hold self._lock."""
         self._seq += 1
+        fields["bytes_by_class"] = MappingProxyType(dict(fields["bytes_by_class"]))
         ev = LogEvent(
             seq=self._seq,
             ts=time.time(),
             stage=self._stage.name if self._stage is not None else "NONE",
-            totals=dict(self._totals),
+            totals=MappingProxyType(dict(self._totals)),
             **fields,
         )
         self._events.append(ev)
@@ -205,7 +208,20 @@ class ByteLog:
     # ------------------------------------------------------------------ header lengths
 
     def set_header_len(self, path: str, header_len: int) -> None:
+        """Register the safetensors header length N for `path`.
+
+        Re-registering the same value is a no-op. A negative N, or a different N for a
+        path that is already registered, raises ValueError (byte classification for
+        already-recorded events must never silently change meaning).
+        """
+        if header_len < 0:
+            raise ValueError(f"header_len must be >= 0, got {header_len} for {path}")
         with self._lock:
+            prev = self._header_lens.get(path)
+            if prev is not None and prev != header_len:
+                raise ValueError(
+                    f"header_len for {path} already registered as {prev}, got {header_len}"
+                )
             self._header_lens[path] = header_len
 
     def header_len(self, path: str) -> int | None:
