@@ -58,3 +58,9 @@ out_of_scope:
   - layout/coordinates (frontend's job)
   - attribution coloring (Phase 4)
 invariants_touched: [1]
+
+amendments:
+  - "2026-10-03 orchestrator (from T011 review r1): consecutive integer markers keep one origin per marker. A node's `count` is the FIRST marker's count, which is the Card stack depth when that marker is the Card '#' stack, never overridden by a literal. The label shows each marker's own count in order, e.g. `input_blocks ×12 ×2`."
+  - "2026-10-03 orchestrator: a leading integer segment (root-level Card stack, prefix '') uses the root as predecessor: id '[#]', parent '', kind 'stack', count = Card depth, label '×N'."
+  - "2026-10-03 orchestrator: a tensor node's dtype is 'varies' whenever the dtypes of its rows differ, independent of shape. shape is None only when shapes differ."
+  - "2026-10-03 orchestrator: if a Parquet stack_prefix or expert template has no matching Card structure entry, raise ScoutError (no silent count=1)."

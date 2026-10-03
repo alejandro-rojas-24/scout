@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import scout.scan
-from scout.bytelog import ByteLog, Stage
+from scout.bytelog import ByteLog
 from scout.card import load_card
 from scout.errors import (
     GatedRepoError,
