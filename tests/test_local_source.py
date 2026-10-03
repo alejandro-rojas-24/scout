@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import os
 import pathlib
@@ -37,22 +38,36 @@ def _make_repo(root: pathlib.Path) -> dict[str, int]:
 
 
 class _OpenSpy:
-    """Replaces builtins.open; records (and optionally refuses) opens under root."""
+    """Records (and optionally refuses) opens under root via builtins.open, io.open and os.open."""
 
     def __init__(self, root: pathlib.Path, fail: bool) -> None:
         self.root = str(root.resolve())
         self.fail = fail
         self.calls: list[str] = []
-        self._real = builtins.open
+        self._real_open = builtins.open
+        self._real_os_open = os.open
 
-    def __call__(self, file, *args, **kwargs):
+    def _check(self, file) -> None:
         if isinstance(file, (str, bytes, os.PathLike)):
             p = os.fsdecode(file)
             if os.path.abspath(p).startswith(self.root):
                 self.calls.append(p)
                 if self.fail:
                     raise AssertionError(f"open() under root: {p}")
-        return self._real(file, *args, **kwargs)
+
+    def open(self, file, *args, **kwargs):
+        self._check(file)
+        return self._real_open(file, *args, **kwargs)
+
+    def os_open(self, path, *args, **kwargs):
+        self._check(path)
+        return self._real_os_open(path, *args, **kwargs)
+
+    def install(self, monkeypatch) -> "_OpenSpy":
+        monkeypatch.setattr(builtins, "open", self.open)
+        monkeypatch.setattr(io, "open", self.open)
+        monkeypatch.setattr(os, "open", self.os_open)
+        return self
 
 
 def test_init_attributes(tmp_path):
@@ -77,8 +92,7 @@ def test_resolve_no_reads(tmp_path, monkeypatch):
     expected = _make_repo(root)
     log = ByteLog()
     src = LocalSource(root, log)
-    spy = _OpenSpy(root, fail=True)
-    monkeypatch.setattr(builtins, "open", spy)
+    spy = _OpenSpy(root, fail=True).install(monkeypatch)
 
     src.resolve()
     files = src.files()
@@ -169,8 +183,7 @@ def test_weight_refused(tmp_path, monkeypatch):
     n = int.from_bytes((root / "model.safetensors").read_bytes()[:8], "little")
     log.set_header_len("model.safetensors", n)
 
-    spy = _OpenSpy(root, fail=False)
-    monkeypatch.setattr(builtins, "open", spy)
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
     with pytest.raises(WeightReadRefused):
         src.read_range("model.safetensors", 8 + n, 4)
     with pytest.raises(WeightReadRefused):
@@ -187,8 +200,7 @@ def test_bin_refused(tmp_path, monkeypatch):
     log = ByteLog()
     src = LocalSource(root, log)
     src.resolve()
-    spy = _OpenSpy(root, fail=False)
-    monkeypatch.setattr(builtins, "open", spy)
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
     with pytest.raises(WeightReadRefused):
         src.read_file("pytorch_model.bin")
     assert spy.calls == []
@@ -288,3 +300,104 @@ def test_protocol_conformance(tmp_path):
     for name in ("kind", "repo", "revision_sha", "revision_kind", "requested_revision",
                  "local_path", "endpoint", "log", "resolve", "files", "read_file", "read_range"):
         assert hasattr(src, name), name
+
+
+def test_stat_note_lists_symlink_realpaths(tmp_path):
+    snap, blobs, _ = _hf_cache(tmp_path)
+    log = ByteLog()
+    LocalSource(snap, log).resolve()
+    note = log.events[-1].note
+    assert note.startswith("3 files; symlinks: ")
+    assert f"model.safetensors -> {os.path.realpath(blobs / ('1' * 64))}" in note
+    assert f"text_encoder/config.json -> {os.path.realpath(blobs / ('2' * 40))}" in note
+
+
+def test_alias_to_safetensors_refused(tmp_path, monkeypatch):
+    """Review repro 1: notes.txt -> model.safetensors must not be readable as meta."""
+    root = tmp_path / "m"
+    _make_repo(root)
+    os.symlink("model.safetensors", root / "notes.txt")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    with pytest.raises(WeightReadRefused):
+        src.read_file("notes.txt")
+    with pytest.raises(WeightReadRefused):
+        src.read_range("notes.txt", 0, 8)  # no header semantics through an alias
+    assert spy.calls == []
+    assert log.totals == {"meta": 0, "header": 0, "weight": 0}
+    assert log.reserved == 0
+    assert log.events[-1].event == "refused"
+
+
+def test_alias_outside_root_bin_refused(tmp_path, monkeypatch):
+    """Review repro 2: readme.md -> /elsewhere/outside.bin must not be readable as meta."""
+    root = tmp_path / "m"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "outside.bin").write_bytes(b"\x01" * 64)
+    os.symlink(elsewhere / "outside.bin", root / "readme.md")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    assert {f.path: f.size for f in src.files()} == {"readme.md": 64}  # outside-root targets stay listed
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    with pytest.raises(WeightReadRefused):
+        src.read_file("readme.md")
+    with pytest.raises(WeightReadRefused):
+        src.read_range("readme.md", 0, 4)
+    assert spy.calls == []
+    assert log.totals == {"meta": 0, "header": 0, "weight": 0}
+    assert log.reserved == 0
+
+
+def test_inode_alias_refused(tmp_path, monkeypatch):
+    """A hard link with a non-weight name sharing an inode with a listed weight file."""
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "pytorch_model.bin").write_bytes(b"\x02" * 32)
+    os.link(root / "pytorch_model.bin", root / "data.txt")
+    write_safetensors(root / "model.safetensors", dense_tensors(n_layers=1))
+    os.link(root / "model.safetensors", root / "blob")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    for path in ("data.txt", "blob"):
+        with pytest.raises(WeightReadRefused):
+            src.read_file(path)
+        with pytest.raises(WeightReadRefused):
+            src.read_range(path, 0, 8)
+    assert spy.calls == []
+    assert log.totals == {"meta": 0, "header": 0, "weight": 0}
+    assert log.reserved == 0
+
+
+def test_hf_cache_blob_names_are_not_aliases(tmp_path):
+    """Extensionless blob targets do not taint a non-weight link name (config.json stays meta)."""
+    snap, _, _ = _hf_cache(tmp_path)
+    log = ByteLog()
+    src = LocalSource(snap, log)
+    src.resolve()
+    data = src.read_file("config.json")
+    assert log.totals == {"meta": len(data), "header": 0, "weight": 0}
+    assert log.events[-1].path == "config.json"
+
+
+def test_walk_error_raises(tmp_path, monkeypatch):
+    root = tmp_path / "m"
+    _make_repo(root)
+    real_scandir = os.scandir
+    bad = str(root.resolve() / "sub")
+
+    def scandir(path="."):
+        if os.fsdecode(path) == bad:
+            raise PermissionError(13, "Permission denied", bad)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    src = LocalSource(root, ByteLog())
+    with pytest.raises(ScoutError, match="cannot list .*sub"):
+        src.resolve()
