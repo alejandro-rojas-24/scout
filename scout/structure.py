@@ -221,6 +221,17 @@ def analyze(tensors: Iterable[TensorInfo]) -> Structure:
         warnings.append(
             f"{parent}: fused expert tensors detected (leading expert dim {fused[parent]}); not collapsed in v0")
 
+    # 5b. index aliases inside real stacks (e.g. "l.0" and "l.00" both -> block 0)
+    literals: dict[tuple[str, int], set[str]] = {}
+    for t, (segs, _, _), (sp, _) in zip(infos, raw, final_pos):
+        if sp is not None:
+            pl = places[t.name]
+            literals.setdefault((pl.stack_prefix, pl.block_index), set()).add(segs[sp])
+    for (prefix, n) in sorted(literals):
+        lits = literals[(prefix, n)]
+        if len(lits) > 1:
+            warnings.append(f"{prefix}: index alias {sorted(lits)} -> {n}")
+
     # 6. totals
     by_dtype: dict[str, int] = {}
     for t in infos:
