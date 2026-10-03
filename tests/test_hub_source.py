@@ -541,10 +541,11 @@ def test_retry_refused_when_budget_spent():
                                   stream=_Chunks(cfg[:-1], reset=True))
         return httpx.Response(200, content=cfg)
 
-    log = ByteLog(threshold_bytes=len(api) + 10100)
+    log = ByteLog()
     src = HubSource(REPO, None, log, client=httpx.Client(transport=httpx.MockTransport(h)),
                     endpoint=HUB, sleep=lambda s: None)
-    src.resolve()
+    src.resolve()  # the API call reserves META_MAX_BYTES, so tighten the budget afterwards
+    log.threshold_bytes = len(api) + 10100
     assert len(requests) == 1
     with pytest.raises(ReadThresholdExceeded):
         src.read_file("config.json")
