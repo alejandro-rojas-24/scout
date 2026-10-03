@@ -238,3 +238,62 @@ def test_scale():
     [g] = st.expert_groups
     assert (g.n_experts, g.n_instances, g.tensors_per_expert, g.homogeneous) == (128, 48, 3, True)
     assert st.stacks[0].depth == 48
+
+
+def test_expert_before_stack_integer():
+    spec = {f"moe.experts.{e}.net.{i}.weight": _w(2, 2) for e in (0, 1) for i in (0, 2)}
+    st = analyze(_infos(spec))
+    [s] = st.stacks
+    assert s.prefix == "moe.experts.*.net" and s.indices == [0, 2]
+    assert s.block_moe == [True, True] and s.block_n_experts == [2, 2]
+    [g] = st.expert_groups
+    assert g.template == "moe.experts.*" and g.n_experts == 2 and g.n_instances == 2
+    assert st.places["moe.experts.1.net.2.weight"] == TensorPlace("moe.experts.*.net.#.weight", "moe.experts.*.net", 2, 1)
+
+
+def test_expert_above_stack_signature_path():
+    spec = {f"experts.{e}.layers.{i}.w": _w(2, 2) for e in (0, 1) for i in (0, 1, 2)}
+    st = analyze(_infos(spec))
+    [s] = st.stacks
+    assert s.prefix == "experts.*.layers" and s.depth == 3
+    assert s.block_n_experts == [2, 2, 2] and len(set(s.block_signatures)) == 1
+    # absolute template "experts.*" with experts=2 is part of the signature
+    import hashlib
+    lines = sorted({"w|F32|[2, 2]", "experts.*|experts=2"})
+    assert s.block_signatures[0] == hashlib.sha1("\n".join(lines).encode()).hexdigest()[:12]
+    [g] = st.expert_groups
+    assert g.template == "experts.*" and g.n_instances == 3
+
+
+def test_nested_expert_containers():
+    spec = {f"a.experts.{e}.experts.{f}.w": _w(2) for e in (0, 1) for f in (0, 1, 2)}
+    st = analyze(_infos(spec))
+    [s] = st.stacks
+    assert s.prefix == "a.experts.*.experts" and s.indices == [0, 1, 2]
+
+
+@pytest.mark.parametrize("seg", ["9" * 5000, "99999999999", "1234567890", "²", "１", "٣"])
+def test_non_index_segments_stay_literal(seg):
+    spec = {f"x.{seg}.w": _w(2), "x.y.w": _w(2), f"experts.{seg}.v": _w(2)}
+    st = analyze(_infos(spec))
+    assert st.stacks == [] and st.expert_groups == []
+    assert st.places[f"x.{seg}.w"] == TensorPlace(f"x.{seg}.w", None, None, None)
+    assert place(f"x.{seg}.w") == TensorPlace(f"x.{seg}.w", None, None, None)
+
+
+def test_max_index_fits_int32():
+    st = analyze(_infos({"l.999999999.w": _w(1), "l.0.w": _w(1)}))
+    assert st.stacks[0].indices == [0, 999999999]
+
+
+def test_empty_stack_prefix():
+    st = analyze(_infos({"0.w": _w(2), "1.w": _w(3)}))
+    [s] = st.stacks
+    assert s.prefix == "" and s.indices == [0, 1] and s.block_params == [2, 3]
+    assert st.places["1.w"] == TensorPlace("#.w", "", 1, None)
+
+
+@pytest.mark.parametrize("lit", ["00", "0", "007"])
+def test_leading_zero_restore(lit):
+    st = analyze(_infos({f"head.{lit}.w": _w(2)}))
+    assert st.places[f"head.{lit}.w"] == TensorPlace(f"head.{lit}.w", None, None, None)

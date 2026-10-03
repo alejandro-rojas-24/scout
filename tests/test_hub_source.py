@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -502,3 +503,148 @@ def test_no_disk_writes(env, tmp_path):
     src.read_range(env.shard, 0, 8)
     assert sorted(p for p in tmp_path.rglob("*")) == before
     assert json.loads(src.read_file("config.json"))["model_type"] == "qwen3"
+
+
+# ---------------------------------------------------------------------------- review round 1
+
+class _Chunks(httpx.SyncByteStream):
+    """A real (non in-memory) stream, so HubSource reads it through iter_raw(); optional reset at the end."""
+
+    def __init__(self, data: bytes, reset: bool = False) -> None:
+        self._data = data
+        self._reset = reset
+
+    def __iter__(self):
+        for i in range(0, len(self._data), 7):
+            yield self._data[i:i + 7]
+        if self._reset:
+            raise httpx.ReadError("connection reset")
+
+
+def _api_body(files: dict[str, bytes]) -> bytes:
+    return json.dumps({"sha": SHA, "siblings": [{"rfilename": k, "size": len(v)} for k, v in files.items()]}).encode()
+
+
+def test_retry_refused_when_budget_spent():
+    cfg = b"{" + b" " * 9998 + b"}"
+    api = _api_body({"config.json": cfg})
+    requests = []
+    state = {"resets": 2}
+
+    def h(req):
+        requests.append(req)
+        if req.url.path.startswith("/api/"):
+            return httpx.Response(200, content=api)
+        if state["resets"]:
+            state["resets"] -= 1
+            return httpx.Response(200, headers={"Content-Length": str(len(cfg))},
+                                  stream=_Chunks(cfg[:-1], reset=True))
+        return httpx.Response(200, content=cfg)
+
+    log = ByteLog(threshold_bytes=len(api) + 10100)
+    src = HubSource(REPO, None, log, client=httpx.Client(transport=httpx.MockTransport(h)),
+                    endpoint=HUB, sleep=lambda s: None)
+    src.resolve()
+    assert len(requests) == 1
+    with pytest.raises(ReadThresholdExceeded):
+        src.read_file("config.json")
+    assert len(requests) == 2  # the retry was refused before a second file request
+    retries = _events(log, "retry")
+    assert len(retries) == 1 and retries[0].bytes == 9999
+    assert len(_events(log, "refused", "config.json")) == 1
+    t = log.totals
+    assert t["meta"] == len(api) + 9999 <= log.threshold_bytes
+    assert log.reserved == 0
+
+
+def test_retry_repreflight_within_budget(env):
+    # the normal retry path still works with a fresh reservation per attempt
+    src, log = _src(env.hub)
+    src.resolve()
+    env.hub.inject(env.shard, "reset", times=2, after_bytes=3)
+    assert src.read_range(env.shard, 0, 8) == (env.root / env.shard).read_bytes()[:8]
+    assert [e.attempt for e in _events(log, "retry")] == [1, 2]
+    assert log.reserved == 0
+
+
+def test_hook_read_inmemory_still_counted(env):
+    # A response hook that pre-reads an in-memory (FakeHub) body: the ByteStream fallback counts it exactly.
+    client = env.hub.client()
+    client.event_hooks["response"] = [lambda r: r.read()]
+    src, log = _src(env.hub, client=client)
+    src.resolve()
+    data = src.read_file("config.json")
+    assert data == (env.root / "config.json").read_bytes()
+    assert _events(log, "fetch", "config.json")[0].bytes == len(data)
+    assert src.read_range(env.shard, 0, 8) == (env.root / env.shard).read_bytes()[:8]
+    assert log.totals["header"] == 8
+    assert log.reserved == 0
+
+
+def test_hook_read_real_stream_fails_closed():
+    cfg = b'{"model_type": "qwen3"}'
+    api = _api_body({"config.json": cfg})
+
+    def h(req):
+        if req.url.path.startswith("/api/"):
+            return httpx.Response(200, content=api)
+        return httpx.Response(200, stream=_Chunks(cfg))
+
+    client = httpx.Client(transport=httpx.MockTransport(h), event_hooks={"response": [lambda r: r.read()]})
+    log = ByteLog()
+    src = HubSource(REPO, None, log, client=client, endpoint=HUB, sleep=lambda s: None)
+    src.resolve()
+    meta0 = log.totals["meta"]
+    t0 = time.monotonic()
+    with pytest.raises(NetworkError, match="consumed outside HubSource"):
+        src.read_file("config.json")
+    assert time.monotonic() - t0 < 2.0
+    ev = _events(log, "fetch", "config.json")
+    assert len(ev) == 1 and ev[0].bytes == len(cfg)
+    assert log.totals["meta"] - meta0 == len(cfg)  # no byte unrecorded
+    assert _events(log, "retry") == []
+    assert log.reserved == 0
+
+
+def test_streamed_bodies_counted_via_iter_raw():
+    cfg = b'{"model_type": "qwen3", "pad": "' + b"x" * 200 + b'"}'
+    api = _api_body({"config.json": cfg})
+    redirect_body = b"Found. Redirecting to the cache"
+    error_body = b"Service Unavailable, try again"
+    state = {"n": 0}
+
+    def h(req):
+        if req.url.path.startswith("/api/models/"):
+            return httpx.Response(200, stream=_Chunks(api))
+        if "/resolve/" in req.url.path:
+            return httpx.Response(302, headers={"Location": "/cache/config.json"}, stream=_Chunks(redirect_body))
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(503, stream=_Chunks(error_body))
+        return httpx.Response(200, stream=_Chunks(cfg))
+
+    log = ByteLog()
+    src = HubSource(REPO, None, log, client=httpx.Client(transport=httpx.MockTransport(h)),
+                    endpoint=HUB, sleep=lambda s: None)
+    src.resolve()
+    assert _events(log, "fetch", API_PATH)[0].bytes == len(api)
+    assert src.read_file("config.json") == cfg
+    reds = _events(log, "fetch", REDIRECT_PATH)
+    assert [e.bytes for e in reds] == [len(redirect_body)] * 2
+    errs = _events(log, "error", ERROR_PATH)
+    assert len(errs) == 1 and errs[0].bytes == len(error_body) and errs[0].status == 503
+    assert _events(log, "fetch", "config.json")[0].bytes == len(cfg)
+    assert log.totals == {"meta": len(api) + 2 * len(redirect_body) + len(error_body) + len(cfg),
+                          "header": 0, "weight": 0}
+    assert log.reserved == 0
+
+
+def test_error_mapping_conflicting_signals(env):
+    def fn(req, resp):
+        if _is_api(req):
+            return httpx.Response(401, content=b"repository not found", headers={"X-Error-Code": "GatedRepo"})
+
+    src, log = _src(env.hub, client=_wrap(env.hub, fn))
+    with pytest.raises(GatedRepoError):
+        src.resolve()
+    assert log.reserved == 0

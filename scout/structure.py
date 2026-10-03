@@ -62,8 +62,9 @@ class Structure:
 
 
 def _is_index(seg: str) -> bool:
-    # ASCII-only so int() never fails on unicode digits such as "²".
-    return seg.isascii() and seg.isdigit()
+    # ASCII-only so int() never fails on unicode digits such as "²"; <= 9 digits keeps every
+    # index inside int32 (Parquet) and clear of Python's int-string conversion limit.
+    return 0 < len(seg) <= 9 and seg.isascii() and seg.isdigit()
 
 
 def _split(name: str) -> tuple[list[str], int | None, int | None]:
@@ -114,20 +115,23 @@ def analyze(tensors: Iterable[TensorInfo]) -> Structure:
         infos.append(t)
 
     # 1. raw placement
+    # Grouping is on the COLLAPSED stack prefix (expert index already "*").
     raw: list[tuple[list[str], int | None, int | None]] = [_split(t.name) for t in infos]
+    raw_places = [_place_from(segs, sp, ep) for segs, sp, ep in raw]
     prefix_indices: dict[str, set[int]] = {}
-    for segs, sp, _ in raw:
-        if sp is not None:
-            prefix_indices.setdefault(".".join(segs[:sp]), set()).add(int(segs[sp]))
+    for pl in raw_places:
+        if pl.stack_prefix is not None:
+            prefix_indices.setdefault(pl.stack_prefix, set()).add(pl.block_index)
     stack_prefixes = {p for p, idx in prefix_indices.items() if len(idx) >= 2}
 
     # 2. final placement (single-index prefixes keep their literal index)
     places: dict[str, TensorPlace] = {}
     final_pos: list[tuple[int | None, int | None]] = []  # (stack_pos, expert_pos) as finally applied
-    for t, (segs, sp, ep) in zip(infos, raw):
-        if sp is not None and ".".join(segs[:sp]) not in stack_prefixes:
+    for t, (segs, sp, ep), pl in zip(infos, raw, raw_places):
+        if sp is not None and pl.stack_prefix not in stack_prefixes:
             sp = None
-        places[t.name] = _place_from(segs, sp, ep)
+            pl = _place_from(segs, None, ep)
+        places[t.name] = pl
         final_pos.append((sp, ep))
 
     warnings: list[str] = []

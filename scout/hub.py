@@ -210,6 +210,8 @@ class HubSource:
         exact: int | None = None,
     ) -> bytes:
         last: Exception | None = None
+        cur = reservation  # current reservation id; replaced before every retry
+        pre_start = start if start is not None else 0
         try:
             for attempt in range(1, self._attempts + 1):
                 t0 = time.monotonic()
@@ -230,12 +232,12 @@ class HubSource:
                                 f"{logged_path}: unsupported Content-Encoding {enc!r} (identity requested)"),
                                 logged_path)
                         if mode == _RANGE and status == 200:
-                            self._range_ignored(resp, logged_path, cap, reservation, t0)
+                            self._range_ignored(resp, logged_path, cap, cur, t0)
                         body_start = start
                         if mode == _RANGE and status == 206:
                             body_start = self._content_range_start(resp, start)
                         chunks: list[bytes] = []
-                        for chunk in _iter_raw(resp):
+                        for chunk in self._iter_raw(resp, logged_path, body_start, "fetch"):
                             chunks.append(chunk)
                             received += len(chunk)
                             if received > cap:
@@ -243,7 +245,7 @@ class HubSource:
                                 self.log.record(
                                     event="fetch", source=_SOURCE, path=logged_path, url=final_url,
                                     start=body_start, nbytes=received, status=status, attempt=attempt,
-                                    elapsed_ms=_ms(t0), note="cap exceeded", release=reservation)
+                                    elapsed_ms=_ms(t0), note="cap exceeded", release=cur)
                                 raise ReadThresholdExceeded(
                                     received, self._nonweight_total(), self.log.threshold_bytes,
                                     f"{logged_path}: response body exceeded the cap of {cap} bytes "
@@ -254,7 +256,7 @@ class HubSource:
                             self.log.record(
                                 event="fetch", source=_SOURCE, path=logged_path, url=final_url,
                                 start=body_start, nbytes=received, status=status, attempt=attempt,
-                                elapsed_ms=_ms(t0), note="unexpected response", release=reservation)
+                                elapsed_ms=_ms(t0), note="unexpected response", release=cur)
                             raise self._fail(NetworkError(
                                 f"{logged_path}: unexpected response (status {status}, body offset "
                                 f"{body_start}, expected {expected_status} at {start})"), logged_path)
@@ -263,7 +265,7 @@ class HubSource:
                         self.log.record(
                             event="fetch", source=_SOURCE, path=logged_path, url=final_url, start=start,
                             nbytes=received, status=status, attempt=attempt, elapsed_ms=_ms(t0),
-                            release=reservation)
+                            release=cur)
                         return body
                     finally:
                         resp.close()
@@ -275,12 +277,18 @@ class HubSource:
                         event="retry", source=_SOURCE, path=logged_path, url=final_url or url, start=start,
                         nbytes=received, status=status, attempt=attempt, elapsed_ms=_ms(t0),
                         note=f"{type(exc).__name__}: {exc}")
-                    if attempt < self._attempts and self._backoff:
-                        self._sleep(self._backoff[min(attempt - 1, len(self._backoff) - 1)])
+                    if attempt < self._attempts:
+                        # Re-preflight the same path/range for the next attempt: the bytes of this
+                        # attempt are now in the totals, so a spent budget refuses the retry here,
+                        # before any further request is sent.
+                        self.log.release(cur)
+                        cur = self.log.preflight(logged_path, pre_start, pre_start + cap)
+                        if self._backoff:
+                            self._sleep(self._backoff[min(attempt - 1, len(self._backoff) - 1)])
             raise self._fail(NetworkError(f"{logged_path}: {self._attempts} attempts failed: {last}"),
                              logged_path)
         finally:
-            self.log.release(reservation)
+            self.log.release(cur)
 
     def _follow(self, url: httpx.URL, headers: dict[str, str] | None) -> httpx.Response:
         """Send GET with manual redirects; returns the final (non-redirect) response, still streaming."""
@@ -310,7 +318,7 @@ class HubSource:
         received = 0
         try:
             try:
-                for chunk in _iter_raw(resp):
+                for chunk in self._iter_raw(resp, REDIRECT_PATH, None, "fetch"):
                     received += len(chunk)
                     if received > REDIRECT_MAX_BYTES:
                         resp.close()
@@ -342,7 +350,7 @@ class HubSource:
         note = f"{resp.status_code} for {logged_path}"
         try:
             try:
-                for chunk in _iter_raw(resp):
+                for chunk in self._iter_raw(resp, ERROR_PATH, None, "error"):
                     chunks.append(chunk)
                     received += len(chunk)
                     if received >= ERROR_BODY_MAX_BYTES:
@@ -418,7 +426,7 @@ class HubSource:
         received = 0
         note = "Range ignored (200)"
         try:
-            for chunk in _iter_raw(resp):
+            for chunk in self._iter_raw(resp, logged_path, 0, "fetch"):
                 received += len(chunk)
                 if received >= length:
                     break
@@ -438,22 +446,37 @@ class HubSource:
         m = _CONTENT_RANGE_RE.match(resp.headers.get("content-range") or "")
         return int(m.group(1)) if m else start
 
+    def _iter_raw(self, resp: httpx.Response, path: str, start: int | None, event: str):
+        """Yield the raw (undecoded) body bytes exactly as the transport delivers them. Fails closed.
+
+        - Not yet consumed: iter_raw() (no chunk_size, so nothing waits uncounted in a buffer).
+        - Consumed, but the underlying stream is an in-memory httpx.ByteStream (httpx marks
+          Response(content=...) as consumed, e.g. MockTransport): that stream is re-iterable
+          raw bytes, so it is read and counted the same way.
+        - Consumed any other way (e.g. a client event hook called r.read()): the bytes were
+          received outside HubSource and cannot be counted by offset. len(resp.content) is
+          recorded when available (path/start of this body, so classification stays
+          honest), then NetworkError is raised. Never retried.
+        """
+        if not resp.is_stream_consumed:
+            yield from resp.iter_raw()
+            return
+        stream = resp.stream
+        inner = getattr(stream, "_stream", stream)
+        if isinstance(stream, httpx.ByteStream) or isinstance(inner, httpx.ByteStream):
+            yield from stream
+            return
+        nbytes = len(resp.content) if hasattr(resp, "_content") else 0
+        self.log.record(
+            event=event, source=_SOURCE, path=path, url=str(resp.request.url), start=start,
+            nbytes=nbytes, status=resp.status_code,
+            note="response body consumed outside HubSource; bytes cannot be counted")
+        raise self._fail(NetworkError("response body consumed outside HubSource; bytes cannot be counted"),
+                         path)
+
     def _nonweight_total(self) -> int:
         t = self.log.totals
         return t["meta"] + t["header"]
-
-
-def _iter_raw(resp: httpx.Response):
-    """Yield the raw (undecoded) body bytes exactly as the transport delivers them.
-
-    A streaming response is read with iter_raw(). A body the transport preloaded into
-    memory (httpx marks Response(content=...) as already consumed, e.g. MockTransport)
-    is read from its re-iterable raw byte stream instead, so it is counted the same way.
-    """
-    if not resp.is_stream_consumed:
-        yield from resp.iter_raw()
-    else:
-        yield from resp.stream
 
 
 def _ms(t0: float) -> float:
