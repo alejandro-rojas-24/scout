@@ -1,6 +1,7 @@
 """HubSource against FakeHub: pinned resolve, manual redirects, ranged reads, retries, honest counting."""
 from __future__ import annotations
 
+import gzip
 import json
 from types import SimpleNamespace
 
@@ -446,7 +447,8 @@ def test_redirect_loop(env):
 def test_content_encoding_refused(env):
     def fn(req, resp):
         if not _is_api(req):
-            return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=b"abc")
+            return httpx.Response(200, headers={"Content-Encoding": "gzip"},
+                                  content=gzip.compress(b"abc"))
 
     src, log = _src(env.hub, client=_wrap(env.hub, fn))
     src.resolve()

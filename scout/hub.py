@@ -235,7 +235,7 @@ class HubSource:
                         if mode == _RANGE and status == 206:
                             body_start = self._content_range_start(resp, start)
                         chunks: list[bytes] = []
-                        for chunk in resp.iter_raw():
+                        for chunk in _iter_raw(resp):
                             chunks.append(chunk)
                             received += len(chunk)
                             if received > cap:
@@ -310,7 +310,7 @@ class HubSource:
         received = 0
         try:
             try:
-                for chunk in resp.iter_raw():
+                for chunk in _iter_raw(resp):
                     received += len(chunk)
                     if received > REDIRECT_MAX_BYTES:
                         resp.close()
@@ -342,7 +342,7 @@ class HubSource:
         note = f"{resp.status_code} for {logged_path}"
         try:
             try:
-                for chunk in resp.iter_raw():
+                for chunk in _iter_raw(resp):
                     chunks.append(chunk)
                     received += len(chunk)
                     if received >= ERROR_BODY_MAX_BYTES:
@@ -418,7 +418,7 @@ class HubSource:
         received = 0
         note = "Range ignored (200)"
         try:
-            for chunk in resp.iter_raw():
+            for chunk in _iter_raw(resp):
                 received += len(chunk)
                 if received >= length:
                     break
@@ -441,6 +441,19 @@ class HubSource:
     def _nonweight_total(self) -> int:
         t = self.log.totals
         return t["meta"] + t["header"]
+
+
+def _iter_raw(resp: httpx.Response):
+    """Yield the raw (undecoded) body bytes exactly as the transport delivers them.
+
+    A streaming response is read with iter_raw(). A body the transport preloaded into
+    memory (httpx marks Response(content=...) as already consumed, e.g. MockTransport)
+    is read from its re-iterable raw byte stream instead, so it is counted the same way.
+    """
+    if not resp.is_stream_consumed:
+        yield from resp.iter_raw()
+    else:
+        yield from resp.stream
 
 
 def _ms(t0: float) -> float:
