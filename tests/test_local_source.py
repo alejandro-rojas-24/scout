@@ -302,14 +302,40 @@ def test_protocol_conformance(tmp_path):
         assert hasattr(src, name), name
 
 
-def test_stat_note_lists_symlink_realpaths(tmp_path):
+def test_stat_note_lists_symlink_targets_relative(tmp_path):
+    """Review r2 item 4: the note is persisted in the Card, so it holds no absolute paths."""
     snap, blobs, _ = _hf_cache(tmp_path)
     log = ByteLog()
     LocalSource(snap, log).resolve()
     note = log.events[-1].note
     assert note.startswith("3 files; symlinks: ")
-    assert f"model.safetensors -> {os.path.realpath(blobs / ('1' * 64))}" in note
-    assert f"text_encoder/config.json -> {os.path.realpath(blobs / ('2' * 40))}" in note
+    assert f"model.safetensors -> ../../blobs/{'1' * 64}" in note
+    assert f"text_encoder/config.json -> ../../blobs/{'2' * 40}" in note
+    assert str(tmp_path) not in note and str(tmp_path.resolve()) not in note
+
+
+def test_stat_note_outside_and_capped(tmp_path):
+    """Targets outside root/../.. become <outside>/basename; at most 20 entries plus (+K more)."""
+    root = tmp_path / "a" / "b" / "m"
+    root.mkdir(parents=True)
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    (ext / "far.json").write_text("{}")
+    os.symlink(ext / "far.json", root / "aaa.json")
+    for i in range(24):
+        (root / f"real{i:02d}.txt").write_text("x")
+        os.symlink(f"real{i:02d}.txt", root / f"link{i:02d}.txt")
+    log = ByteLog()
+    LocalSource(root, log).resolve()
+    note = log.events[-1].note
+    assert note.startswith("49 files; symlinks: ")
+    assert "aaa.json -> <outside>/far.json" in note
+    assert "link00.txt -> real00.txt" in note
+    assert "link18.txt -> real18.txt" in note
+    assert "link19.txt" not in note  # 25 links sorted by rel: aaa.json + link00..link18 shown
+    assert note.endswith("(+5 more)")
+    assert note.count(" -> ") == 20
+    assert str(tmp_path) not in note and str(tmp_path.resolve()) not in note
 
 
 def test_alias_to_safetensors_refused(tmp_path, monkeypatch):
@@ -401,3 +427,166 @@ def test_walk_error_raises(tmp_path, monkeypatch):
     src = LocalSource(root, ByteLog())
     with pytest.raises(ScoutError, match="cannot list .*sub"):
         src.resolve()
+
+
+def test_symlink_chain_aliases_refused(tmp_path, monkeypatch):
+    """Review r2 item 1: readme.md -> ext/model.bin -> ext/<hash>; realpath alone says 'hash'."""
+    root = tmp_path / "m"
+    root.mkdir()
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    (ext / ("9" * 64)).write_bytes(b"\x03" * 64)
+    os.symlink(ext / ("9" * 64), ext / "model.bin")
+    os.symlink(ext / "model.bin", root / "readme.md")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    assert {f.path: f.size for f in src.files()} == {"readme.md": 64}
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    with pytest.raises(WeightReadRefused):
+        src.read_file("readme.md")
+    with pytest.raises(WeightReadRefused):
+        src.read_range("readme.md", 0, 4)
+    assert spy.calls == []
+    assert log.totals == {"meta": 0, "header": 0, "weight": 0}
+    assert log.reserved == 0
+
+
+def test_symlink_chain_middle_hop_relative(tmp_path):
+    """A relative middle hop (notes.txt -> sub/w.pt -> ../blobhash) is followed hop by hop."""
+    root = tmp_path / "m"
+    (root / "sub").mkdir(parents=True)
+    (root / "blobhash").write_bytes(b"\x04" * 16)
+    os.symlink("../blobhash", root / "sub" / "w.pt")
+    os.symlink("sub/w.pt", root / "notes.txt")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    with pytest.raises(WeightReadRefused):
+        src.read_file("notes.txt")
+    # blobhash shares the inode with notes.txt and sub/w.pt, so it is refused too (errs safe)
+    with pytest.raises(WeightReadRefused):
+        src.read_file("blobhash")
+    assert log.totals["weight"] == 0 and log.totals["meta"] == 0
+
+
+def test_symlink_chain_too_long(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "target.json").write_text("{}")
+    prev = "target.json"
+    for i in range(41):
+        name = f"l{i:02d}.json"
+        os.symlink(prev, root / name)
+        prev = name
+    with pytest.raises(ScoutError, match="symlink chain too long"):
+        LocalSource(root, ByteLog()).resolve()
+
+
+def test_symlink_cycle_raises(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    os.symlink("b.json", root / "a.json")
+    os.symlink("a.json", root / "b.json")
+    with pytest.raises(ScoutError, match="symlink chain too long"):
+        LocalSource(root, ByteLog()).resolve()
+
+
+def test_hidden_weight_named_hardlink_refused(tmp_path, monkeypatch):
+    """Review r2 item 2: .model.bin hardlinked to notes.txt; hidden names still count as aliases."""
+    root = tmp_path / "m"
+    (root / "sub").mkdir(parents=True)
+    (root / "notes.txt").write_bytes(b"\x05" * 32)
+    os.link(root / "notes.txt", root / ".model.bin")
+    (root / "sub" / "info.md").write_bytes(b"\x06" * 32)
+    os.link(root / "sub" / "info.md", root / "sub" / ".w.safetensors")
+    (root / "plain.txt").write_text("ok")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    assert [f.path for f in src.files()] == ["notes.txt", "plain.txt", "sub/info.md"]
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    for path in ("notes.txt", "sub/info.md"):
+        with pytest.raises(WeightReadRefused):
+            src.read_file(path)
+        with pytest.raises(WeightReadRefused):
+            src.read_range(path, 0, 8)
+    assert spy.calls == []
+    assert src.read_file("plain.txt") == b"ok"
+    assert log.totals == {"meta": 2, "header": 0, "weight": 0}
+    assert log.reserved == 0
+
+
+def test_hidden_broken_link_ignored(tmp_path):
+    """Hidden files are only alias sources; a broken hidden link does not fail resolve()."""
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "config.json").write_text("{}")
+    os.symlink("missing", root / ".dangling.bin")
+    src = LocalSource(root, ByteLog())
+    src.resolve()
+    assert src.read_file("config.json") == b"{}"
+
+
+def test_new_hardlink_after_resolve_detected(tmp_path):
+    """A weight-named hard link added after resolve() changes st_nlink, so the read is refused."""
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "notes.txt").write_bytes(b"abc")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    os.link(root / "notes.txt", root / ".late.bin")
+    with pytest.raises(ScoutError, match="changed since resolve"):
+        src.read_file("notes.txt")
+    assert log.totals["meta"] == 0 and log.reserved == 0
+
+
+@pytest.mark.parametrize("kind", ["hardlink", "symlink", "chain"])
+@pytest.mark.parametrize("other", ["pytorch_model.bin", "x.pt"])
+def test_safetensors_name_over_other_weight_format_refused(tmp_path, monkeypatch, kind, other):
+    """Review r2 item 3: model.safetensors aliasing a .bin/.pt must not get safetensors header semantics."""
+    root = tmp_path / "m"
+    root.mkdir()
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    payload = (16).to_bytes(8, "little") + b"{" + b" " * 14 + b"}" + b"\x07" * 64
+    if kind == "hardlink":
+        (root / other).write_bytes(payload)
+        os.link(root / other, root / "model.safetensors")
+    elif kind == "symlink":
+        (ext / other).write_bytes(payload)
+        os.symlink(ext / other, root / "model.safetensors")
+    else:
+        (ext / ("8" * 64)).write_bytes(payload)
+        os.symlink(ext / ("8" * 64), ext / other)
+        os.symlink(ext / other, root / "model.safetensors")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    spy = _OpenSpy(root, fail=False).install(monkeypatch)
+    with pytest.raises(WeightReadRefused):
+        src.read_range("model.safetensors", 0, 8)
+    assert spy.calls == []
+    assert log.totals == {"meta": 0, "header": 0, "weight": 0}
+    assert log.reserved == 0
+    assert log.events[-1].event == "refused"
+
+
+def test_safetensors_over_safetensors_or_blob_allowed(tmp_path):
+    """Same-format and extensionless aliases keep normal safetensors header reads."""
+    root = tmp_path / "m"
+    root.mkdir()
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    st = safetensors_bytes(dense_tensors(n_layers=1))
+    (ext / ("7" * 64)).write_bytes(st)
+    os.symlink(ext / ("7" * 64), ext / "other.safetensors")
+    os.symlink(ext / "other.safetensors", root / "model.safetensors")
+    log = ByteLog()
+    src = LocalSource(root, log)
+    src.resolve()
+    n = int.from_bytes(src.read_range("model.safetensors", 0, 8), "little")
+    log.set_header_len("model.safetensors", n)
+    assert src.read_range("model.safetensors", 8, n) == st[8 : 8 + n]
+    assert log.totals == {"meta": 0, "header": 8 + n, "weight": 0}
