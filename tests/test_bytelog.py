@@ -414,3 +414,152 @@ def test_on_event_exception_propagates():
                    start=0, nbytes=1, status=200)
     # the event was still recorded before the callback raised
     assert log.totals["meta"] == 1
+
+
+# --------------------------------------------------------------------------- emit ordering
+
+
+def _run_with_timeout(fn, timeout=10.0):
+    """Run fn in a daemon thread; fail (instead of hanging) on deadlock."""
+    err: list[BaseException] = []
+
+    def target():
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), "deadlock: call did not finish"
+    if err:
+        raise err[0]
+
+
+def test_on_event_strict_seq_order_under_concurrency():
+    seen: list[int] = []
+
+    def cb(ev):
+        # no extra lock: the ByteLog must serialize callbacks itself
+        seen.append(ev.seq)
+
+    log = ByteLog(on_event=cb)
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        for _ in range(200):
+            log.record(event="fetch", source=None, path="config.json", url=None,
+                       start=0, nbytes=1, status=200)
+
+    def main():
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    _run_with_timeout(main, timeout=30.0)
+    assert seen == list(range(1, 1601))
+    assert log.totals["meta"] == 1600
+
+
+def test_on_event_strict_seq_order_mixed_event_kinds():
+    seen: list[int] = []
+    log = ByteLog(threshold_bytes=50, on_event=lambda ev: seen.append(ev.seq))
+    barrier = threading.Barrier(8)
+
+    def worker(i):
+        barrier.wait()
+        for _ in range(50):
+            if i % 4 == 0:
+                log.record(event="fetch", source=None, path="m.safetensors", url=None,
+                           start=0, nbytes=4, status=206)
+            elif i % 4 == 1:
+                log.note("error", "x")
+            elif i % 4 == 2:
+                try:
+                    log.preflight("c.json", 0, 60)  # always over budget -> refused event
+                except ReadThresholdExceeded:
+                    pass
+            else:
+                try:
+                    log.preflight("w.bin", 0, 1)  # weight -> refused event
+                except WeightReadRefused:
+                    pass
+
+    def main():
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    _run_with_timeout(main, timeout=30.0)
+    assert seen == list(range(1, len(log.events) + 1))
+    assert len(seen) == 400
+
+
+def test_reentrant_record_from_on_event_does_not_deadlock():
+    seen: list[tuple[int, str]] = []
+    log_ref: list[ByteLog] = []
+
+    def cb(ev):
+        seen.append((ev.seq, ev.event))
+        log = log_ref[0]
+        # read views and re-enter the log from inside the callback
+        _ = log.totals, log.reserved, log.events, log.current_stage
+        if ev.event == "fetch" and ev.path == "config.json":
+            log.record(event="retry", source=None, path="nested.json", url=None,
+                       start=0, nbytes=2, status=503)
+            log.note("error", "nested")
+            rid = log.preflight("x.json", 0, 1)
+            log.release(rid)
+
+    log = ByteLog(on_event=cb)
+    log_ref.append(log)
+
+    def main():
+        log.stage(Stage.RESOLVE)
+        log.record(event="fetch", source=None, path="config.json", url=None,
+                   start=0, nbytes=3, status=200)
+
+    _run_with_timeout(main)
+    # callbacks start in seq order even when nested
+    assert [s for s, _ in seen] == [1, 2, 3, 4]
+    assert [e for _, e in seen] == ["stage_start", "fetch", "retry", "error"]
+    assert log.totals["meta"] == 5
+
+
+def test_reentrant_record_from_on_event_concurrent():
+    seen: list[int] = []
+    log_ref: list[ByteLog] = []
+
+    def cb(ev):
+        seen.append(ev.seq)
+        if ev.event == "fetch":
+            log_ref[0].note("error", "nested")
+
+    log = ByteLog(on_event=cb)
+    log_ref.append(log)
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        for _ in range(100):
+            log.record(event="fetch", source=None, path="config.json", url=None,
+                       start=0, nbytes=1, status=200)
+
+    def main():
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    _run_with_timeout(main, timeout=30.0)
+    assert seen == list(range(1, 1601))
+    # each fetch is immediately followed by its nested note
+    kinds = [e.event for e in log.events]
+    assert kinds == ["fetch", "error"] * 800

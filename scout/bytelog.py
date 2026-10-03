@@ -120,6 +120,11 @@ class ByteLog:
     ) -> None:
         self.threshold_bytes = threshold_bytes
         self._on_event = on_event
+        # Lock order is always _emit_lock -> _lock. _lock guards state and is never held
+        # while on_event runs. _emit_lock (re-entrant) is held from appending an event
+        # until its callback returns, so callbacks see seq 1..n in order and
+        # record() called from inside on_event (same thread) does not deadlock.
+        self._emit_lock = threading.RLock()
         self._lock = threading.Lock()
         self._seq = 0
         self._stage: Stage | None = None
@@ -172,6 +177,7 @@ class ByteLog:
         return ev
 
     def _emit(self, ev: LogEvent) -> LogEvent:
+        """Run on_event. Caller must hold self._emit_lock (and not self._lock)."""
         if self._on_event is not None:
             self._on_event(ev)
         return ev
@@ -186,14 +192,15 @@ class ByteLog:
 
     def stage(self, stage: Stage) -> LogEvent:
         stage = Stage(stage)
-        with self._lock:
-            if self._stage is not None and stage < self._stage:
-                raise StageOrderError(
-                    f"cannot enter stage {stage.name} after {self._stage.name}"
-                )
-            self._stage = stage
-            ev = self._zero_event_locked("stage_start", None, None)
-        return self._emit(ev)
+        with self._emit_lock:
+            with self._lock:
+                if self._stage is not None and stage < self._stage:
+                    raise StageOrderError(
+                        f"cannot enter stage {stage.name} after {self._stage.name}"
+                    )
+                self._stage = stage
+                ev = self._zero_event_locked("stage_start", None, None)
+            return self._emit(ev)
 
     # ------------------------------------------------------------------ header lengths
 
@@ -214,25 +221,22 @@ class ByteLog:
             self.note("refused", msg, path=path)
             raise WeightReadRefused(msg)
         requested = end_exclusive - start
-        with self._lock:
-            t = self._totals["meta"] + self._totals["header"] + sum(self._reservations.values())
-            thr = self.threshold_bytes
-            if t + requested > thr:
+        with self._emit_lock:
+            with self._lock:
+                t = self._totals["meta"] + self._totals["header"] + sum(self._reservations.values())
+                thr = self.threshold_bytes
+                if t + requested <= thr:
+                    rid = self._next_reservation
+                    self._next_reservation += 1
+                    self._reservations[rid] = requested
+                    return rid
                 msg = (
                     f"threshold: requested={requested} total={t} threshold={thr} "
                     f"disk=0 reason=non-weight read budget"
                 )
                 ev = self._zero_event_locked("refused", msg, path)
-                refused = True
-            else:
-                rid = self._next_reservation
-                self._next_reservation += 1
-                self._reservations[rid] = requested
-                refused = False
-        if refused:
             self._emit(ev)
-            raise ReadThresholdExceeded(requested, t, thr, msg)
-        return rid
+        raise ReadThresholdExceeded(requested, t, thr, msg)
 
     def release(self, reservation: int) -> None:
         with self._lock:
@@ -260,26 +264,28 @@ class ByteLog:
         if nbytes < 0:
             raise ValueError(f"nbytes must be >= 0, got {nbytes}")
         s = 0 if start is None else start
-        with self._lock:
-            c = classify_range(path or "", s, s + nbytes, self._header_lens.get(path or ""))
-            for k, v in c.items():
-                self._totals[k] += v
-            if release is not None:
-                self._reservations.pop(release, None)
-            ev = self._append_locked(
-                event=event, source=source, path=path, url=url,
-                range=(start, start + nbytes) if start is not None else None,
-                status=status, bytes=nbytes, bytes_by_class=c, attempt=attempt,
-                elapsed_ms=elapsed_ms, note=note,
-            )
-        return self._emit(ev)
+        with self._emit_lock:
+            with self._lock:
+                c = classify_range(path or "", s, s + nbytes, self._header_lens.get(path or ""))
+                for k, v in c.items():
+                    self._totals[k] += v
+                if release is not None:
+                    self._reservations.pop(release, None)
+                ev = self._append_locked(
+                    event=event, source=source, path=path, url=url,
+                    range=(start, start + nbytes) if start is not None else None,
+                    status=status, bytes=nbytes, bytes_by_class=c, attempt=attempt,
+                    elapsed_ms=elapsed_ms, note=note,
+                )
+            return self._emit(ev)
 
     def note(self, event: str, note: str, path: str | None = None) -> LogEvent:
         if event not in _NOTE_EVENTS:
             raise ValueError(f"note event must be one of {sorted(_NOTE_EVENTS)}, got {event!r}")
-        with self._lock:
-            ev = self._zero_event_locked(event, note, path)
-        return self._emit(ev)
+        with self._emit_lock:
+            with self._lock:
+                ev = self._zero_event_locked(event, note, path)
+            return self._emit(ev)
 
     # ------------------------------------------------------------------ export
 
