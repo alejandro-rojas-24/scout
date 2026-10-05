@@ -196,3 +196,16 @@ def test_uneven_inner_indices(tmp_path):
     n = nodes["d.blocks[#].resnets[#]"]
     assert n["kind"] == "stack" and n["count"] == 3 and n["label"] == "resnets ×3"
     assert nodes["d.blocks[#]"]["count"] == 2
+
+
+def test_long_digit_segment_is_not_an_index(tmp_path):
+    t = {"a.0.w": ("F32", (2, 2)), "a.1.w": ("F32", (2, 2)), "a.1234567890.w": ("F32", (3,))}
+    built, view = _custom_view(tmp_path, t)
+    nodes = _by_id(view)
+    strip = next(s for s in view["depth_strips"] if s["prefix"] == "a")
+    assert strip["depth"] == 2
+    assert nodes["a[#]"]["params"] == sum(c["params"] for c in strip["cells"]) == 8
+    leaf = nodes["a.1234567890.w"]
+    assert leaf["kind"] == "tensor" and leaf["parent"] == "a.1234567890"
+    assert not any(n["id"].startswith("a[#]") and "1234567890" in n["id"] for n in view["nodes"])
+    assert nodes[""]["params"] == built.card["weights"]["params_total"]

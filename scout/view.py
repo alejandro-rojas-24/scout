@@ -10,6 +10,7 @@ import copy
 import pyarrow as pa
 
 from scout.errors import ScoutError
+from scout.structure import _is_index  # same index rule as the Card's structure analysis
 
 DISCLAIMERS: tuple[str, str, str] = (
     "Distillation is invisible to weight forensics: a model trained on another model's outputs leaves no trace in its weights.",
@@ -26,10 +27,6 @@ _MARK_LEN = len(_STACK)
 Origin = tuple[str, str | None]
 
 
-def _is_digits(seg: str) -> bool:
-    return seg.isascii() and seg.isdigit()
-
-
 def _segments(collapsed_name: str, stack_prefix: str | None) -> list[tuple[str, list[Origin]]]:
     """Apply the segment rule. Each merged segment carries one origin per marker, in order.
 
@@ -42,7 +39,7 @@ def _segments(collapsed_name: str, stack_prefix: str | None) -> list[tuple[str, 
             mark, info = _STACK, ("card", stack_prefix)
         elif seg == "*":
             mark, info = _EXPERT, ("exp", ".".join(orig[: k + 1]))
-        elif _is_digits(seg):
+        elif _is_index(seg):
             mark, info = _STACK, ("lit", seg.lstrip("0") or "0")
         else:
             out.append((seg, []))
@@ -124,7 +121,10 @@ def build_view(card: dict, table: pa.Table) -> dict:
                     m.literals.add(info[1])
                 else:
                     c = resolve(info, name)
-                    m.fixed = c if m.fixed is None else max(m.fixed, c)
+                    if m.fixed is not None and m.fixed != c:
+                        raise ScoutError(
+                            f"node {nid!r}: conflicting Card counts {m.fixed} and {c} (row {name!r})")
+                    m.fixed = c
             parent = nid
         leaf_rows.setdefault(parent, []).append((cols["shape"][i], cols["dtype"][i]))
 

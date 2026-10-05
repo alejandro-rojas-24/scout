@@ -63,6 +63,7 @@ amendments:
   - "2026-10-03 orchestrator (from T011 review r1): consecutive integer markers keep one origin per marker. A node's `count` is the FIRST marker's count, which is the Card stack depth when that marker is the Card '#' stack, never overridden by a literal. The label shows each marker's own count in order, e.g. `input_blocks ×12 ×2`."
   - "2026-10-03 orchestrator: a leading integer segment (root-level Card stack, prefix '') uses the root as predecessor: id '[#]', parent '', kind 'stack', count = Card depth, label '×N'."
   - "2026-10-03 orchestrator: a tensor node's dtype is 'varies' whenever the dtypes of its rows differ, independent of shape. shape is None only when shapes differ."
+  - "2026-10-05 orchestrator (T011 follow-up): rule 1's 'all-digit segment' means structure.py's index rule (scout.structure._is_index), not str.isdigit."
   - "2026-10-03 orchestrator: if a Parquet stack_prefix or expert template has no matching Card structure entry, raise ScoutError (no silent count=1)."
 
 decisions:
@@ -72,5 +73,5 @@ decisions:
   - "Leading marker: any leading '#', literal digit or '*' merges into an empty predecessor, so the ids are '[#]' / '[*]' with parent ''. Amendment 2 is applied to literal leading digits too, not only to the Card stack with prefix ''."
   - "Rule 6 as amended: shape = None iff the shapes differ; dtype = 'varies' iff the dtypes differ. A shape mismatch with equal dtypes now keeps the common dtype (previously it forced 'varies')."
   - "Mismatch (amendment 4): a '#' row whose stack_prefix (including None) has no Card stack, or a '*' template with no Card expert group, raises ScoutError naming the row's collapsed_name and the missing key. No count=1 fallback for Card markers. A literal-only marker with no literals cannot occur, but falls back to 1."
-  - "If several rows reach the same node and marker position with different fixed counts (only possible with >9-digit literal segments, which structure.py does not treat as indices but view.py does), the max is used."
+  - "Index rule: view.py imports scout.structure._is_index (read-only use), so a segment is a stack/literal index exactly when structure.py treats it as one (ASCII digits, 1..9 chars). Longer digit runs (e.g. '1234567890') stay plain segments. If two rows ever give one node marker different Card counts, build_view raises ScoutError; there is no max() merge (replaces the earlier max decision, which was only reachable through the >9-digit mismatch now removed)."
   - "New tests build custom repos via write_sharded(n_shards=1) + config.json + DEFAULT_README through build_fixture_card. The round-trip test uses the MoE fixture (stacks + expert group) and compares the full view dicts with ==."
