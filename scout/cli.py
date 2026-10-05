@@ -11,7 +11,7 @@ from typing import Callable
 
 import httpx
 
-from scout.bytelog import DEFAULT_THRESHOLD_BYTES, ByteLog, LogEvent
+from scout.bytelog import DEFAULT_THRESHOLD_BYTES, ByteLog, LogEvent, Stage
 from scout.errors import ScoutError
 from scout.hub import HubSource
 from scout.scan import parse_target, scan
@@ -60,6 +60,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_scan(args: argparse.Namespace, client: httpx.Client | None) -> int:
+    try:
+        parse_target(args.target)
+    except ValueError as e:
+        print(f"error: ValueError: {e}", file=sys.stderr)
+        return 2
     log = _stderr_log(args.max_read_bytes)
     result = scan(args.target, Path(args.out), log, client=client, endpoint=args.endpoint)
     print(json.dumps({
@@ -75,12 +80,17 @@ def _cmd_scan(args: argparse.Namespace, client: httpx.Client | None) -> int:
 
 
 def _cmd_resolve(args: argparse.Namespace, client: httpx.Client | None) -> int:
-    kind, repo, rev = parse_target(args.target)
-    if kind != "hub":
-        raise ValueError(f"resolve needs a Hub repo (owner/name[@rev]): {args.target}")
+    try:
+        kind, repo, rev = parse_target(args.target)
+        if kind != "hub":
+            raise ValueError(f"resolve needs a Hub repo (owner/name[@rev]): {args.target}")
+    except ValueError as e:
+        print(f"error: ValueError: {e}", file=sys.stderr)
+        return 2
     log = _stderr_log(DEFAULT_THRESHOLD_BYTES)
     source = HubSource(repo, rev, log, client=client, endpoint=args.endpoint)
     try:
+        log.stage(Stage.RESOLVE)
         source.resolve()
         print(source.revision_sha)
     finally:
@@ -102,19 +112,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None, *,
          client_factory: Callable[[], httpx.Client] | None = None) -> int:
     args = _build_parser().parse_args(argv)  # argparse errors exit with 2
-    client = client_factory() if client_factory else None
+    if args.command == "serve":
+        return _cmd_serve(args)
+    client = None
     try:
+        client = client_factory() if client_factory else None
         if args.command == "scan":
             return _cmd_scan(args, client)
-        if args.command == "resolve":
-            return _cmd_resolve(args, client)
-        return _cmd_serve(args)
+        return _cmd_resolve(args, client)
     except ScoutError as e:
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return e.exit_code
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+    except Exception as e:  # noqa: BLE001 - generic handler
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
     finally:
         if client is not None:
             client.close()
