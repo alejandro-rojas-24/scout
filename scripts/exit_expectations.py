@@ -3,16 +3,23 @@
 Everything here is a pure function over a TargetResult (plan.md section 2). No network, no
 server. Every assertion is its own Check, and a Check never raises: an exception inside a
 predicate becomes ok=False with actual="error: <Type>: <msg>".
+
+These checks are the phase's independent evidence, so they deliberately do not import the
+code under test (scout.*): slugs, path layout and the resolve URL shape are re-derived here
+from plan.md section 3.3.
 """
 
 from __future__ import annotations
 
+import math
+import os
 import pathlib
+import posixpath
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pyarrow as pa
 
@@ -110,16 +117,26 @@ def _comp(card: Any) -> str:
         return "?"
 
 
+def _list_of(r: TargetResult, attr: str) -> list:
+    """r.<attr> if it is a list, else [] (never raises; the type itself is checked by _typed)."""
+    v = getattr(r, attr, None)
+    return v if isinstance(v, list) else []
+
+
+def _cards(r: TargetResult) -> list[dict]:
+    return [c for c in _list_of(r, "cards") if isinstance(c, dict)]
+
+
 def _card(r: TargetResult, component: str | None) -> dict:
-    for c in r.cards:
+    for c in _cards(r):
         if c["key"]["component"] == component:
             return c
     raise KeyError(f"no card for component {component!r}")
 
 
 def _view(r: TargetResult, component: str | None) -> dict:
-    for v in r.views:
-        if v["card_key"]["component"] == component:
+    for v in _list_of(r, "views"):
+        if isinstance(v, dict) and v["card_key"]["component"] == component:
             return v
     raise KeyError(f"no view for component {component!r}")
 
@@ -139,8 +156,92 @@ def _stack_by_prefix(card: dict, prefix: str) -> dict:
     raise KeyError(f"no stack with prefix {prefix!r}")
 
 
+def _repo_slug(repo: str) -> str:
+    """plan.md 3.3 repo_slug for Hub repos (the exit targets are all Hub repos)."""
+    return repo.replace("/", "__")
+
+
+def _component_slug(component: str | None) -> str:
+    return "_model" if component is None else component
+
+
+_JSON_SUFFIX = ".card.json"
+_PARQUET_SUFFIX = ".tensors.parquet"
+
+
+def _split_card_path(p: Any, suffix: str) -> tuple[str, str, str, str] | None:
+    """(repo_slug dir, sha dir, stem, parent str) if p ends with suffix, else None."""
+    path = pathlib.Path(p)
+    if not path.name.endswith(suffix) or len(path.name) == len(suffix):
+        return None
+    return path.parent.parent.name, path.parent.name, path.name[: -len(suffix)], str(path.parent)
+
+
+def _table_meta(table: Any) -> dict[str, str]:
+    md = table.schema.metadata or {}
+    return {k.decode("utf-8", "replace"): v.decode("utf-8", "replace") for k, v in md.items()}
+
+
+def _table_for(r: TargetResult, card: dict) -> pa.Table:
+    """The one table whose Parquet schema metadata names this card's component and revision_sha."""
+    comp = card["key"]["component"]
+    want = ("" if comp is None else comp, card["key"]["revision_sha"])
+    hits = []
+    for t in _list_of(r, "tables"):
+        if not isinstance(t, pa.Table):
+            continue
+        md = _table_meta(t)
+        if (md.get("component"), md.get("revision_sha")) == want:
+            hits.append(t)
+    if len(hits) != 1:
+        raise KeyError(f"{len(hits)} tables with metadata component={want[0]!r} revision_sha={want[1]!r}")
+    return hits[0]
+
+
+def _norm_orig(orig: Any) -> str:
+    """unquote(urlsplit(orig_path).path): drops scheme/host/query/fragment, undoes percent-encoding."""
+    if not isinstance(orig, str):
+        raise TypeError(f"orig_path is {type(orig).__name__}, not str")
+    return unquote(urlsplit(orig).path)
+
+
+def _ext_key(path: str) -> tuple[str, str]:
+    """Match key: the path is compared exactly except its extension, which is compared case-insensitively."""
+    base, ext = posixpath.splitext(path)
+    return base, ext.lower()
+
+
+def _is_weight_name(path: str) -> bool:
+    return path.lower().endswith(".safetensors")
+
+
+_RANGE_RE = re.compile(r"bytes=(\d+)-(\d+)", re.IGNORECASE)
+
+
+def _is_2xx(status: Any) -> bool:
+    """Fail closed: anything that is not a readable int outside 200..299 counts as 2xx."""
+    if isinstance(status, int) and not isinstance(status, bool):
+        return 200 <= status < 300
+    return True
+
+
 # ---------------------------------------------------------------------------
 # common checks C1..C12
+
+
+def _typed(t: str, out: list[Check], r: TargetResult, attr: str, elem: tuple[type, ...] | None,
+           container: type = list) -> None:
+    """Up-front type Check for one TargetResult field (and its elements)."""
+    def fn() -> tuple[Any, bool]:
+        v = getattr(r, attr, None)
+        if not isinstance(v, container):
+            return f"{type(v).__name__}", False
+        if elem is None:
+            return container.__name__, True
+        bad = [i for i, x in enumerate(v) if not isinstance(x, elem)]
+        return f"{container.__name__} of {len(v)}, wrong element type at {bad}", not bad
+    want = container.__name__ + ("" if elem is None else " of " + "|".join(e.__name__ for e in elem))
+    out.append(_run(t, f"TYPE field {attr} has the right type", want, fn))
 
 
 def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
@@ -150,29 +251,46 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
     out: list[Check] = []
     add = out.append
 
+    # field types first; afterwards every list field is coerced (non-list -> [], bad elements dropped)
+    _typed(t, out, r, "final", None, dict)
+    for attr, elem in (("events", (dict,)), ("cards", (dict,)), ("tables", (pa.Table,)), ("views", (dict,)),
+                       ("json_paths", (str, os.PathLike)), ("parquet_paths", (str, os.PathLike)),
+                       ("wire", (dict,))):
+        _typed(t, out, r, attr, elem)
+    events = [e for e in _list_of(r, "events") if isinstance(e, dict)]
+    cards = _cards(r)
+    views = [v for v in _list_of(r, "views") if isinstance(v, dict)]
+    json_paths = [p for p in _list_of(r, "json_paths") if isinstance(p, (str, os.PathLike))]
+    parquet_paths = [p for p in _list_of(r, "parquet_paths") if isinstance(p, (str, os.PathLike))]
+    wire = [w for w in _list_of(r, "wire") if isinstance(w, dict)]
+    n_tables = len(_list_of(r, "tables"))
+
     # C1
-    add(_run(t, "C1 status done and elapsed < budget", f'status == "done" and elapsed_s < {budget_s}',
-             lambda: (f"status={r.status!r} elapsed_s={r.elapsed_s}",
-                      r.status == "done" and r.elapsed_s < budget_s)))
+    def c1() -> tuple[Any, bool]:
+        e = r.elapsed_s
+        num = isinstance(e, (int, float)) and not isinstance(e, bool)
+        ok = r.status == "done" and num and math.isfinite(e) and 0 < e < budget_s
+        return f"status={r.status!r} elapsed_s={e!r}", ok
+    add(_run(t, "C1 status done and 0 < elapsed < budget", f'status == "done" and 0 < elapsed_s < {budget_s}', c1))
 
     # C2
     add(_eq(t, "C2 server totals.weight", 0, lambda: r.final["totals"]["weight"]))
-    for i, card in enumerate(r.cards):
+    for i, card in enumerate(cards):
         add(_eq(t, f"C2 card[{i}] {_comp(card)} fetch_log.totals.weight", 0,
                 lambda card=card: card["fetch_log"]["totals"]["weight"]))
     add(_eq(t, "C2 sum of event bytes_by_class.weight", 0,
-            lambda: sum(e["bytes_by_class"]["weight"] for e in r.events)))
+            lambda: sum(e["bytes_by_class"]["weight"] for e in events)))
 
     # C3
     def c3() -> tuple[Any, bool]:
-        got = sum(e["bytes_by_class"]["header"] for e in r.events if e["event"] == "fetch")
-        want = sum(8 + f["header_len"] for c in r.cards for f in c["weights"]["files"])
+        got = sum(e["bytes_by_class"]["header"] for e in events if e["event"] == "fetch")
+        want = sum(8 + f["header_len"] for c in cards for f in c["weights"]["files"])
         return f"{got} (sum of header_len+8 = {want})", got == want
     add(_run(t, "C3 header bytes == sum(8 + header_len)", "equal", c3))
 
     # C4
     n_files = 0
-    for i, card in enumerate(r.cards):
+    for i, card in enumerate(cards):
         try:
             files = list(card["weights"]["files"])
         except Exception as e:  # noqa: BLE001
@@ -193,7 +311,7 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
     add(_run(t, "C4 at least one weight file", ">= 1", lambda: (n_files, n_files >= 1)))
 
     # C5
-    for i, card in enumerate(r.cards):
+    for i, card in enumerate(cards):
         try:
             has_index = bool(card["weights"]["index_path"])
         except Exception as e:  # noqa: BLE001
@@ -202,31 +320,64 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
             continue
         if has_index:
             add(_eq(t, f"C5 card[{i}] {_comp(card)} tensor_bytes_total == index_total_size",
-                    _peek(lambda card=card: card["weights"]["index_total_size"]), lambda card=card: card["weights"]["tensor_bytes_total"]))
+                    _peek(lambda card=card: card["weights"]["index_total_size"]),
+                    lambda card=card: card["weights"]["tensor_bytes_total"]))
 
-    # C6 (sanity)
+    # C6 (sanity): counts, existence, <out>/<repo_slug>/<sha>/<component_slug>.{card.json,tensors.parquet}
     def c6_counts() -> tuple[Any, bool]:
-        ns = (len(r.cards), len(r.tables), len(r.views), len(r.json_paths), len(r.parquet_paths))
+        ns = (len(_list_of(r, "cards")), n_tables, len(_list_of(r, "views")),
+              len(_list_of(r, "json_paths")), len(_list_of(r, "parquet_paths")))
         return f"cards/tables/views/json/parquet = {ns}", len(set(ns)) == 1
     add(_run(t, "C6 cards, tables, views and paths have equal counts", "equal", c6_counts))
 
     def c6_exist() -> tuple[Any, bool]:
-        paths = [pathlib.Path(p) for p in list(r.json_paths) + list(r.parquet_paths)]
+        paths = [pathlib.Path(p) for p in json_paths + parquet_paths]
         missing = [str(p) for p in paths if not p.exists()]
         return f"missing={missing} (checked {len(paths)})", not missing and len(paths) > 0
     add(_run(t, "C6 card json and parquet files exist", "all exist", c6_exist))
-    for i, card in enumerate(r.cards):
+
+    def c6_layout() -> tuple[Any, bool]:
+        bad: list[str] = []
+        js, ps = set(), set()
+        for paths, suffix, acc in ((json_paths, _JSON_SUFFIX, js), (parquet_paths, _PARQUET_SUFFIX, ps)):
+            for p in paths:
+                parts = _split_card_path(p, suffix)
+                if parts is None:
+                    bad.append(f"{p}: name does not end in {suffix}")
+                    continue
+                if parts[1] != r.pin:
+                    bad.append(f"{p}: parent dir {parts[1]!r} != pin")
+                acc.add((parts[3], parts[2]))
+        unpaired = sorted(js ^ ps)
+        if unpaired:
+            bad.append(f"json/parquet without a same-dir same-stem partner: {unpaired}")
+        return f"problems={bad}", not bad and bool(js)
+    add(_run(t, "C6 path layout: parent == pin, suffixes, one shared stem per json/parquet pair",
+             f"<sha>/<stem>{_JSON_SUFFIX} + <sha>/<stem>{_PARQUET_SUFFIX}", c6_layout))
+
+    def c6_card_paths(card: dict) -> tuple[Any, bool]:
+        want = (_repo_slug(card["key"]["repo"]), r.pin, _component_slug(card["key"]["component"]))
+        have_j = {_split_card_path(p, _JSON_SUFFIX) for p in json_paths} - {None}
+        have_p = {_split_card_path(p, _PARQUET_SUFFIX) for p in parquet_paths} - {None}
+        dirs_j = {x[3] for x in have_j if x[:3] == want}
+        dirs_p = {x[3] for x in have_p if x[:3] == want}
+        return f"json dirs={sorted(dirs_j)} parquet dirs={sorted(dirs_p)}", bool(dirs_j & dirs_p)
+    for i, card in enumerate(cards):
+        add(_run(t, f"C6 card[{i}] {_comp(card)} files at <repo_slug>/<pin>/<component_slug>",
+                 _peek(lambda card=card: "/".join((_repo_slug(card["key"]["repo"]), r.pin,
+                                                   _component_slug(card["key"]["component"])))),
+                 lambda card=card: c6_card_paths(card)))
         add(_eq(t, f"C6 card[{i}] {_comp(card)} key.revision_sha == pin", r.pin,
                 lambda card=card: card["key"]["revision_sha"]))
 
-    # C7
-    for i, card in enumerate(r.cards):
+    # C7 (tables paired with cards by Parquet schema metadata, not by position)
+    for i, card in enumerate(cards):
         lab = f"card[{i}] {_comp(card)}"
         add(_eq(t, f"C7 {lab} parquet rows == n_tensors", _peek(lambda card=card: card["weights"]["n_tensors"]),
-                lambda i=i: r.tables[i].num_rows))
+                lambda card=card: _table_for(r, card).num_rows))
 
-        def c7_stats(i=i) -> tuple[Any, bool]:
-            table = r.tables[i]
+        def c7_stats(card=card) -> tuple[Any, bool]:
+            table = _table_for(r, card)
             cols = [n for n in table.column_names if n.startswith("stat_")]
             bad = {n: table.column(n).null_count for n in cols if table.column(n).null_count != table.num_rows}
             return f"stat columns={len(cols)} not-all-null={bad}", bool(cols) and not bad
@@ -239,76 +390,140 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
         add(_run(t, f"C7 {lab} JSON stats all null", "all None", c7_json))
 
     # C8
-    for i, v in enumerate(r.views):
+    for i, v in enumerate(views):
         def c8(v=v) -> tuple[Any, bool]:
             n = sum(1 for node in v["nodes"] if node["kind"] != "tensor")
             return n, n <= 100
         add(_run(t, f"C8 view[{i}] non-tensor nodes <= 100", "<= 100", c8))
-    if not r.views:
+    if not views:
         add(Check(t, "C8 at least one view", ">= 1", "0", False))
 
     # C9 (sanity)
-    for i, card in enumerate(r.cards):
-        add(_eq(t, f"C9 card[{i}] {_comp(card)} params_total == sum(numel)", _peek(lambda card=card: card["weights"]["params_total"]),
-                lambda i=i: sum(r.tables[i].column("numel").to_pylist())))
+    for i, card in enumerate(cards):
+        add(_eq(t, f"C9 card[{i}] {_comp(card)} params_total == sum(numel)",
+                _peek(lambda card=card: card["weights"]["params_total"]),
+                lambda card=card: sum(_table_for(r, card).column("numel").to_pylist())))
 
-    # C10
-    def header_len_for(orig_path: str) -> int:
-        best: tuple[int, int] | None = None   # (len of matched path, header_len)
-        for c in r.cards:
-            for f in c["weights"]["files"]:
-                p = f["path"]
-                if orig_path == p or orig_path.endswith("/" + p):
-                    if best is None or len(p) > best[0]:
-                        best = (len(p), f["header_len"])
-        if best is None:
-            raise KeyError(f"no weight file in the cards matches {orig_path!r}")
-        return best[1]
-
-    n_st = 0
-    for w in r.wire:
-        try:
-            is_st = str(w["orig_path"]).endswith(".safetensors")
-        except Exception:  # noqa: BLE001
-            is_st = False
-        if not is_st:
-            continue
-        n_st += 1
-        def c10(w=w) -> tuple[Any, bool]:
-            rng = w["range"]
-            if rng is None:
-                return "no Range header", False
-            m = re.fullmatch(r"bytes=(\d+)-(\d+)", str(rng))
-            if not m:
-                return f"unparseable Range {rng!r}", False
-            b = int(m.group(2))
-            limit = 8 + header_len_for(w["orig_path"])
-            return f"{rng} (b+1={b + 1}, 8+header_len={limit})", b + 1 <= limit
-        add(_run(t, f"C10 {w.get('orig_path')} Range within header", "Range bytes=a-b with b+1 <= 8+header_len", c10))
-    add(_run(t, "C10 at least one .safetensors wire record", ">= 1", lambda: (n_st, n_st >= 1)))
+    out += _c10(t, r.pin, cards, wire, expected_endpoint)
 
     # C11
     def c11() -> tuple[Any, bool]:
-        wire_bytes = sum(w["body_bytes"] for w in r.wire)
+        wire_bytes = sum(w["body_bytes"] for w in wire)
         tot = r.final["totals"]
         logged = tot["meta"] + tot["header"] + tot["weight"]
         return f"wire={wire_bytes} bytelog={logged}", wire_bytes == logged
     add(_run(t, "C11 wire body bytes == ByteLog meta+header+weight", "equal", c11))
 
     # C12
-    add(_run(t, "C12 at least one wire record", ">= 1", lambda: (len(r.wire), len(r.wire) >= 1)))
+    add(_run(t, "C12 at least one wire record", ">= 1", lambda: (len(wire), len(wire) >= 1)))
 
     def c12_hosts() -> tuple[Any, bool]:
-        hosts = {(urlsplit(w["url"]).hostname or "").lower() for w in r.wire}
+        hosts = {(urlsplit(w["url"]).hostname or "").lower() for w in wire}
         bad = sorted(h for h in hosts if not host_allowed(h, allowed))
         return f"hosts={sorted(hosts)} offending={bad}", not bad
     add(_run(t, "C12 every wire host allowed", f"hosts in {list(allowed)}", c12_hosts))
 
     def c12_endpoint() -> tuple[Any, bool]:
-        eps = [c["source"]["endpoint"] for c in r.cards]
-        return f"endpoints={sorted(set(map(str, eps)))} cards={len(eps)}", bool(eps) and all(e == expected_endpoint for e in eps)
+        eps = [c["source"]["endpoint"] for c in cards]
+        return (f"endpoints={sorted(set(map(str, eps)))} cards={len(eps)}",
+                bool(eps) and all(e == expected_endpoint for e in eps))
     add(_run(t, "C12 every card source.endpoint", expected_endpoint, c12_endpoint))
 
+    return out
+
+
+def _c10(t: str, pin: str, cards: list[dict], wire: list[dict], expected_endpoint: str) -> list[Check]:
+    """C10, wire-level header-only evidence.
+
+    Every record's orig_path is normalised with unquote(urlsplit(orig_path).path) and must lie under
+    /{repo}/resolve/{pin}/ for a Card repo; a 2xx record without orig_path fails (the one exception is
+    the Hub API revision call /api/models/{repo}/revision/{pin} on the expected endpoint host, which
+    T015 records with orig_path None and which never carries file bytes). Every weight request (name
+    ends in .safetensors, any case, or maps to a Card file) must map exactly to a Card weight file
+    (extension compared case-insensitively) and carry Range bytes=a-b with b + 1 <= 8 + header_len.
+    Every Card weight file needs >= 1 2xx record mapped to it.
+    """
+    out: list[Check] = []
+    add = out.append
+
+    file_map: dict[tuple[str, str], tuple[str, int]] = {}   # ext_key(resolve path) -> (label, header_len)
+    prefixes: set[str] = set()
+    api_paths: set[str] = set()
+    labels: list[str] = []
+    for i, card in enumerate(cards):
+        try:
+            repo = card["key"]["repo"]
+            if not isinstance(repo, str) or not repo:
+                raise TypeError(f"key.repo is {repo!r}")
+            prefixes.add(f"/{repo}/resolve/{pin}/")
+            api_paths.add(f"/api/models/{repo}/revision/{pin}")
+            for f in card["weights"]["files"]:
+                path, hl = f["path"], f["header_len"]
+                if not isinstance(path, str) or not isinstance(hl, int) or isinstance(hl, bool):
+                    raise TypeError(f"file path/header_len {path!r}/{hl!r}")
+                label = f"{_comp(card)} {path}"
+                file_map[_ext_key(f"/{repo}/resolve/{pin}/{path}")] = (label, hl)
+                labels.append(label)
+        except Exception as e:  # noqa: BLE001
+            add(Check(t, f"C10 card[{i}] {_comp(card)} weight files readable", "key.repo + weights.files",
+                      f"error: {type(e).__name__}: {e}", False))
+    endpoint_host = (urlsplit(expected_endpoint).hostname or "").lower()
+
+    def api_exempt(w: dict) -> bool:
+        try:
+            u = urlsplit(w["url"])
+            return (u.hostname or "").lower() == endpoint_host and unquote(u.path) in api_paths
+        except Exception:  # noqa: BLE001
+            return False
+
+    hits: dict[str, int] = {lab: 0 for lab in labels}
+    offenders: list[str] = []
+    n_weight = 0
+    for i, w in enumerate(wire):
+        try:
+            orig, status = w["orig_path"], w["status"]
+        except Exception as e:  # noqa: BLE001
+            offenders.append(f"wire[{i}]: unreadable ({type(e).__name__}: {e})")
+            continue
+        ok2xx = _is_2xx(status)
+        if orig is None:
+            if ok2xx and not api_exempt(w):
+                offenders.append(f"wire[{i}] {w.get('url')} status={status}: 2xx without orig_path")
+            continue
+        try:
+            p = _norm_orig(orig)
+        except Exception as e:  # noqa: BLE001
+            offenders.append(f"wire[{i}] orig_path={orig!r}: {type(e).__name__}: {e}")
+            continue
+        if not any(p.startswith(pre) for pre in prefixes):
+            offenders.append(f"wire[{i}] {p}: not under {sorted(prefixes)}")
+        entry = file_map.get(_ext_key(p))
+        if not (_is_weight_name(p) or entry is not None):
+            continue
+        n_weight += 1
+        if entry is not None and ok2xx:
+            hits[entry[0]] += 1
+
+        def c10(w=w, p=p, entry=entry) -> tuple[Any, bool]:
+            if entry is None:
+                return f"{p} matches no Card weight file at /<repo>/resolve/{pin}/", False
+            rng = w["range"]
+            if rng is None:
+                return "no Range header", False
+            m = _RANGE_RE.fullmatch(str(rng).strip())
+            if not m:
+                return f"unparseable Range {rng!r}", False
+            a, b = int(m.group(1)), int(m.group(2))
+            limit = 8 + entry[1]
+            return f"{rng} (b+1={b + 1}, 8+header_len={limit})", a <= b and b + 1 <= limit
+        add(_run(t, f"C10 {p} [wire {i}] is a Card weight file with Range within header",
+                 "maps to a Card file; Range bytes=a-b with b+1 <= 8+header_len", c10))
+
+    add(_run(t, "C10 every wire record maps to /{repo}/resolve/{pin}/ (2xx needs orig_path)", "no offenders",
+             lambda: (f"offenders={offenders} records={len(wire)}", not offenders and bool(prefixes))))
+    for lab in labels:
+        add(_run(t, f"C10 {lab}: >= 1 2xx wire record", ">= 1", lambda lab=lab: (hits[lab], hits[lab] >= 1)))
+    add(_run(t, "C10 at least one weight-file wire record", ">= 1", lambda: (n_weight, n_weight >= 1)))
     return out
 
 
@@ -350,7 +565,15 @@ def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]:
     t = r.target
     c = lambda: _card(r, None)  # noqa: E731
     eg = lambda: c()["structure"]["expert_groups"][0]  # noqa: E731
-    strip = lambda: next(s for s in _view(r, None)["depth_strips"] if s["prefix"] == "model.layers")  # noqa: E731
+
+    def strips() -> list[dict]:
+        return [s for s in _view(r, None)["depth_strips"] if s["prefix"] == "model.layers"]
+
+    def strip() -> dict:
+        found = strips()
+        if len(found) != 1:
+            raise KeyError(f"{len(found)} depth strips with prefix 'model.layers'")
+        return found[0]
 
     def nonexp_cfg(*keys: str) -> Any:
         return cfg_value(r, None, *keys)
@@ -383,6 +606,7 @@ def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]:
         _eq(t, "E2 expert_group.params_per_expert == 3 x hidden_size x moe_intermediate_size", hidden_x_moe(),
             lambda: eg()["params_per_expert"]),
         _eq(t, "E2 expert_group.homogeneous", True, lambda: eg()["homogeneous"]),
+        _eq(t, "E2 exactly one model.layers depth strip", 1, lambda: len(strips())),
         _eq(t, "E2 depth strip cells", 48, lambda: len(strip()["cells"])),
         _eq(t, "E2 depth strip all moe", True, lambda: all(x["moe"] is True for x in strip()["cells"]) and bool(strip()["cells"])),
         _eq(t, "E2 depth strip all n_experts == 128", True,
@@ -393,6 +617,13 @@ def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]:
         _eq(t, "E2 model_card.license", "apache-2.0", lambda: c()["model_card"]["license"]),
         _eq(t, "E2 model_card.base_model", ["Qwen/Qwen3-30B-A3B-Base"], lambda: c()["model_card"]["base_model"]),
     ]
+
+
+def _expected_str(fn: Callable[[], Any]) -> Any:
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        return f"<unavailable: {type(e).__name__}: {e}>"
 
 
 def _suffix_checks(t: str, prefix: str, card_fn: Callable[[], dict], suffix: str,
@@ -407,13 +638,29 @@ def _suffix_checks(t: str, prefix: str, card_fn: Callable[[], dict], suffix: str
         depths = {s["prefix"]: s["depth"] for s in _stacks_with_suffix(card_fn(), suffix)}
         return depths, any(d == want for d in depths.values())
 
-    try:
-        want_s = expected_depth_fn()
-    except Exception as e:  # noqa: BLE001
-        want_s = f"<unavailable: {type(e).__name__}: {e}>"
     return [
         _run(t, f"{prefix} a stack with prefix suffix {suffix!r} exists", f"some stack ending in {suffix!r}", exists),
-        _run(t, f"{prefix} stack ending in {suffix!r} has expected depth", f"depth == {want_s}", depth),
+        _run(t, f"{prefix} stack ending in {suffix!r} has expected depth",
+             f"depth == {_expected_str(expected_depth_fn)}", depth),
+    ]
+
+
+def _exact_prefix_checks(t: str, prefix: str, card_fn: Callable[[], dict], stack_prefix: str,
+                         expected_depth_fn: Callable[[], Any]) -> list[Check]:
+    """Two Checks: a stack with exactly this prefix exists, and it has the expected depth."""
+    def exists() -> tuple[Any, bool]:
+        prefixes = [s["prefix"] for s in card_fn()["structure"]["stacks"]]
+        return prefixes, stack_prefix in prefixes
+
+    def depth() -> tuple[Any, bool]:
+        want = expected_depth_fn()
+        d = _stack_by_prefix(card_fn(), stack_prefix)["depth"]
+        return d, d == want and type(d) is type(want)
+
+    return [
+        _run(t, f"{prefix} stack with prefix {stack_prefix!r} exists", f"prefix == {stack_prefix!r}", exists),
+        _run(t, f"{prefix} stack {stack_prefix!r} has expected depth",
+             f"depth == {_expected_str(expected_depth_fn)}", depth),
     ]
 
 
@@ -423,14 +670,26 @@ def expect_qwen_image(r: TargetResult) -> list[Check]:
     tr = lambda: _card(r, "transformer")  # noqa: E731
     vae = lambda: _card(r, "vae")  # noqa: E731
 
-    def pipeline_components() -> dict:
-        for card in r.cards:
-            if card.get("pipeline"):
-                return {c["name"]: c["has_weights"] for c in card["pipeline"]["components"]}
-        raise KeyError("no card has a pipeline")
+    def pipeline() -> dict:
+        """The pipeline dict, read once from the first card (consistency is a separate Check)."""
+        cards = _cards(r)
+        if not cards:
+            raise KeyError("no cards")
+        p = cards[0]["pipeline"]
+        if not isinstance(p, dict):
+            raise TypeError(f"pipeline is {type(p).__name__}")
+        return p
 
-    def pipeline_classes() -> set:
-        return {card["pipeline"]["pipeline_class"] for card in r.cards}
+    def pipeline_same() -> tuple[Any, bool]:
+        cards = _cards(r)
+        distinct = []
+        for c in cards:
+            if c["pipeline"] not in distinct:
+                distinct.append(c["pipeline"])
+        return f"{len(distinct)} distinct pipeline dicts over {len(cards)} cards", bool(cards) and len(distinct) == 1
+
+    def pipeline_components() -> dict:
+        return {c["name"]: c["has_weights"] for c in pipeline()["components"]}
 
     def text_depth() -> Any:
         raw = te()["config"]["raw"]
@@ -441,32 +700,38 @@ def expect_qwen_image(r: TargetResult) -> list[Check]:
             return tc["num_hidden_layers"]
         return raw["num_hidden_layers"]
 
+    def te_archs() -> tuple[Any, bool]:
+        a = te()["config"]["architectures"]
+        return a, isinstance(a, list) and "Qwen2_5_VLForConditionalGeneration" in a
+
     out: list[Check] = [
         _eq(t, "E3 number of cards", 3, lambda: len(r.cards)),
-        _eq(t, "E3 components", {"text_encoder", "transformer", "vae"}, lambda: {c["key"]["component"] for c in r.cards}),
-        _eq(t, "E3 pipeline.pipeline_class", {"QwenImagePipeline"}, pipeline_classes),
+        _eq(t, "E3 components", {"text_encoder", "transformer", "vae"},
+            lambda: {c["key"]["component"] for c in _cards(r)}),
+        _run(t, "E3 all cards carry an identical pipeline", "1 distinct pipeline dict", pipeline_same),
+        _eq(t, "E3 pipeline.pipeline_class", "QwenImagePipeline", lambda: pipeline()["pipeline_class"]),
     ]
     for name, want in (("scheduler", False), ("tokenizer", False), ("text_encoder", True),
                        ("transformer", True), ("vae", True)):
         out.append(_eq(t, f"E3 pipeline.components {name}.has_weights", want, lambda name=name: pipeline_components()[name]))
 
-    out.append(_run(t, "E3 text_encoder architectures contain Qwen2_5_VLForConditionalGeneration",
-                    "contains", lambda: (te()["config"]["architectures"],
-                                         "Qwen2_5_VLForConditionalGeneration" in te()["config"]["architectures"])))
+    out.append(_run(t, "E3 text_encoder architectures is a list containing Qwen2_5_VLForConditionalGeneration",
+                    "list containing it", te_archs))
     out += _suffix_checks(t, "E3 text_encoder", te, "layers", text_depth)
     out += _suffix_checks(t, "E3 text_encoder", te, "blocks", lambda: cfg(te(), "vision_config", "depth"))
     out.append(_eq(t, "E3 text_encoder expert_groups", [], lambda: te()["structure"]["expert_groups"]))
 
     out.append(_eq(t, "E3 transformer config.class_name", "QwenImageTransformer2DModel",
                    lambda: tr()["config"]["class_name"]))
-    out += _suffix_checks(t, "E3 transformer", tr, "transformer_blocks", lambda: cfg(tr(), "num_layers"))
+    out += _exact_prefix_checks(t, "E3 transformer", tr, "transformer_blocks", lambda: cfg(tr(), "num_layers"))
 
     out += [
         _eq(t, "E3 vae config.class_name", "AutoencoderKLQwenImage", lambda: vae()["config"]["class_name"]),
         _eq(t, "E3 vae number of weight files", 1, lambda: len(vae()["weights"]["files"])),
         _eq(t, "E3 vae index_path", None, lambda: vae()["weights"]["index_path"]),
-        _eq(t, "E3 all cards same revision_sha", 1, lambda: len({c["key"]["revision_sha"] for c in r.cards})),
-        _eq(t, "E3 all cards model_card.license", {"apache-2.0"}, lambda: {c["model_card"]["license"] for c in r.cards}),
+        _eq(t, "E3 all cards same revision_sha", 1, lambda: len({c["key"]["revision_sha"] for c in _cards(r)})),
+        _eq(t, "E3 all cards model_card.license", {"apache-2.0"},
+            lambda: {c["model_card"]["license"] for c in _cards(r)}),
     ]
     return out
 

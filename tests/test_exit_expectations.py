@@ -148,10 +148,6 @@ def test_empty_result_fails_without_raising():
 # E1..E3 fail, one input per checked field: (builder, fn, mutator, failing name fragment)
 
 
-def _set(path_fn):
-    return path_fn
-
-
 E1_CASES = [
     ("wrong depth", lambda c: c["structure"]["stacks"][0].update(depth=35), "stacks[0].depth"),
     ("depth vs config", lambda c: c["config"]["raw"].update(num_hidden_layers=40), "num_hidden_layers"),
@@ -260,9 +256,9 @@ E3_CASES = [
      "architectures"),
     ("expert groups", "text_encoder", lambda c: c["structure"].update(expert_groups=[{}]), "expert_groups"),
     ("wrong transformer depth", "transformer", lambda c: c["structure"]["stacks"][0].update(depth=59),
-     "transformer stack ending in"),
+     "transformer stack 'transformer_blocks' has expected depth"),
     ("missing num_layers", "transformer", lambda c: c["config"]["raw"].pop("num_layers"),
-     "transformer stack ending in"),
+     "transformer stack 'transformer_blocks' has expected depth"),
     ("wrong transformer class", "transformer", lambda c: c["config"].update(class_name="X"), "transformer config"),
     ("wrong vae class", "vae", lambda c: c["config"].update(class_name="X"), "vae config.class_name"),
     ("vae two files", "vae", lambda c: c["weights"]["files"].append({"path": "b"}), "vae number of weight files"),
@@ -333,6 +329,13 @@ def test_stack_suffix_boundary():
 
 
 HEADER_LEN = 100
+
+
+def _table(component, numels, sha=SHA, repo="o/n"):
+    n = len(numels)
+    table = pa.table({"numel": pa.array(numels, pa.int64()), **{c: pa.nulls(n, pa.float64()) for c in STAT_COLS}})
+    return table.replace_schema_metadata({"schema_version": "card.v0", "repo": repo, "revision_sha": sha,
+                                          "component": "" if component is None else component})
 DATA = 1000
 SIZE = 8 + HEADER_LEN + DATA
 
@@ -342,9 +345,10 @@ def _common(tmp_path: pathlib.Path) -> TargetResult:
               "n_tensors": 2, "metadata": {}}]
     card = _card(None, files=files, n_tensors=2, params_total=15, index_path="model.safetensors.index.json",
                  index_total_size=DATA, tensor_bytes_total=DATA)
-    table = pa.table({"numel": pa.array([5, 10], pa.int64()),
-                      **{c: pa.nulls(2, pa.float64()) for c in STAT_COLS}})
-    jp, pp = tmp_path / "_model.card.json", tmp_path / "_model.tensors.parquet"
+    table = _table(None, [5, 10])
+    base = tmp_path / "o__n" / SHA
+    base.mkdir(parents=True, exist_ok=True)
+    jp, pp = base / "_model.card.json", base / "_model.tensors.parquet"
     jp.write_text("{}")
     pp.write_text("x")
     events = [
@@ -354,8 +358,9 @@ def _common(tmp_path: pathlib.Path) -> TargetResult:
         {"event": "fetch", "bytes_by_class": {"meta": 0, "header": HEADER_LEN, "weight": 0}},
     ]
     wire = [
-        {"method": "GET", "url": "https://huggingface.co/api/models/o/n", "orig_path": "@api/revision",
-         "range": None, "status": 200, "location": None, "body_bytes": 100},
+        # T015 records the Hub API call with orig_path None; C10 exempts exactly this path on the endpoint host
+        {"method": "GET", "url": "https://huggingface.co/api/models/o/n/revision/%s?blobs=true" % SHA,
+         "orig_path": None, "range": None, "status": 200, "location": None, "body_bytes": 100},
         {"method": "GET", "url": "https://cas-bridge.xethub.hf.co/x", "orig_path": "/o/n/resolve/%s/model.safetensors" % SHA,
          "range": "bytes=0-7", "status": 206, "location": None, "body_bytes": 8},
         {"method": "GET", "url": "https://cas-bridge.xethub.hf.co/x", "orig_path": "/o/n/resolve/%s/model.safetensors" % SHA,
@@ -514,3 +519,260 @@ def test_common_checks_never_raise_on_garbage():
     assert checks and _failing(checks)
     assert any(c.actual.startswith("error: ") for c in checks)
     assert all(isinstance(c, Check) for c in checks)
+
+
+# ---------------------------------------------------------------------------
+# review round 1 fixes (each test fails without its fix)
+
+
+@pytest.mark.parametrize("elapsed", [0, 0.0, -5, float("nan"), None, float("inf"), True, "1.0"])
+def test_c1_elapsed_must_be_finite_positive_number(tmp_path, elapsed):
+    r = _common(tmp_path)
+    r.elapsed_s = elapsed
+    assert _fails(common_checks(r, 10.0), "C1 ")
+
+
+def _resolve(path, sha=SHA, repo="o/n"):
+    return f"/{repo}/resolve/{sha}/{path}"
+
+
+def _c10_fails(r):
+    return _fails(common_checks(r, 10.0), "C10 ")
+
+
+@pytest.mark.parametrize("orig", [
+    _resolve("model.safetensors", repo="x/y"),          # wrong repo
+    _resolve("model.safetensors", sha="main"),          # wrong revision
+    _resolve("model.safetensors", sha="b" * 40),        # another pinned revision
+    _resolve("MODEL.safetensors"),                      # only the extension is case-insensitive
+    _resolve("sub/model.safetensors"),                  # suffix match is not a match
+], ids=["wrong-repo", "wrong-revision-main", "wrong-revision-sha", "basename-case", "deeper-path"])
+def test_c10_wire_must_match_repo_pin_and_card_file(tmp_path, orig):
+    r = _common(tmp_path)
+    r.wire[2]["orig_path"] = orig                       # Range is still valid: only the mapping is wrong
+    fails = _c10_fails(r)
+    assert any("Card weight file" in c.name and "matches no Card weight file" in c.actual for c in fails), fails
+
+
+@pytest.mark.parametrize("orig", [_resolve("model.safetensors", repo="x/y"), _resolve("config.json", sha="main")])
+def test_c10_every_record_must_be_under_repo_pin(tmp_path, orig):
+    r = _common(tmp_path)
+    r.wire.append({"method": "GET", "url": "https://huggingface.co" + orig, "orig_path": orig, "range": None,
+                   "status": 200, "location": None, "body_bytes": 0})
+    assert _fails(common_checks(r, 10.0), "C10 every wire record maps")
+
+
+def test_c10_unmapped_redirect_fails(tmp_path):
+    r = _common(tmp_path)
+    r.wire.append({"method": "GET", "url": "https://cas-bridge.xethub.hf.co/opaque", "orig_path": None,
+                   "range": None, "status": 200, "location": None, "body_bytes": 0})
+    fails = _fails(common_checks(r, 10.0), "C10 every wire record maps")
+    assert fails and "2xx without orig_path" in fails[0].actual
+    # a 3xx or 4xx without orig_path carries no file bytes and is not an offender
+    r.wire[-1]["status"] = 404
+    assert not _c10_fails(r)
+
+
+@pytest.mark.parametrize("url", [
+    "https://huggingface.co/api/models/x/y/revision/%s" % SHA,       # API call for another repo
+    "https://huggingface.co/api/models/o/n/revision/main",           # API call for another revision
+    "https://cdn-lfs.hf.co/api/models/o/n/revision/%s" % SHA,        # right path, not the endpoint host
+])
+def test_c10_api_exemption_is_exact(tmp_path, url):
+    r = _common(tmp_path)
+    r.wire[0]["url"] = url
+    assert _fails(common_checks(r, 10.0), "C10 every wire record maps")
+
+
+@pytest.mark.parametrize("orig", [5, b"/o/n/resolve/x/model.safetensors"])
+def test_c10_non_str_orig_path_fails(tmp_path, orig):
+    r = _common(tmp_path)
+    r.wire[2]["orig_path"] = orig
+    assert _fails(common_checks(r, 10.0), "C10 every wire record maps")
+
+
+def test_c10_uppercase_extension_without_range_fails(tmp_path):
+    r = _common(tmp_path)
+    r.wire[2]["orig_path"] = _resolve("model.SAFETENSORS")
+    assert not _c10_fails(r)                            # maps to the Card file: ext compared case-insensitively
+    r.wire[2]["range"] = None
+    fails = _c10_fails(r)
+    assert any(c.actual == "no Range header" for c in fails), fails
+
+
+@pytest.mark.parametrize("name", ["other.SAFETENSORS", "other.SafeTensors", "other.safetensors"])
+def test_c10_unknown_weight_file_any_case_fails(tmp_path, name):
+    r = _common(tmp_path)
+    r.wire[2]["orig_path"] = _resolve(name)             # right repo and pin, valid Range, but not a Card file
+    fails = _c10_fails(r)
+    assert any("matches no Card weight file" in c.actual for c in fails), fails
+
+
+def test_c10_query_string_is_normalised(tmp_path):
+    r = _common(tmp_path)
+    r.wire[2]["orig_path"] = _resolve("model.safetensors") + "?download=true"
+    assert not _c10_fails(r)
+    r.wire[2]["range"] = None
+    fails = _c10_fails(r)
+    assert any(c.actual == "no Range header" for c in fails), fails
+    r.wire[2]["range"] = "bytes=8-200"
+    assert _c10_fails(r)
+
+
+def test_c10_full_url_and_percent_encoding_are_normalised(tmp_path):
+    r = _common(tmp_path)
+    r.cards[0]["weights"]["files"][0]["path"] = "sub dir/model.safetensors"
+    r.wire[1]["orig_path"] = "https://huggingface.co" + _resolve("sub%20dir/model.safetensors")
+    r.wire[2]["orig_path"] = _resolve("sub%20dir/model.safetensors")
+    assert not _c10_fails(r)
+
+
+def test_c10_open_or_reversed_range_fails(tmp_path):
+    for rng in ("bytes=8-", "bytes=50-8", "bytes=0-7,8-107"):
+        r = _common(tmp_path)
+        r.wire[2]["range"] = rng
+        assert _c10_fails(r), rng
+
+
+def test_c10_missing_record_for_a_card_file_fails(tmp_path):
+    r = _common(tmp_path)
+    r.cards[0]["weights"]["files"].append({"path": "model-2.safetensors", "size_bytes": SIZE,
+                                           "header_len": HEADER_LEN, "data_bytes": DATA, "n_tensors": 0,
+                                           "metadata": {}})
+    fails = _fails(common_checks(r, 10.0), "C10 _model model-2.safetensors: >= 1 2xx")
+    assert fails and fails[0].actual == "0"
+    assert not _fails(common_checks(r, 10.0), "C10 _model model.safetensors: >= 1 2xx")
+
+
+def test_c10_only_3xx_for_a_card_file_is_not_enough(tmp_path):
+    r = _common(tmp_path)
+    for w in r.wire[1:]:
+        w["status"] = 302
+    assert _fails(common_checks(r, 10.0), "C10 _model model.safetensors: >= 1 2xx")
+
+
+def test_c10_redirect_records_are_range_checked(tmp_path):
+    r = _common(tmp_path)
+    r.wire.insert(1, {"method": "GET", "url": "https://huggingface.co" + _resolve("model.safetensors"),
+                      "orig_path": _resolve("model.safetensors"), "range": None, "status": 302,
+                      "location": "https://cas-bridge.xethub.hf.co/x", "body_bytes": 0})
+    assert _c10_fails(r)
+
+
+@pytest.mark.parametrize("attr,bad", [(a, b) for a in ("cards", "views", "wire", "tables", "events", "json_paths",
+                                                       "parquet_paths") for b in (None, {}, "x", 3)]
+                         + [("final", None), ("final", []), ("cards", [None]), ("wire", ["x"]),
+                            ("tables", [{}]), ("views", [3]), ("json_paths", [None])])
+def test_common_checks_never_raise_on_wrong_field_types(tmp_path, attr, bad):
+    r = _common(tmp_path)
+    setattr(r, attr, bad)
+    checks = common_checks(r, 10.0)
+    assert all(isinstance(c, Check) for c in checks)
+    assert _fails(checks, f"TYPE field {attr} ")
+
+
+@pytest.mark.parametrize("attr,bad", [("cards", None), ("cards", "x"), ("cards", [None, 3])])
+def test_expectations_never_raise_on_bad_cards(attr, bad):
+    for builder, fn in ((_qwen3_8b, expect_qwen3_8b), (_qwen3_30b, expect_qwen3_30b_a3b), (_image, expect_qwen_image)):
+        r = builder()
+        setattr(r, attr, bad)
+        checks = fn(r)
+        assert checks and _failing(checks)
+
+
+@pytest.mark.parametrize("bad", [None, "x", [None]])
+def test_e2_never_raises_on_bad_views(bad):
+    r = _qwen3_30b()
+    r.views = bad
+    checks = expect_qwen3_30b_a3b(r)
+    assert any(not c.ok and "depth strip" in c.name for c in checks)
+
+
+def _move(r, paths_attr, i, new_path):
+    old = getattr(r, paths_attr)[i]
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    old.rename(new_path)
+    getattr(r, paths_attr)[i] = new_path
+
+
+@pytest.mark.parametrize("which,rel,frag", [
+    ("both", ("o__n", "main"), "C6 path layout"),                         # parent dir is not the pin
+    ("both", ("o_n", SHA), "C6 card[0] _model files at"),                 # wrong repo_slug
+    ("parquet", ("o__n", SHA, "_model.parquet"), "C6 path layout"),       # wrong suffix
+    ("json", ("o__n", SHA, "_model.json"), "C6 path layout"),             # wrong suffix
+    ("parquet", ("o__n", SHA, "other.tensors.parquet"), "C6 path layout"),  # stems differ
+    ("parquet", ("o__n", "x", SHA, "_model.tensors.parquet"), "C6 path layout"),  # same stem, other dir
+    ("both", ("o__n", SHA, "model"), "C6 card[0] _model files at"),       # wrong component_slug
+])
+def test_c6_layout(tmp_path, which, rel, frag):
+    r = _common(tmp_path)
+    if which == "both":
+        stem = rel[2] if len(rel) == 3 else "_model"
+        d = tmp_path.joinpath(*rel[:2])
+        _move(r, "json_paths", 0, d / f"{stem}.card.json")
+        _move(r, "parquet_paths", 0, d / f"{stem}.tensors.parquet")
+    else:
+        _move(r, f"{which}_paths", 0, tmp_path.joinpath(*rel))
+    assert not _fails(common_checks(r, 10.0), "C6 card json and parquet files exist")
+    assert _fails(common_checks(r, 10.0), frag)
+
+
+def test_c7_c9_pair_tables_by_metadata_not_position(tmp_path):
+    r = _common(tmp_path)
+    vae = _card("vae", n_tensors=1, params_total=7)
+    r.cards.append(vae)
+    r.tables = [_table("vae", [7]), r.tables[0]]        # reversed relative to cards
+    checks = common_checks(r, 10.0)
+    assert not _fails(checks, "C7 ") and not _fails(checks, "C9 ")
+
+
+@pytest.mark.parametrize("meta", [None, {"component": "vae", "revision_sha": SHA},
+                                  {"component": "", "revision_sha": "b" * 40}, {"revision_sha": SHA}])
+def test_c7_c9_table_metadata_must_match_card(tmp_path, meta):
+    r = _common(tmp_path)
+    r.tables[0] = r.tables[0].replace_schema_metadata(meta)
+    checks = common_checks(r, 10.0)
+    assert _fails(checks, "C7 card[0] _model parquet rows") and _fails(checks, "C9 ")
+
+
+def test_c7_duplicate_tables_for_one_card_fail(tmp_path):
+    r = _common(tmp_path)
+    r.tables.append(r.tables[0])
+    assert _fails(common_checks(r, 10.0), "C7 card[0] _model parquet rows")
+
+
+def test_e2_exactly_one_model_layers_strip():
+    res = copy.deepcopy(_qwen3_30b())
+    res.views[0]["depth_strips"].append(copy.deepcopy(res.views[0]["depth_strips"][0]))
+    checks = expect_qwen3_30b_a3b(res)
+    assert any(not c.ok and "exactly one model.layers depth strip" in c.name for c in checks)
+
+
+def test_e3_transformer_blocks_prefix_is_exact():
+    res = _image()
+    res.cards[1]["structure"]["stacks"][0]["prefix"] = "foo.transformer_blocks"
+    checks = expect_qwen_image(res)
+    assert any(not c.ok and "stack with prefix 'transformer_blocks' exists" in c.name for c in checks)
+    assert any(not c.ok and "stack 'transformer_blocks' has expected depth" in c.name for c in checks)
+
+
+@pytest.mark.parametrize("archs", ["Qwen2_5_VLForConditionalGeneration", "xQwen2_5_VLForConditionalGenerationx",
+                                   ("Qwen2_5_VLForConditionalGeneration",), None])
+def test_e3_architectures_must_be_a_list(archs):
+    res = _image()
+    res.cards[0]["config"]["architectures"] = archs
+    checks = expect_qwen_image(res)
+    assert any(not c.ok and "text_encoder architectures" in c.name for c in checks)
+
+
+def test_e3_pipeline_identical_across_cards():
+    res = copy.deepcopy(_image())
+    vae = res.cards[2]
+    vae["pipeline"] = copy.deepcopy(vae["pipeline"])    # _image() shares one pipeline dict across cards
+    for comp in vae["pipeline"]["components"]:
+        if comp["name"] == "tokenizer":
+            comp["has_weights"] = True                  # only the vae card's copy differs
+    checks = expect_qwen_image(res)
+    assert any(not c.ok and "identical pipeline" in c.name for c in checks)
+    res.cards[2]["pipeline"] = None
+    assert any(not c.ok and "identical pipeline" in c.name for c in expect_qwen_image(res))
