@@ -48,3 +48,4 @@ T006: >1 non-canonical index with exactly one single file returns the single fil
 - Process: reviewer/implementer probe scripts in the shared scratchpad were overwritten by other agents; future evidence should be self-contained probes with task-specific names, or committed tests.
 - T009 (r3 review): concurrent first-writer window can leave a JSON pointing at a missing Parquet until the next rescan (load fails cleanly). Fix in P4 with a per-key lock or content-addressed store.
 - T010 (review): budget threshold can only trip mid-scan (HEADERS/META) at the HubSource level; the 16 MiB unknown-length reservation means small fixtures trip on the API preflight.
+- T016/C12 (review): older HF revisions may redirect LFS to cdn-lfs*.huggingface.co, which ALLOWED_HOSTS (*.hf.co) does not cover; if E4 hits this, it is a human decision to widen the allowed set.
