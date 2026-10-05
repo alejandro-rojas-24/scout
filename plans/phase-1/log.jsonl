@@ -65,3 +65,4 @@
 {"ts":"2026-10-05T00:45:49Z","agent":"implementer-sonnet","model":"sonnet","step":"ROUTE","task_id":"T013","status":"DONE","note":"7 tests, 293 suite; conservative 400/404 edge choices; review + wave 9 (T012 sonnet, T014 opus) spawned"}
 {"ts":"2026-10-05T00:47:04Z","agent":"implementer-opus","model":"opus","step":"REVIEW","task_id":"T010","status":"DONE","note":"test-only follow-ups done; no scan.py bug found; 40 tests; T010 complete"}
 {"ts":"2026-10-05T00:47:16Z","agent":"implementer-sonnet","model":"sonnet","step":"ROUTE","task_id":"T012","status":"DONE","note":"5 tests; scout --help ok; serve not exercised end-to-end; review spawned"}
+{"ts":"2026-10-05T00:47:28Z","agent":"implementer-sonnet","model":"sonnet","step":"ROUTE","task_id":"T016","status":"DONE","note":"78 tests; granularity/non-vacuity choices made without BLOCKED; review spawned"}
