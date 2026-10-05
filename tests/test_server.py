@@ -147,3 +147,67 @@ def test_static_missing_and_unknown(tmp_path, run_server, monkeypatch):
     assert httpx.get(f"{s.url}/api/scans/unknown").json() == {"error": "not found"}
     assert httpx.get(f"{s.url}/api/scans/unknown").status_code == 404
     assert httpx.post(f"{s.url}/other", json={}).status_code == 404
+
+
+class _SlowTransport(httpx.BaseTransport):
+    def __init__(self, inner):
+        self._inner = inner
+
+    def handle_request(self, request):
+        time.sleep(0.03)
+        return self._inner.handle_request(request)
+
+
+def test_live_log_while_running(tmp_path, monkeypatch):
+    hub = _hub(tmp_path, write_pipeline_repo)
+    clients = []
+
+    def factory():
+        c = httpx.Client(transport=_SlowTransport(hub.transport()), follow_redirects=True)
+        clients.append(c)
+        return c
+
+    loads = []
+    real_load = srv.load_card
+
+    def spy(path):
+        loads.append(path)
+        return real_load(path)
+
+    monkeypatch.setattr(srv, "load_card", spy)
+    server = make_server(port=0, out_dir=tmp_path / "out", client_factory=factory, endpoint=HUB)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        scan_id = _post(url, REPO).json()["scan_id"]
+        seqs, last, saw_running = [], 0, False
+        deadline = time.monotonic() + 20
+        while True:
+            assert time.monotonic() < deadline
+            body = httpx.get(f"{url}/api/scans/{scan_id}", params={"since": last}).json()
+            seqs.extend(e["seq"] for e in body["events"])
+            if body["events"]:
+                last = body["events"][-1]["seq"]
+            if body["status"] == "running":
+                if body["views"] is None and body["elapsed_s"] is not None and seqs:
+                    saw_running = True
+            else:
+                break
+            time.sleep(0.01)
+        assert body["status"] == "done", body["error"]
+        assert saw_running
+        final = httpx.get(f"{url}/api/scans/{scan_id}", params={"since": 0}).json()
+        final_seqs = [e["seq"] for e in final["events"]]
+        assert seqs == list(range(1, len(seqs) + 1))
+        assert seqs == final_seqs
+        assert len(loads) == len(final["views"]) == 3
+        assert len(clients) == 1
+        end = time.monotonic() + 5
+        while not clients[0].is_closed and time.monotonic() < end:
+            time.sleep(0.01)
+        assert clients[0].is_closed
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(5)

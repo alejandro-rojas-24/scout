@@ -53,8 +53,14 @@ class ScoutServer(http.server.ThreadingHTTPServer):
     scans: dict[str, ScanState]
     lock: threading.Lock
 
+    def handle_error(self, request, client_address) -> None:
+        if isinstance(sys.exc_info()[1], ConnectionError) and os.environ.get("SCOUT_HTTP_LOG") != "1":
+            return
+        super().handle_error(request, client_address)
+
 
 def _run_scan(server: ScoutServer, state: ScanState) -> None:
+    client: httpx.Client | None = None
     try:
         client = server.client_factory() if server.client_factory is not None else None
         result = scan(state.target, server.out_dir, state.log, client=client, endpoint=server.endpoint)
@@ -67,6 +73,9 @@ def _run_scan(server: ScoutServer, state: ScanState) -> None:
         if not isinstance(e, Exception):
             raise
         return
+    finally:
+        if client is not None:
+            client.close()
     with server.lock:
         state.views = views
         state.status = "done"
@@ -76,6 +85,7 @@ def _run_scan(server: ScoutServer, state: ScanState) -> None:
 class _Handler(http.server.BaseHTTPRequestHandler):
     server: ScoutServer
     protocol_version = "HTTP/1.1"
+    timeout = 30
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         if os.environ.get("SCOUT_HTTP_LOG") == "1":
