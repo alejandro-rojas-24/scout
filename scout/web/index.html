@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>scout</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     color-scheme: light dark;
@@ -13,6 +14,7 @@
     --muted: #6a6f75;
     --border: #d6d8db;
     --accent: #2f6fb3;
+    --on-accent: #ffffff;
     --ok: #1f8a3b;
     --ok-bg: #e3f4e7;
     --bad: #c62828;
@@ -34,6 +36,7 @@
       --muted: #9aa0a6;
       --border: #363a40;
       --accent: #6aa8e8;
+      --on-accent: #0d1b2a;
       --ok: #5fd07c;
       --ok-bg: #173322;
       --bad: #ff7a7a;
@@ -59,7 +62,7 @@
   #scan-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
   #target { flex: 1 1 320px; min-width: 0; padding: 6px 8px; font: 13px var(--mono); color: var(--fg);
             background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
-  #scan { padding: 6px 16px; font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 4px; cursor: pointer; }
+  #scan { padding: 6px 16px; font: inherit; color: var(--on-accent); background: var(--accent); border: 0; border-radius: 4px; cursor: pointer; }
   #scan:disabled { opacity: .5; cursor: default; }
   #status { font-family: var(--mono); font-size: 13px; color: var(--muted); }
   #status.running { color: var(--accent); }
