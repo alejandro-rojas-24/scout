@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -51,10 +52,6 @@ POLL_INTERVAL_S = 0.1
 SCAN_TIMEOUT_S = 60.0
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _RESOLVE_RE = re.compile(r"^/[^/]+/[^/]+/resolve/[^/]+/.+$")
-
-# TargetResults of the latest run() call (read by main() for the summary's wire hosts).
-LAST_TARGET_RESULTS: list[TargetResult] = []
-
 
 # ---------------------------------------------------------------------------
 # wire evidence
@@ -128,6 +125,46 @@ class CountingTransport(httpx.BaseTransport):
 
     def close(self) -> None:
         self._inner.close()
+
+
+def _env_proxy_for(url: str) -> str | None:
+    """The environment proxy for url (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY), or None if NO_PROXY bypasses it."""
+    parts = urlsplit(url)
+    if urllib.request.proxy_bypass_environment(parts.hostname or ""):
+        return None
+    proxies = urllib.request.getproxies_environment()
+    return proxies.get(parts.scheme) or proxies.get("all") or None
+
+
+class _EnvProxyTransport(httpx.BaseTransport):
+    """Per request host: httpx.HTTPTransport(proxy=<env proxy for that URL, honouring NO_PROXY>).
+
+    Sits UNDER CountingTransport, so wire records always carry the origin URL, never the proxy.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._transports: dict[str | None, httpx.HTTPTransport] = {}
+
+    def _for(self, proxy: str | None) -> httpx.HTTPTransport:
+        with self._lock:
+            t = self._transports.get(proxy)
+            if t is None:
+                t = self._transports[proxy] = httpx.HTTPTransport(proxy=proxy)
+            return t
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._for(_env_proxy_for(str(request.url))).handle_request(request)
+
+    def close(self) -> None:
+        with self._lock:
+            ts, self._transports = list(self._transports.values()), {}
+        for t in ts:
+            t.close()
+
+
+def default_inner_transport() -> httpx.BaseTransport:
+    return _EnvProxyTransport()
 
 
 def _client_for(counting: CountingTransport) -> httpx.Client:
@@ -230,25 +267,35 @@ def _safe_expectation(fn: Callable[[TargetResult], list[Check]], r: TargetResult
         return [Check(r.target, "expectations", "no exception", f"error: {type(e).__name__}: {e}", False)]
 
 
-def run(pins: dict[str, str], out_dir: Path, *, endpoint: str = HF_ENDPOINT_URL,
-        allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
-        inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
-        expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,
-        budget_s: float = BUDGET_S) -> list[Check]:
+def _run_with_results(pins: dict[str, str], out_dir: Path, *, endpoint: str = HF_ENDPOINT_URL,
+                      allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
+                      inner_transport_factory: Callable[[], httpx.BaseTransport] = default_inner_transport,
+                      expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,
+                      budget_s: float = BUDGET_S) -> tuple[list[Check], list[TargetResult]]:
     expectations = DEFAULT_EXPECTATIONS if expectations is None else expectations
     allowed = tuple(allowed_hosts)
-    LAST_TARGET_RESULTS.clear()
     c0 = check_target_set(pins, expectations)
     if not c0.ok:
-        return [c0]
+        return [c0], []
     checks = [c0]
+    results: list[TargetResult] = []
     for repo, sha in pins.items():
         r = _scan_target(repo, sha, Path(out_dir), endpoint=endpoint,
                          inner_transport_factory=inner_transport_factory)
-        LAST_TARGET_RESULTS.append(r)
+        results.append(r)
         checks += common_checks(r, budget_s, allowed_hosts=allowed, expected_endpoint=endpoint)
         checks += _safe_expectation(expectations[repo], r)
-    return checks
+    return checks, results
+
+
+def run(pins: dict[str, str], out_dir: Path, *, endpoint: str = HF_ENDPOINT_URL,
+        allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
+        inner_transport_factory: Callable[[], httpx.BaseTransport] = default_inner_transport,
+        expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,
+        budget_s: float = BUDGET_S) -> list[Check]:
+    return _run_with_results(pins, out_dir, endpoint=endpoint, allowed_hosts=allowed_hosts,
+                             inner_transport_factory=inner_transport_factory, expectations=expectations,
+                             budget_s=budget_s)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = args.out if args.out is not None else Path(tempfile.mkdtemp(prefix="scout-exit-"))
     print(f"cards dir: {out_dir}", file=sys.stderr)
-    checks = run(pins, out_dir, endpoint=HF_ENDPOINT_URL, allowed_hosts=ALLOWED_HOSTS, budget_s=BUDGET_S)
+    checks, results = _run_with_results(pins, out_dir, endpoint=HF_ENDPOINT_URL, allowed_hosts=ALLOWED_HOSTS,
+                                        budget_s=BUDGET_S)
 
     print("target | check | expected | actual | result")
     for c in checks:
@@ -318,12 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     print("EXIT CHECK: PASS" if ok else "EXIT CHECK: FAIL")
 
     hosts = sorted({(urlsplit(w.get("url", "")).hostname or "").lower()
-                    for r in LAST_TARGET_RESULTS for w in r.wire if isinstance(w, dict)} - {""})
+                    for r in results for w in r.wire if isinstance(w, dict)} - {""})
+    proxy = _env_proxy_for(HF_ENDPOINT_URL)
     git_commit, git_dirty = _git_info()
     print(json.dumps({
         "step": "EXIT", "hostname": socket.gethostname(), "pins": pins,
         "passed": sum(1 for c in checks if c.ok), "failed": sum(1 for c in checks if not c.ok),
         "endpoint": HF_ENDPOINT_URL, "budget_s": BUDGET_S, "hosts": hosts,
+        "proxy": (urlsplit(proxy).hostname or proxy) if proxy else None,
         "git_commit": git_commit, "git_dirty": git_dirty,
     }))
     return 0 if ok else 1

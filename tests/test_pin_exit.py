@@ -19,7 +19,7 @@ def _sha(repo: str) -> str:
     return format(abs(hash(repo)) % (16 ** 12), "012x").rjust(40, "0")
 
 
-def _fake(scout=None, git=None, calls=None):
+def _fake(scout=None, git=None, calls=None, insteadof=None):
     """run_cmd returning per-repo SHAs; scout/git map repo -> str (default: the agreeing _sha)."""
     scout = scout or {}
     git = git or {}
@@ -27,6 +27,11 @@ def _fake(scout=None, git=None, calls=None):
     def run_cmd(cmd: list[str]) -> str:
         if calls is not None:
             calls.append(list(cmd))
+        if cmd[:2] == ["git", "config"]:
+            assert cmd[2:] == ["--get-urlmatch", "url.insteadOf", "https://huggingface.co"]
+            if insteadof is None:
+                raise subprocess.CalledProcessError(1, cmd, output="", stderr="")
+            return insteadof + "\n"
         if cmd[0] == "git":
             assert cmd[1:2] == ["ls-remote"] and cmd[3] == "refs/heads/main"
             repo = cmd[2][len(pin_exit.HF_GIT) + 1:]
@@ -54,8 +59,9 @@ def test_agree_writes_pins_and_evidence(pins, capsys):
     line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert line["step"] == "PIN" and isinstance(line["hostname"], str) and line["hostname"]
     assert line["repos"] == {r: {"scout": _sha(r), "git_ls_remote": _sha(r)} for r in REPOS}
+    assert line["git_url_insteadof"] == ""
     # every target was checked by both tools, against the fixed endpoint
-    assert [c[2] for c in calls if c[0] == "git"] == [f"https://huggingface.co/{r}" for r in REPOS]
+    assert [c[2] for c in calls if c[:2] == ["git", "ls-remote"]] == [f"https://huggingface.co/{r}" for r in REPOS]
     assert [c[4] for c in calls if c[0] != "git"] == REPOS
 
 
@@ -120,3 +126,9 @@ def test_default_run_cmd_strips_hf_endpoint(monkeypatch):
     assert pin_exit._default_run_cmd(["echo"]) == "x\n"
     assert "HF_ENDPOINT" not in seen["env"]
     assert seen["check"] is True and seen["capture_output"] is True and seen["text"] is True
+
+
+def test_insteadof_recorded(pins, capsys):
+    rule = "git@mirror.example.com:"
+    assert pin_exit.main(["--pins", str(pins)], run_cmd=_fake(insteadof=rule)) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["git_url_insteadof"] == rule

@@ -7,7 +7,9 @@ and the real T016 common checks, with endpoint=HUB and allowed_hosts={"hub.test"
 from __future__ import annotations
 
 import json
+import math
 import pathlib
+import re
 
 import httpx
 import pytest
@@ -16,7 +18,7 @@ import scout.hub
 from scripts import exit_check as ec
 from scripts.exit_expectations import DEFAULT_EXPECTATIONS, HF_ENDPOINT_URL, Check, common_checks
 from tests.helpers.fakehub import CDN, HUB, FakeHub
-from tests.helpers.st_fixtures import dense_tensors, write_dense_repo, write_sharded
+from tests.helpers.st_fixtures import _nbytes, dense_tensors, moe_tensors, write_dense_repo, write_sharded
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -292,10 +294,11 @@ def test_summary_line(tmp_path, monkeypatch, capsys):
 
     def fake_run(pins, out_dir, **kw):
         seen.update(kw, pins=pins)
-        ec.LAST_TARGET_RESULTS[:] = []
-        return [Check("*", "C0 target set", "x", "x", True), Check("t", "C1 x", "a", "a", True)]
-    monkeypatch.setattr(ec, "run", fake_run)
+        return [Check("*", "C0 target set", "x", "x", True), Check("t", "C1 x", "a", "a", True)], []
+    monkeypatch.setattr(ec, "_run_with_results", fake_run)
     monkeypatch.setattr(ec, "_git_info", lambda: ("deadbeef", False))
+    for k in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co/")   # same endpoint, trailing slash ok
     pins = _valid_pins()
     assert ec.main(["--pins", _write_pins(tmp_path, pins), "--out", str(tmp_path / "o")]) == 0
@@ -305,27 +308,48 @@ def test_summary_line(tmp_path, monkeypatch, capsys):
     assert line["step"] == "EXIT" and line["hostname"] and line["pins"] == pins
     assert line["endpoint"] == HF_ENDPOINT_URL and line["budget_s"] == 10.0
     assert line["hosts"] == [] and line["git_commit"] == "deadbeef" and line["git_dirty"] is False
+    assert line["proxy"] is None
     assert line["passed"] == 2 and line["failed"] == 0
     assert seen["endpoint"] == HF_ENDPOINT_URL and seen["budget_s"] == 10.0
     assert tuple(seen["allowed_hosts"]) == ec.ALLOWED_HOSTS
 
 
+def _main_offline(tmp_path, monkeypatch, hub, pins_hub):
+    """main() with its (fixed-endpoint) run routed to FakeHub, to exercise table + summary on a real run."""
+    real = ec._run_with_results
+
+    def offline(pins, out_dir, **kw):
+        assert kw["endpoint"] == HF_ENDPOINT_URL and kw["budget_s"] == ec.BUDGET_S
+        return real(pins_hub, out_dir, endpoint=HUB, allowed_hosts=OFFLINE_HOSTS,
+                    inner_transport_factory=hub.transport, expectations={k: (lambda r: []) for k in pins_hub})
+    monkeypatch.setattr(ec, "_run_with_results", offline)
+    monkeypatch.setattr(ec, "_git_info", lambda: ("unknown", None))
+    return ec.main(["--pins", _write_pins(tmp_path, _valid_pins()), "--out", str(tmp_path / "o")])
+
+
 def test_summary_fail_and_hosts(tmp_path, monkeypatch, capsys):
     hub, _ = _dense_hub(tmp_path)
-    real_run = ec.run
-
-    def offline_run(pins, out_dir, **kw):
-        # main always passes the fixed values; route the scan to FakeHub to exercise the summary
-        assert kw["endpoint"] == HF_ENDPOINT_URL and kw["budget_s"] == ec.BUDGET_S
-        return real_run({"org/dense": SHA_A}, out_dir, endpoint=HUB, allowed_hosts=OFFLINE_HOSTS,
-                        inner_transport_factory=hub.transport, expectations={"org/dense": lambda r: []})
-    monkeypatch.setattr(ec, "run", offline_run)
-    monkeypatch.setattr(ec, "_git_info", lambda: ("unknown", None))
-    assert ec.main(["--pins", _write_pins(tmp_path, _valid_pins()), "--out", str(tmp_path / "o")]) == 0
+    for k in ("https_proxy", "no_proxy", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    monkeypatch.setenv("NO_PROXY", "")
+    assert _main_offline(tmp_path, monkeypatch, hub, {"org/dense": SHA_A}) == 0
     out = capsys.readouterr().out.strip().splitlines()
     assert any(l.startswith("* | C0 target set |") and l.endswith("| PASS") for l in out)
     line = json.loads(out[-1])
     assert line["hosts"] == ["cdn.test", "hub.test"] and line["git_dirty"] is None
+    assert line["proxy"] == "proxy.test"
+
+
+def test_main_fail_path(tmp_path, monkeypatch, capsys):
+    hub, info = _dense_hub(tmp_path)
+    hub.inject(info["files"][0], "ignore_range")
+    assert _main_offline(tmp_path, monkeypatch, hub, {"org/dense": SHA_A}) == 1
+    out = capsys.readouterr().out.strip().splitlines()
+    assert "EXIT CHECK: FAIL" in out and "EXIT CHECK: PASS" not in out
+    assert any(l.endswith("| FAIL") and "C1 " in l for l in out)
+    line = json.loads(out[-1])
+    assert line["step"] == "EXIT" and line["failed"] > 0 and line["passed"] > 0
 
 
 def test_git_info_failure_is_unknown(monkeypatch):
@@ -366,3 +390,172 @@ def test_counting_transport_is_not_an_event_hook(tmp_path):
     assert not client.event_hooks.get("response")
     assert client.timeout.read == 10.0
     scout.hub.HubSource("o/n", SHA_A, scout.hub.ByteLog(1 << 20), client=client, endpoint=HUB)  # no ValueError
+
+
+# ---------------------------------------------------------------------------
+# C10 from real records: a header read one byte past 8 + header_len
+
+
+def test_header_overread_fails_c10(tmp_path, monkeypatch):
+    hub, _ = _dense_hub(tmp_path)
+    real_get = scout.hub.HubSource._get
+    widened = []
+
+    def wide_get(self, url, *, headers=None, start=None, **kw):
+        rng = (headers or {}).get("Range")
+        if rng and start == 8:  # the header read: bytes=8-(8+header_len-1) -> one byte more
+            a, b = map(int, rng.split("=", 1)[1].split("-"))
+            headers = dict(headers, Range=f"bytes={a}-{b + 1}")
+            widened.append(url)
+        return real_get(self, url, headers=headers, start=start, **kw)
+    monkeypatch.setattr(scout.hub.HubSource, "_get", wide_get)
+    checks = _run(hub, tmp_path, {"org/dense": SHA_A}, {"org/dense": lambda r: []})
+    assert widened
+    c10 = _named(checks, "C10")
+    assert c10 and not all(c.ok for c in c10)
+    assert any(not c.ok and "Range within header" in c.name for c in c10)
+    c11 = _named(checks, "C11")
+    assert len(c11) == 1 and c11[0].ok, c11
+
+
+# ---------------------------------------------------------------------------
+# proxy: HTTPTransport(proxy=<env proxy>) under CountingTransport
+
+
+class _FakeHTTPTransport(httpx.BaseTransport):
+    made: list = []
+
+    def __init__(self, proxy=None, **kw):
+        self.proxy = proxy
+        _FakeHTTPTransport.made.append(self)
+
+    def handle_request(self, request):
+        return httpx.Response(200, content=b"ok", extensions={"via": self.proxy})
+
+
+def _proxy_env(monkeypatch, no_proxy=""):
+    for k in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:3128")
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+    _FakeHTTPTransport.made = []
+    monkeypatch.setattr(ec.httpx, "HTTPTransport", _FakeHTTPTransport)
+
+
+def test_default_transport_uses_env_proxy_and_wire_has_origin_hosts(monkeypatch):
+    _proxy_env(monkeypatch)
+    ct = ec.CountingTransport(ec.default_inner_transport())
+    with ec._client_for(ct) as c:
+        r1 = c.get(f"{HF_ENDPOINT_URL}/api/models/Qwen/Qwen3-8B/revision/{SHA_A}")
+        r2 = c.get(f"https://cas-bridge.xethub.hf.co/xet/{SHA_A}")
+    assert r1.extensions["via"] == r2.extensions["via"] == "http://proxy.test:3128"
+    assert [httpx.URL(w["url"]).host for w in ct.records] == ["huggingface.co", "cas-bridge.xethub.hf.co"]
+    assert all("proxy.test" not in w["url"] for w in ct.records)
+    assert ec.run.__kwdefaults__["inner_transport_factory"] is ec.default_inner_transport
+    assert ec._run_with_results.__kwdefaults__["inner_transport_factory"] is ec.default_inner_transport
+
+
+def test_default_transport_honours_no_proxy(monkeypatch):
+    _proxy_env(monkeypatch, no_proxy="hf.co")
+    ct = ec.CountingTransport(ec.default_inner_transport())
+    with ec._client_for(ct) as c:
+        assert c.get(f"{HF_ENDPOINT_URL}/x").extensions["via"] == "http://proxy.test:3128"
+        assert c.get("https://cdn-lfs.hf.co/x").extensions["via"] is None
+    assert ec._env_proxy_for("https://cdn-lfs.hf.co/x") is None
+    assert ec._env_proxy_for(HF_ENDPOINT_URL) == "http://proxy.test:3128"
+    assert sorted(t.proxy or "" for t in _FakeHTTPTransport.made) == ["", "http://proxy.test:3128"]
+
+
+# ---------------------------------------------------------------------------
+# sparse full-size replicas through the REAL E1/E2 expectations
+
+
+def _write_sparse(path: pathlib.Path, tensors: dict) -> int:
+    header, cur = {}, 0
+    for n, spec in tensors.items():
+        nb = _nbytes(spec)
+        header[n] = {"dtype": spec[0], "shape": list(spec[1]), "data_offsets": [cur, cur + nb]}
+        cur += nb
+    hb = json.dumps(header, separators=(",", ":")).encode()
+    hb += b" " * (-len(hb) % 8)
+    with open(path, "wb") as f:
+        f.write(len(hb).to_bytes(8, "little") + hb)
+        f.truncate(8 + len(hb) + cur)  # sparse: the weight bytes are never written
+    return cur
+
+
+def _sparse_repo(root: pathlib.Path, tensors: dict, config: dict, base_model: str, n_shards: int = 4) -> None:
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "README.md").write_text(f"---\nlicense: apache-2.0\nbase_model:\n- {base_model}\n---\n# x\n")
+    items = list(tensors.items())
+    per = math.ceil(len(items) / n_shards)
+    wm, total = {}, 0
+    for k in range(n_shards):
+        name = f"model-{k + 1:05d}-of-{n_shards:05d}.safetensors"
+        chunk = dict(items[k * per:(k + 1) * per])
+        total += _write_sparse(root / name, chunk)
+        wm.update({t: name for t in chunk})
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": total}, "weight_map": wm}))
+
+
+def _range_cdn(hub: FakeHub):
+    """A CDN that reads only the requested range from disk (sparse multi-GB files are never loaded)."""
+    def cdn(request, segs):
+        sha, path = segs[0], "/".join(segs[1:])
+        for repo in hub._repos.values():
+            if repo.sha == sha and (repo.root / path).is_file():
+                p = repo.root / path
+                break
+        else:
+            return httpx.Response(404)
+        m = re.match(r"^bytes=(\d+)-(\d+)$", request.headers.get("Range") or "")
+        if not m:
+            return httpx.Response(400)
+        size = p.stat().st_size
+        a, b = int(m.group(1)), min(int(m.group(2)), size - 1)
+        with open(p, "rb") as f:
+            f.seek(a)
+            body = f.read(b - a + 1)
+        return httpx.Response(206, headers={"Content-Range": f"bytes {a}-{b}/{size}"}, content=body)
+    return cdn
+
+
+_QWEN3_8B = (
+    dict(n_layers=36, hidden=4096, inter=12288, vocab=151936, heads=32, kv_heads=8, head_dim=128),
+    {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"], "num_hidden_layers": 36, "hidden_size": 4096,
+     "intermediate_size": 12288, "vocab_size": 151936, "num_attention_heads": 32, "num_key_value_heads": 8,
+     "head_dim": 128, "tie_word_embeddings": False},
+    "Qwen/Qwen3-8B-Base",
+)
+_QWEN3_30B = (
+    dict(n_layers=48, n_experts=128, hidden=2048, moe_inter=768, vocab=151936, heads=32, kv_heads=4, head_dim=128),
+    {"model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"], "num_hidden_layers": 48,
+     "hidden_size": 2048, "moe_intermediate_size": 768, "num_experts": 128, "num_experts_per_tok": 8,
+     "vocab_size": 151936, "num_attention_heads": 32, "num_key_value_heads": 4, "head_dim": 128,
+     "tie_word_embeddings": False},
+    "Qwen/Qwen3-30B-A3B-Base",
+)
+
+
+@pytest.mark.parametrize("repo", ["Qwen/Qwen3-8B", "Qwen/Qwen3-30B-A3B"])
+def test_sparse_rehearsal_real_expectations(tmp_path, monkeypatch, repo):
+    kwargs, config, base_model = _QWEN3_8B if repo == "Qwen/Qwen3-8B" else _QWEN3_30B
+    tensors = dense_tensors(**kwargs) if repo == "Qwen/Qwen3-8B" else moe_tensors(**kwargs)
+    sha = "c" * 40
+    root = tmp_path / repo.replace("/", "--")
+    _sparse_repo(root, tensors, config, base_model)
+    hub = FakeHub()
+    hub.add_repo(repo, root, sha=sha, meta_redirect="relative307")
+    monkeypatch.setattr(hub, "_cdn", _range_cdn(hub))
+
+    r = ec._scan_target(repo, sha, tmp_path / "out", endpoint=HUB, inner_transport_factory=hub.transport)
+    assert r.status == "done", r.status
+    checks = (common_checks(r, ec.BUDGET_S, allowed_hosts=OFFLINE_HOSTS, expected_endpoint=HUB)
+              + DEFAULT_EXPECTATIONS[repo](r))
+    failed = [c for c in checks if not c.ok]
+    assert not failed, "\n".join(f"{c.name}: expected {c.expected} actual {c.actual[:200]}" for c in failed)
+    prefix = "E1 " if repo == "Qwen/Qwen3-8B" else "E2 "
+    assert len([c for c in checks if c.name.startswith(prefix)]) >= 15
+    assert r.final["totals"]["weight"] == 0

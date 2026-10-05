@@ -53,6 +53,14 @@ def scout_sha(repo: str, run_cmd: Callable[[list[str]], str]) -> str:
     return run_cmd([sys.executable, "-m", "scout", "resolve", repo]).strip()
 
 
+def git_insteadof(run_cmd: Callable[[list[str]], str]) -> str:
+    """`git config --get-urlmatch url.insteadOf https://huggingface.co` ("" if none: git exits 1)."""
+    try:
+        return run_cmd(["git", "config", "--get-urlmatch", "url.insteadOf", HF_GIT]).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
 def _endpoint_refused() -> str | None:
     value = os.environ.get("HF_ENDPOINT")
     if value and value.removesuffix("/") != HF_ENDPOINT_URL:
@@ -102,8 +110,14 @@ def main(argv: list[str] | None = None, *, run_cmd: Callable[[list[str]], str] |
         pins[repo] = s
         evidence[repo] = {"scout": s, "git_ls_remote": g}
 
+    try:
+        insteadof = git_insteadof(run_cmd)
+    except OSError as exc:
+        print(f"PIN ERROR git config: {type(exc).__name__}: {exc}")
+        return 1
     _write_atomic(args.pins, pins)
-    print(json.dumps({"step": "PIN", "hostname": socket.gethostname(), "repos": evidence}))
+    print(json.dumps({"step": "PIN", "hostname": socket.gethostname(), "repos": evidence,
+                      "git_url_insteadof": insteadof}))
     return 0
 
 

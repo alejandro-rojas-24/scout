@@ -8,7 +8,7 @@ This directory holds the plan-only output of the orchestrator wave (see
 | Phase | Branch | Status |
 |---|---|---|
 | harness | `claude/sleepy-fermat-dmjyu9` | harness + Phase 1 through validation r3 |
-| 1 | `plan/phase-1-architecture-view` | PLANNED (3 revise rounds, approved under directive) |
+| 1 | `plan/phase-1-architecture-view` | PLANNED; IMPLEMENTED on `impl/phase-1-architecture-view` (16/16 tasks reviewed, E0 pass; E1–E5 pending Hub access) |
 | 2 | `plan/phase-2-diff-view` | PLANNED (2 revise rounds, approved under directive) |
 | 3 | `plan/phase-3-analysis-backend` | PLANNED (2 revise rounds, approved under directive; D36 needs human ack) |
 | 4 | `plan/phase-4-infra-attribution` | PLANNED (2 revise rounds, approved under directive) |
