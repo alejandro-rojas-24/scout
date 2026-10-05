@@ -19,6 +19,8 @@
     --ok-bg: #e3f4e7;
     --bad: #c62828;
     --bad-bg: #fbe4e4;
+    --warn: #a35f00;
+    --warn-bg: #fdf0d9;
     --note-bg: #fff6dc;
     --note-border: #e0c060;
     --neutral: #b9bcc0;
@@ -41,6 +43,8 @@
       --ok-bg: #173322;
       --bad: #ff7a7a;
       --bad-bg: #3a1c1c;
+      --warn: #f0b048;
+      --warn-bg: #3a2c12;
       --note-bg: #2e2915;
       --note-border: #7a6626;
       --neutral: #5d6268;
@@ -73,6 +77,7 @@
   .counters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
   .counter { font: 13px var(--mono); padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; }
   #counter-weight.zero { color: var(--ok); background: var(--ok-bg); border-color: var(--ok); font-weight: 600; }
+  #counter-weight.unknown { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); font-weight: 600; }
   #counter-weight.nonzero { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); font-weight: 600; }
   #log { list-style: none; margin: 0; padding: 6px 8px; height: 13rem; overflow: auto; resize: vertical;
          font: 12px/1.5 var(--mono); white-space: pre; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; }
@@ -94,6 +99,8 @@
   .summary { margin: 10px 0 0; font-family: var(--mono); font-size: 13px; }
   .summary .zero { color: var(--ok); font-weight: 600; }
   .summary .nonzero { color: var(--bad); font-weight: 600; }
+  .summary .unknown { color: var(--warn); font-weight: 600; }
+  .disclaimers li.missing { color: var(--bad); font-weight: 600; }
   .muted { color: var(--muted); }
 
   .strip { margin: 6px 0 10px; }

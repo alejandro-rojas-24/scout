@@ -47,8 +47,18 @@
   }
 
   // Exact byte count with thousands separators: "0 B", "12,345 B".
+  // A missing or non-numeric count is unknown ("? B"), never silently 0.
   function fmtBytes(n) {
-    return String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ",") + " B";
+    if (!isKnown(n)) return "? B";
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",") + " B";
+  }
+
+  function isKnown(n) { return typeof n === "number" && Number.isFinite(n); }
+
+  // "zero" only for exactly 0, "nonzero" for > 0, "unknown" otherwise.
+  function byteClass(n) {
+    if (!isKnown(n)) return "unknown";
+    return n === 0 ? "zero" : "nonzero";
   }
 
   // Parameter count in human units (K/M/B, 2 decimals); below 1000 it is shown as-is.
@@ -84,7 +94,7 @@
     el.meta.textContent = "meta " + fmtBytes(t.meta);
     el.header.textContent = "header " + fmtBytes(t.header);
     el.weight.textContent = "weight " + fmtBytes(t.weight);
-    el.weight.className = "counter " + (t.weight > 0 ? "nonzero" : "zero");
+    el.weight.className = "counter " + byteClass(t.weight);
   }
 
   function appendEvents(events) {
@@ -173,7 +183,9 @@
 
     // a0. disclaimers: always visible at the top of every view section (invariant 5)
     const notes = h("ul", { class: "disclaimers", role: "note", "aria-label": "disclaimers" });
-    for (const d of v.disclaimers || []) notes.appendChild(h("li", null, d));
+    const ds = Array.isArray(v.disclaimers) ? v.disclaimers : [];
+    for (const d of ds) notes.appendChild(h("li", null, d));
+    if (ds.length !== 3) notes.appendChild(h("li", { class: "missing" }, "disclaimers missing from view"));
     sec.appendChild(notes);
 
     // a. title + claims
@@ -186,7 +198,7 @@
     p.appendChild(document.createTextNode(
       "params " + fmtParams(sm.params_total) + " · tensors " + sm.n_tensors + " · stacks " + sm.n_stacks +
       " · expert groups " + sm.n_expert_groups + " · "));
-    p.appendChild(h("span", { class: sm.weight_bytes_read > 0 ? "nonzero" : "zero" }, "weight " + fmtBytes(sm.weight_bytes_read)));
+    p.appendChild(h("span", { class: byteClass(sm.weight_bytes_read) }, "weight " + fmtBytes(sm.weight_bytes_read)));
     p.appendChild(document.createTextNode(
       " read · header " + fmtBytes(sm.header_bytes_read) + " · meta " + fmtBytes(sm.meta_bytes_read)));
     sec.appendChild(p);

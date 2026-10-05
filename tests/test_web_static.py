@@ -32,6 +32,8 @@ def test_no_external_urls(name, text):
     stripped = text.replace(SVG_NS, "")
     assert "http://" not in stripped, name
     assert "https://" not in stripped, name
+    for frag in ('"//', "'//", "(//", "@import"):
+        assert frag not in stripped, (name, frag)
 
 
 def test_app_has_no_inner_html():

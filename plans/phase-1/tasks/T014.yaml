@@ -66,3 +66,6 @@ decisions:
   - "index.html includes <link rel='icon' href='data:,'> so the browser does not request /favicon.ico (which would 404 in the console). This is not an external URL."
   - "Static test extras beyond the spec (cheap guards): app.js also has no outerHTML/insertAdjacentHTML, no import/require; index.html loads app.js and contains prefers-color-scheme; GET / returns text/html containing id='cards'."
   - "Manual check done via Playwright (Chromium headless) against scout.server.make_server on 127.0.0.1 with st_fixtures dense/moe/pipeline dirs. Screenshots are in plans/phase-1/screens/T014-*.png. The log.jsonl note asked for in acceptance.manual is left to the orchestrator because log.jsonl is not in this task's files."
+  - "Review follow-up: a missing or non-numeric byte total renders as '? B'. The weight counter and summary span get class 'unknown' (amber --warn). 'zero' (green) is used only for === 0 and 'nonzero' (red) for > 0."
+  - "Review follow-up: if view.disclaimers is not an array of exactly 3 entries, the note block gets an extra red item 'disclaimers missing from view'."
+  - "Review follow-up: test_no_external_urls also rejects '\"//', \"'//\", '(//' and '@import' (protocol-relative URLs and CSS imports)."
