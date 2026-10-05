@@ -66,3 +66,4 @@
 {"ts":"2026-10-05T00:47:04Z","agent":"implementer-opus","model":"opus","step":"REVIEW","task_id":"T010","status":"DONE","note":"test-only follow-ups done; no scan.py bug found; 40 tests; T010 complete"}
 {"ts":"2026-10-05T00:47:16Z","agent":"implementer-sonnet","model":"sonnet","step":"ROUTE","task_id":"T012","status":"DONE","note":"5 tests; scout --help ok; serve not exercised end-to-end; review spawned"}
 {"ts":"2026-10-05T00:47:28Z","agent":"implementer-sonnet","model":"sonnet","step":"ROUTE","task_id":"T016","status":"DONE","note":"78 tests; granularity/non-vacuity choices made without BLOCKED; review spawned"}
+{"ts":"2026-10-05T00:47:39Z","agent":"reviewer","model":"opus","step":"REVIEW","task_id":"T011","status":"PASS","note":"re-review PASS with mutation testing; recommended: view uses structure._is_index (len<=9) so view never disagrees with Card; sent to implementer"}
