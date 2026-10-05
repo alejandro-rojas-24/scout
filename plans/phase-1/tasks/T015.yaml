@@ -1,5 +1,5 @@
 id: T015
-title: Exit check runner (C0 target set, CountingTransport), pin script with git ls-remote cross-check, pins file, network test
+title: Exit check runner (C0 target set, per-target server + CountingTransport), pin script with git ls-remote cross-check, pins file, network test
 depends_on: [T012, T013, T016]
 files:
   - scripts/exit_check.py
@@ -18,14 +18,22 @@ interface: |
         def __init__(self, inner: httpx.BaseTransport) -> None
         records: list[dict]     # {method,url,orig_path,range,status,location,body_bytes}; guarded by a lock
         def handle_request(self, request: httpx.Request) -> httpx.Response
-    def run(pins: dict[str, str], out_dir: Path, *, endpoint: str | None = None,
+    BUDGET_S: float = 10.0                     # fixed; not configurable from the CLI
+    def run(pins: dict[str, str], out_dir: Path, *, endpoint: str = HF_ENDPOINT_URL,
+            allowed_hosts: Iterable[str] = ALLOWED_HOSTS,       # offline tests pass {"hub.test", "cdn.test"}
             inner_transport_factory: Callable[[], httpx.BaseTransport] = httpx.HTTPTransport,
             expectations: dict[str, Callable[[TargetResult], list[Check]]] | None = None,   # default DEFAULT_EXPECTATIONS
-            budget_s: float = 10.0) -> list[Check]
+            budget_s: float = BUDGET_S) -> list[Check]      # budget_s/endpoint/allowed_hosts overridable only by offline tests
+    def _client_for(counting: CountingTransport) -> httpx.Client
+        # httpx.Client(transport=counting, timeout=10.0)
+    def _scan_target(repo: str, sha: str, out_dir: Path, *, endpoint: str,
+                     inner_transport_factory: Callable[[], httpx.BaseTransport]) -> TargetResult
+        # builds a fresh CountingTransport + its own make_server(client_factory=partial(_client_for, counting)),
+        # scans one target, shuts the server down, and returns the TargetResult with wire = counting.records
     def check_target_set(pins: dict[str, str], expectations: dict) -> Check
         # Check(target="*", name="C0 target set", expected=sorted(expectations), actual=sorted(pins), ok=set(pins)==set(expectations))
     def main(argv: list[str] | None = None) -> int
-      # flags: --pins PATH (default <repo>/exit/pins.json), --out DIR (default: tempfile.mkdtemp()), --budget-s FLOAT (default 10.0)
+      # flags: --pins PATH (default <repo>/exit/pins.json), --out DIR (default: tempfile.mkdtemp()). No endpoint or budget flags.
   scripts/pin_exit.py:
     HF_GIT = "https://huggingface.co"
     def git_main_sha(repo: str, run_cmd: Callable[[list[str]], str]) -> str
@@ -49,18 +57,28 @@ behavior: |
        - otherwise, if this URL equals a Location seen in an earlier 3xx record -> that record's orig_path;
        - else None.
      location = the resolved absolute Location header for 3xx, else None. range = request.headers.get("range").
-  2. run: one CountingTransport per target, created from inner_transport_factory(). client_factory = lambda:
-     httpx.Client(transport=counting, timeout=10.0). make_server(port=0, out_dir=out_dir, endpoint=endpoint,
-     client_factory=client_factory) runs in a daemon thread. Per (repo, sha) in pins order: target f"{repo}@{sha}";
+  2. run: targets are scanned STRICTLY SEQUENTIALLY. Each target gets its OWN server and its OWN fresh CountingTransport,
+     via _scan_target (see interface). For each (repo, sha) in pins order:
+       - counting = CountingTransport(inner_transport_factory())
+       - client_factory = functools.partial(_client_for, counting). This binds the transport at creation time, with no
+         shared holder and no closure over a loop variable.
+       - server = make_server(port=0, out_dir=out_dir, endpoint=endpoint, client_factory=client_factory), run in a daemon
+         thread
+       - target = f"{repo}@{sha}"
+     After the scan reaches done or error and the results are collected, call server.shutdown() and server.server_close()
+     and join the server thread, in a finally block (so it also runs on timeout or exception), BEFORE the next target's
+     CountingTransport or server is created. Scans never overlap. TargetResult.wire = counting.records of that target only.
      t0 = monotonic; POST /api/scans; poll every 0.1 s until done/error or 60 s; elapsed = monotonic - t0. The control
      requests to the local server use a separate plain httpx.Client (not counted). Then GET with since=0 for all events,
      load the cards under out_dir/repo_slug(repo)/sha/ via load_card, build a TargetResult (T016) with wire = counting.records,
-     and extend checks with common_checks(r, budget_s) + expectations[repo](r).
-     Shut the server down at the end.
+     and extend checks with common_checks(r, budget_s, allowed_hosts=allowed_hosts, expected_endpoint=endpoint) + expectations[repo](r).
+     Each per-target server is shut down inside _scan_target.
   2a. run() FIRST computes c0 = check_target_set(pins, expectations). If not c0.ok it returns [c0] immediately: no server,
      no scans. Otherwise the result list starts with c0. There is no code path that scans a repo without an expectation
      function.
-  3. main: load pins. c0 = check_target_set(pins, DEFAULT_EXPECTATIONS). If not ok: print the C0 row and
+  3. main: if os.environ.get("HF_ENDPOINT") is set and != HF_ENDPOINT_URL (ignoring one trailing "/"): print
+     f"HF_ENDPOINT={value} is not allowed for the exit check" and return 1. main always calls run(endpoint=HF_ENDPOINT_URL,
+     allowed_hosts=ALLOWED_HOSTS, budget_s=BUDGET_S). Load pins. c0 = check_target_set(pins, DEFAULT_EXPECTATIONS). If not ok: print the C0 row and
      "EXIT CHECK: FAIL (target set must be exactly: ...)", then return 1. Then, if any pin value does not match ^[0-9a-f]{40}$, print "pins not set: run `scout resolve <repo>` and commit
      exit/pins.json" and return 2. Otherwise print a table with one row per Check: target | check | expected | actual |
      PASS/FAIL, then "EXIT CHECK: PASS" iff all ok, else "EXIT CHECK: FAIL"; return 0 iff all ok. When run as a file,
@@ -68,18 +86,30 @@ behavior: |
   3a. pin_exit.main: for each target in sorted(DEFAULT_EXPECTATIONS): s = scout_sha(repo), g = git_main_sha(repo). If
      either is not 40-hex, or s != g: print f"PIN MISMATCH {repo}: scout={s} git_ls_remote={g}" and return 1 WITHOUT
      writing the pins file (and a failing run_cmd, e.g. CalledProcessError, also returns 1 without writing). Otherwise
-     write {repo: s} (json indent=2, sorted keys) atomically, then print one JSON line {"step":"PIN","hostname":
+     write {repo: s} (json indent=2, sorted keys) atomically. scout_sha runs the subprocess with env = os.environ minus
+     HF_ENDPOINT, and pin_exit.main returns 1 up front if HF_ENDPOINT is set to anything other than HF_ENDPOINT_URL.
+     After writing, print one JSON line {"step":"PIN","hostname":
      socket.gethostname(),"repos":{repo:{"scout":s,"git_ls_remote":g}}} and return 0.
   4. After a real run, the operator appends to plans/phase-1/log.jsonl a line with step "EXIT", the pins, hostname and the
-     full stdout (plan.md §2 phase status rule). The script prints a one-line JSON summary {"hostname","pins","passed","failed"}
-     as its last stdout line to make that easy.
+     full stdout (plan.md §2 phase status rule). The script prints a one-line JSON summary as its last stdout line:
+     {"step":"EXIT","hostname","pins","passed","failed","endpoint": HF_ENDPOINT_URL,"budget_s": BUDGET_S,
+      "hosts": sorted distinct wire hosts across all targets,
+      "git_commit": `git rev-parse HEAD` output or "unknown", "git_dirty": bool(`git status --porcelain` output) or null}
+     (git is run via subprocess in the repo root; failure yields "unknown"/null, never an exception).
+     The hostname must equal the hostname of the PIN line in log.jsonl; if not, the run is invalid and is repeated on the
+     pinning host (plan.md §2).
 acceptance:
   tests:
     - "tests/test_exit_check_offline.py uses FakeHub: inner_transport_factory=hub.transport, endpoint=HUB"
-    - "test_offline_pass: pins={'org/dense': 'a'*40} on a write_dense_repo(n_shards=2) FakeHub repo added with meta_redirect='relative307', expectations={'org/dense': lambda r: []} -> C0 and every common Check (C1..C11) ok; C10 saw >= 2 safetensors records via the absolute-Location mapping; C11 includes the 18-byte relative-307 bodies"
+    - "test_offline_pass: pins={'org/dense': 'a'*40} on a write_dense_repo(n_shards=2) FakeHub repo added with meta_redirect='relative307', endpoint=HUB, allowed_hosts={'hub.test','cdn.test'}, expectations={'org/dense': lambda r: []} -> C0 and every common Check (C1..C12) ok; C10 saw >= 2 safetensors records via the absolute-Location mapping; C11 includes the 18-byte relative-307 bodies"
     - "test_target_set_missing: main(['--pins', <file with only 2 of the 3 required repos, 40-hex values>]) == 1; output contains 'C0 target set'; no server started (monkeypatch make_server to raise if called)"
     - "test_target_set_extra: main with the 3 required repos plus 'stabilityai/stable-diffusion-xl-base-1.0' -> 1"
     - "test_target_set_renamed: main with 'Qwen/Qwen3-8b' (wrong case) instead of 'Qwen/Qwen3-8B' -> 1"
+    - "test_endpoint_env_refused: monkeypatch HF_ENDPOINT='https://mirror.example.com' -> main([...valid 3-repo pins...]) == 1 and no server started"
+    - "test_no_budget_flag: main(['--budget-s','60']) exits with argparse error code 2"
+    - "test_c12_disallowed_host: offline run with allowed_hosts={'hub.test'} only (cdn.test missing) -> C12 not ok"
+    - "test_summary_line: the last stdout line of a (monkeypatched run) main parses as JSON with keys endpoint, budget_s == 10.0, hosts, git_commit, git_dirty, hostname"
+    - "test_transport_per_target: pins with two FakeHub repos 'org/a' and 'org/b' (distinct file names, expectations for both) -> no wire record of target A (any URL containing '/org/a/' or an orig_path of org/a's files) appears in target B's TargetResult.wire and vice versa; the two CountingTransport instances are distinct objects; make_server was called exactly twice (spy) with distinct client_factory objects, and the first server's shutdown() was called before the second make_server call"
     - "test_run_c0: run(pins={'org/a':'a'*40}, expectations={'org/b': ...}) returns exactly one Check, C0, not ok"
     - "tests/test_pin_exit.py: with a fake run_cmd: (1) scout and git agree -> 0, pins file written with the 3 required repos, JSON evidence line printed; (2) they disagree for one repo -> 1 and the pins file is unchanged; (3) git returns an empty string -> 1; (4) run_cmd raises CalledProcessError -> 1, file unchanged"
     - "test_unlogged_read_fails_c11: monkeypatch scout.hub.HubSource.read_file to also do an unlogged self.client.get(<the config.json resolve url>) and read its body -> C11 not ok, everything else still runs"
@@ -96,5 +126,23 @@ out_of_scope:
   - browser automation (E5 is a manual check)
   - expectation logic (T016)
   - any fallback target or flag to select alternative expectations (replacing a target is a human decision + plan revision)
-decisions: []
+decisions:
+  - "D1 orig_path (coordinator, from the T016 review): orig_path is the FULL unquoted URL path of the originating resolve request, /{owner}/{name}/resolve/{sha}/{file} (unquote(urlsplit(url).path), query dropped), never the bare file name. Redirect hops inherit it through a map from each 3xx record's resolved absolute Location (request.url.join(Location)) to its orig_path, so chains (resolve -> CDN/Xet -> ...) and relative Locations (FakeHub relative307) map back. The Hub API call /api/models/{repo}/revision/{pin} keeps orig_path None. test_c10_passes_on_real_counting_records feeds real CountingTransport records from a FakeHub run through T016 common_checks and asserts that every C10 Check passes. It also asserts that bare file-name orig_paths would fail C10."
+  - "D2 CountingTransport is a transport wrapper (httpx.BaseTransport), not an event hook. It returns a new httpx.Response whose stream is a SyncByteStream wrapper, which counts chunks as the client pulls them. close() is forwarded to the inner stream, and CountingTransport.close() closes the inner transport. HubSource accepts the client (no response hooks; test_counting_transport_is_not_an_event_hook)."
+  - "D3 The record is appended (under the lock) BEFORE the inner transport is called. A transport exception therefore leaves a record with status None and body_bytes 0, and the exception propagates. C12 still sees the attempted host, and T016's fail-closed _is_2xx treats the None status as 2xx."
+  - "D4 _scan_target wire = counting.snapshot(), a copy of the records taken under the lock after the server shuts down. A scan thread left running after a timeout cannot mutate the TargetResult later."
+  - "D5 (amended per orchestrator follow-up 5) Results handoff: no module global. _run_with_results(pins, out_dir, **same kwargs as run) -> (checks, results) does the work. run() is a thin wrapper that returns [0], so its interface is unchanged. main() calls _run_with_results and takes the summary's sorted distinct wire hosts from the returned TargetResults."
+  - "D6 Polling: each poll uses since=<last seen seq> (since is a seq, not an index). The clock stops when status == 'error', or when status == 'done' and views is not None. After 60 s the status becomes 'timeout after 60 s (...)'. Collection afterwards pages since=0 -> since=last seq until a poll returns no events (POLL_EVENTS_MAX). final = that last (empty-page) GET response. It carries the same status/totals/views."
+  - "D7 Exceptions in the control path (POST not 202, malformed JSON, connection errors) are caught inside _scan_target. They become status 'runner error: <Type>: <msg>' (C1 FAIL), and the run continues with the next target. Server shutdown/server_close/join always run in finally. The server thread starts before the try, so shutdown() can never block on a serve_forever that never ran. The control client is a separate httpx.Client(trust_env=False), so env proxies never touch the 127.0.0.1 traffic. Overlap note (follow-up 6): server.shutdown() stops the HTTP server, not a running daemon scan thread. If a target hits the 60 s SCAN_TIMEOUT_S, its scan can keep running while the next target scans. That target already has a C1 FAIL (the phase stays open), and each target has its own CountingTransport and server, so its wire records never leak into the next target. Scans can therefore overlap only after a C1 FAIL."
+  - "D8 Cards are loaded from out_dir/repo_slug(repo)/sha/*.card.json (sorted), using scout.card.load_card and repo_slug. parquet path = json dir / card['tensors_parquet']. If a card fails to load, its json path is still listed and the card is skipped, so C6's equal-count check fails (fail closed). An exception raised by an expectation function becomes one failing 'expectations' Check."
+  - "D9 main ordering: argparse (errors exit 2; there is no --budget-s or --endpoint) -> HF_ENDPOINT check (an exact match, ignoring one trailing '/', is allowed) -> load pins (unreadable or not a str->str object: message + return 1) -> C0 -> 40-hex check (return 2). The JSON summary line is printed only when run() actually ran, i.e. not on the C0/endpoint/unpinned early exits, which run no scans and produce no evidence. The table has a header row 'target | check | expected | actual | result'. --out defaults to tempfile.mkdtemp(prefix='scout-exit-'), and its path is printed to stderr so stdout stays table + verdict + JSON."
+  - "D10 _git_info runs `git rev-parse HEAD` and `git status --porcelain` with cwd=ROOT and a 30 s timeout. An exception or non-zero exit yields 'unknown' / None. The tests monkeypatch subprocess.run, so the suite never invokes git."
+  - "D11 pin_exit: the default run_cmd is subprocess.run(check=True, capture_output=True, text=True, cwd=ROOT, env=os.environ minus HF_ENDPOINT, plus GIT_TERMINAL_PROMPT=0) for both commands. cwd=ROOT lets `python -m scout` import without an install. GIT_TERMINAL_PROMPT=0 makes a gated or missing repo fail instead of prompting. CalledProcessError and OSError -> 'PIN ERROR ...' + return 1, and nothing is written. SHAs are checked with re.fullmatch. git_main_sha returns '' on empty output. The pins file is written via mkstemp in the same dir + os.replace (indent=2, sort_keys, trailing newline). exit/pins.json is committed in that same format with the three UNPINNED values."
+  - "D12 (amended per orchestrator follow-up 1) Proxy: the default inner_transport_factory is now default_inner_transport() (not bare httpx.HTTPTransport, which ignores proxy env when passed as a transport). It returns _EnvProxyTransport, which picks per request URL an httpx.HTTPTransport(proxy=_env_proxy_for(url)), cached per proxy value. _env_proxy_for uses urllib.request.getproxies_environment() (scheme proxy, else all_proxy; lowercase vars win, as in urllib) and returns None when urllib.request.proxy_bypass_environment(host) is true (NO_PROXY), so NO_PROXY is honoured per host (huggingface.co vs *.hf.co). It sits UNDER CountingTransport, so wire records carry origin URLs and C12 checks origin hosts, never the proxy. The EXIT summary line gains 'proxy': the proxy hostname used for https://huggingface.co, or null. Tests: test_default_transport_uses_env_proxy_and_wire_has_origin_hosts and test_default_transport_honours_no_proxy (fake HTTPTransport), plus test_summary_fail_and_hosts (proxy == 'proxy.test'). The reviewer probe t015_probe_proxy.py in this container gets ProxyError 403 from the egress proxy (plan D3), and the record still shows host huggingface.co."
+  - "D13 Offline rehearsal coverage beyond the listed acceptance: test_summary_fail_and_hosts (a real FakeHub run through main's summary path; hosts == ['cdn.test','hub.test']), test_counting_transport_counts_consumed_bytes_only, test_committed_pins_file_is_unpinned, pin_exit HF_ENDPOINT / default-run_cmd env tests."
+  - "D14 (follow-up 2) Sparse rehearsal: test_sparse_rehearsal_real_expectations[Qwen/Qwen3-8B, Qwen/Qwen3-30B-A3B] builds full-size header-only replicas: a real safetensors header is written, then the file is truncated to full size (sparse), in 4 shards with an index. A per-instance FakeHub _cdn replacement serves only the requested Range from disk (fakehub.py itself is untouched). Each repo runs through _scan_target, then common_checks + the REAL DEFAULT_EXPECTATIONS E1/E2, and the test asserts 0 failures. Both run in about 2.5 s together, so both are kept. Qwen-Image (E3) is not rehearsed: it needs a diffusers pipeline replica, which is out of scope here."
+  - "D15 (follow-up 3) test_main_fail_path runs main() on a real failing FakeHub run (ignore_range on a shard, routed through a monkeypatched _run_with_results that keeps main's fixed endpoint/budget asserts). It asserts rc 1, 'EXIT CHECK: FAIL', a C1 FAIL row, and a final JSON line with failed > 0."
+  - "D16 (follow-up 4) test_header_overread_fails_c10 monkeypatches HubSource._get so the header read (Range request at start == 8) asks for one byte past 8+header_len. A patch at read_range level would instead be refused by ByteLog.preflight (weight byte) before any request, leaving no wire evidence. The over-long 206 body is logged by HubSource ('cap exceeded') and the scan errors. The test asserts the Range-within-header C10 check fails and C11 (wire bytes == ByteLog bytes) still passes."
+  - "D17 (follow-up 6) pin_exit adds 'git_url_insteadof' to the PIN evidence line: the stripped output of run_cmd(['git','config','--get-urlmatch','url.insteadOf','https://huggingface.co']). It is '' when git exits 1 (no rule, CalledProcessError). An OSError -> PIN ERROR, return 1, nothing written. It runs after all pins agree and before the file is written. Test: test_insteadof_recorded."
 invariants_touched: [1, 2, 6]
+

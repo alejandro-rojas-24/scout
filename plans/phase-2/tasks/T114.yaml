@@ -1,0 +1,67 @@
+id: T114
+title: Frontend - scan options, download-gate panel, diff panel (reference picker, suggestions, aligned strips coloured by r)
+depends_on: [T014, T113]
+files:
+  - scout/web/index.html
+  - scout/web/app.js
+  - scout/web/diff.js
+  - tests/test_web_static_p2.py
+route: opus
+spec_complete: false      # visual layout choices are left to the implementer; record them in decisions
+interface: |
+  index.html (P1 ids kept) adds these required ids:
+    #opt-sample (checkbox), #opt-tokenizer (checkbox), #gate (panel, hidden unless awaiting), #gate-summary,
+    #gate-files (table), #gate-confirm (button), #gate-decline (button),
+    #diff (section), #diff-ref (select), #diff-subj (select), #diff-suggest (button), #diff-run (button),
+    #diff-suggestions (list), #diff-out (container)
+    and loads <script src="/diff.js"></script> after app.js.
+  app.js: POST /api/scans sends {"target", "sample": #opt-sample.checked, "tokenizer": #opt-tokenizer.checked};
+    handles status "awaiting_confirmation"; POST /api/scans/{id}/confirm and /decline.
+  diff.js: plain ES2020 IIFE, no imports, no external URLs; GET /api/cards, GET /api/suggest, POST /api/diff.
+behavior: |
+  1. Gate panel (app.js): when a poll returns status "awaiting_confirmation" with a plan, show #gate with:
+     - the repo@sha12, the plan_id and the reason
+     - bytes planned (exact, with thousands separators, plus MiB with 1 decimal), the hard cap incl. retries, "disk 0 B",
+       memory peak, the threshold and the read count
+     - a per-file table
+     - the skipped units
+     The confirm button's label includes the exact bytes_cap. On click it POSTs {plan_id, bytes_confirmed: plan.bytes_cap}
+     (the server accepts only the exact cap of the displayed plan);
+     decline POSTs /decline. The panel hides once the status leaves awaiting_confirmation. The weight counter keeps its
+     P1 behaviour: it stays "weight 0 B" green until confirmation, then shows the bytes read. When the value is > 0 it
+     uses a neutral (not red) class "weight-gated" if gate[0].approved is true, and red "nonzero" otherwise.
+  2. Diff panel (diff.js): on load and after every scan reaches done, refresh GET /api/cards into both selects (label =
+     title + badges "σ" if has_sigma, "tok" if has_tokenizer). "Suggest" -> GET /api/suggest for the subject; render up to
+     5 rows (title, score, tokenizer J, config score, "claimed base" badge) followed by the result's 3 disclaimers
+     (invariant 5); clicking a row sets #diff-ref. "Diff" -> POST
+     /api/diff and render into #diff-out:
+     a. the header: the reference and subject titles; per stack pair the kind, mode, and "location unresolved" in amber when
+        location_resolved is false; the median r and n_with_r/n_layers; an "in-run null" line with q10_r, offdiag_median_r,
+        diag_top1_frac, z_shift (vs cyclic-shift null) and the participation ratios (numbers only, no pass/fail wording);
+        the tokenizer J; config mismatches
+     b. an SVG with the reference strip on top (reference_depth cells) and the subject strip below (subject_depth cells), and
+        one line per subject layer from its cell to the reference cell reference_index; jump lines dashed; reldepth lines
+        dotted and grey
+     c. subject cells filled by r on a fixed diverging scale over [-1, 1] (for example blue -> neutral grey at 0 -> orange),
+        grey hatched when r is null; a <title> tooltip with subject_index, reference_index, op, struct_cost, r (3 decimals), or
+        "not scored (edge block)" when r is null and weight.available is true (plan.md 3.4 step 6)
+     d. a legend for the colour scale with its fixed endpoints -1, 0, +1 (no threshold marks; P2 renders no verdict)
+     e. tensor diff lists (collapsed <details>), duplicated/pruned reference indices
+     f. the view's 3 disclaimers, visible at the top of the diff output
+  3. All text via textContent (no innerHTML with data). No external fonts/CDNs. prefers-color-scheme honoured. No page-level
+     horizontal scroll (the SVG scrolls inside its container).
+acceptance:
+  tests:
+    - "tests/test_web_static_p2.py: index.html contains every new id and a script tag for /diff.js; app.js contains '/confirm', '/decline', 'awaiting_confirmation', 'bytes_cap'; diff.js contains '/api/diff', '/api/suggest', '/api/cards', 'disclaimers', 'median_r', 'offdiag_median_r', 'diag_top1_frac', 'z_shift', 'not scored'; no file contains 'innerHTML'; there are no 'http://'/'https://' except the SVG namespace"
+    - "served through make_server: GET /diff.js -> 200 application/javascript"
+    - "P1 tests/test_web_static.py passes unchanged"
+  commands:
+    - pytest -q tests/test_web_static_p2.py tests/test_web_static.py
+    - pytest -q
+  manual:
+    - "scout serve --out <tmp>; scan two weights_fixtures family dirs (base and fine-tune) with 'weight sample' ticked; the gate panel appears with exact bytes; confirm; then diff them: a straight alignment and high-r colours; then diff base vs an upscale() dir: a dashed jump line at subject 12; record in log.jsonl"
+out_of_scope:
+  - any framework or build tooling (D27)
+  - verdict labels, threshold markings
+invariants_touched: [2, 5]
+decisions: []

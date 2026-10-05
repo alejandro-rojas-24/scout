@@ -1,0 +1,146 @@
+id: T320
+title: P4 exit expectations - frozen target table and thresholds, frozen P4 param literals, C0-C16 and C10b as pure check functions (with an independent byte recomputation for C3)
+depends_on: [T016, T115, T216, T306, T309, T310, T314, T317, T318]
+files:
+  - scripts/exit_expectations_p4.py
+  - tests/test_exit_expectations_p4.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_expectations_p4.py:
+    from scripts.exit_expectations import Check                 # P1 T016
+    P4_TARGETS: tuple[dict, ...] = (
+      {"label": "70b", "subject": "bartowski/DeepSeek-R1-Distill-Llama-70B-GGUF",
+       "selector": "DeepSeek-R1-Distill-Llama-70B-Q4_K_M.gguf", "base": "meta-llama/Llama-3.3-70B-Instruct",
+       "independent": (), "control": "Qwen/Qwen2.5-72B", "kind": "gguf", "max_wall_s": 21600, "max_compute_s": 7200},
+      {"label": "te", "subject": "Qwen/Qwen-Image", "selector": "text_encoder", "base": "Qwen/Qwen2.5-VL-7B-Instruct",
+       "independent": ("allenai/OLMo-2-1124-7B",), "control": "meta-llama/Llama-3.1-8B", "kind": "text_encoder",
+       "max_wall_s": 5400, "max_compute_s": 1200})
+      # "independent": documented-independent candidates passed as references AFTER the base (role "reference"),
+      # each checked by C10b (validation r2 major 2); plan model order = [subject, base, *independent, control]
+    P4_REPOS: frozenset[str]                  # the 7 repos of P4_TARGETS (subjects, bases, independents, controls)
+    ALPHA = 0.01; MIN_ATTRIBUTED_FRAC = 0.95; MIN_PRIMARY_FRAC = 0.95; MIN_MEDIAN_Z_ADJ = 10.0; MAX_CONTROL_ATTRIBUTED = 0
+    MAX_INDEPENDENT_ATTRIBUTED = 0
+    MAX_RSS_BYTES = 48 * 2**30; MIN_MEM_TOTAL_BYTES = 100 * 2**30; MACHINE = "aarch64"; SYSTEM = "Linux"
+    CODE_PATHS = ("scout", "scripts", "pyproject.toml")
+    FROZEN_ATTRIB_PARAMS, FROZEN_QUANT_PARAMS, FROZEN_GGUF_PARAMS, FROZEN_JOB_PARAMS, FROZEN_STORE_PARAMS: dict   # plan.md 4.9 literals
+
+    @dataclass(frozen=True)
+    class Env:                                # the only knobs the offline rehearsal may override (never thresholds)
+        machine: str = MACHINE; system: str = SYSTEM; min_mem_total_bytes: int = MIN_MEM_TOTAL_BYTES
+        max_rss_bytes: int = MAX_RSS_BYTES
+        require_clean: bool = True    # the rehearsal runs on a developer checkout that may be dirty; commits must still match
+
+    def depth_of(card: dict) -> int | None    # config.raw text_config.num_hidden_layers, else num_hidden_layers
+    def expected_plan_bytes(models: list[tuple[dict, pyarrow.Table]], plan: dict) -> int
+        # independent recomputation: for each planned model, Σ Parquet nbytes of the rows named in plan.models[i].reads
+        # AND a check that those rows are exactly: the embedding row + for each block in plan.models[i].blocks the rows
+        # whose rel name matches the frozen roles (gate/up/norm, first match) + their _scale_inv/_scale companions
+    def check_target_set(pins: dict) -> Check                                                        # C0
+    def check_env(hello: dict, client_code: dict, disk_needed: int, env: Env = Env()) -> list[Check]  # C1
+        # client_code = scout.jobs.runner.code_identity(repo_root) on the client (T316)
+    def check_frozen(hello: dict, client_digest: str, client_code: dict, plan_code_id: str | None,
+                     env: Env = Env()) -> list[Check]                                              # C2
+        # plan_code_id: code_id of the last P4_PLAN entry (run only; None at preflight/plan)
+    def check_plan(label: str, plan: dict, models: list[tuple[dict, pyarrow.Table]]) -> list[Check]  # C3
+    def check_gate(label: str, plan_snapshot: dict, client_gate: list[dict], worker_gate: list[dict],
+                   confirm_plans: dict[str, int], plan: dict, worker_plan_id: str | None) -> list[Check]   # C4
+    def check_log(label: str, outcome: dict, client_totals_by_origin: dict, plan: dict) -> list[Check]    # C5
+    def check_wire(label: str, result: dict, plan: dict, header_bounds: dict[str, int]) -> list[Check]    # C6
+    def check_disk(label: str, audit_before: dict, result: dict, live_events: list[dict], audit_after: dict,
+                   plan: dict) -> list[Check]                                                       # C7
+    def check_intervention(label: str, outcomes: list[dict]) -> list[Check]                         # C8
+    def check_resources(label: str, result: dict, target: dict, env: Env = Env()) -> list[Check]    # C9
+    def check_positive(label: str, attribution: dict, target: dict, depth: int) -> list[Check]      # C10
+    def check_independent(label: str, attribution: dict, target: dict, depth: int) -> list[Check]   # C10b ([] when target["independent"] is empty)
+    def check_control(label: str, attribution: dict, target: dict, depth: int) -> list[Check]       # C11
+    def check_card_store(label: str, store: CardStore, entry: StoreEntry, base_title: str, depth: int) -> list[Check]   # C12
+    def check_cache(label: str, second: dict, n_requests: int) -> list[Check]                       # C13
+    def check_gguf(label: str, subject_card: dict, subject_scan_log: dict, base_card: dict, attribution: dict) -> list[Check]   # C14
+    def check_te(label: str, subject_card: dict, attribution: dict | None) -> list[Check]           # C15
+        # attribution None = the E3 (plan-time) evaluation: only the key and tokenizer clauses
+    TE_TOKENIZER_FILES = ("tokenizer/tokenizer.json", "tokenizer/vocab.json")   # P2 T104 resolution order for text_encoder
+    def check_disclaimers(label: str, text: str, view: dict) -> list[Check]                         # C16
+behavior: |
+  Each function returns Check(target, name, expected, actual, ok) rows exactly as plan.md 2.3 states the condition:
+  1. C0: set(pins) == P4_REPOS and every pin 40-hex.
+  2. C1: hello machine/system equal Env; mem_total_bytes >= env.min_mem_total_bytes; disk_free_bytes >= disk_needed +
+     FROZEN_JOB_PARAMS["disk_reserve_bytes"] (disk_needed 0 at E2, max plan disk_bytes at E3/E4; T321); hello
+     wire_audit_available is True; hello has_hf_token is True (validation r2 minor: a Spark without a token must fail at
+     E2, not inside the E4 job; the offline rehearsal's LocalBackend hello runs with HF_TOKEN set to a dummy value by
+     the rehearsal test, since local targets never use it); hello code_id is not None and ==
+     client_code["code_id"] (the trees of CODE_PATHS, not the commit: committing exit/ files or checking out another
+     commit with identical CODE_PATHS trees on the Spark keeps C1 true; validation r1 major 5) and, when
+     env.require_clean, both clean (hello git_dirty False and client_code["dirty"] False). git_commit is recorded,
+     not compared.
+  3. C2: scout.attrib.ATTRIB_PARAMS == FROZEN_ATTRIB_PARAMS, likewise QUANT/GGUF/JOB/STORE; hello params_digest ==
+     client_digest; P2 SIGMA/ALIGN and P3 CKA/TSTATS/FEATURE/JEV equal their frozen literals (imported from
+     exit_expectations_p2/p3); code frozen (run only, plan_code_id given): client_code["code_id"] == plan_code_id
+     (equivalent to an empty CODE_PATHS diff since the P4_PLAN commit, and independent of later commits under exit/)
+     and, when env.require_clean, client_code["dirty"] False.
+  4. C3: plan models' repos == [subject, base, *independent, control] (label's target row); each planned model's len(blocks) ==
+     depth_of(card); bytes_planned == expected_plan_bytes(...); bytes_cap == bytes_planned + max(16 MiB, 4 *
+     min(chunk, largest read), ceil(bytes_planned / 256)); disk_bytes == bytes_planned.
+  5. C4: plan_snapshot["totals"]["weight"] == 0; client_gate has exactly one approved decision, via "cli-flag",
+     bytes_confirmed == bytes_cap, (plan_id, bytes_cap) in confirm_plans; worker_gate has exactly one approved
+     decision via "job-spec" with the same pair; worker_plan_id == plan_id.
+  6. C5: result totals.weight in [bytes_planned, bytes_cap]; outcome n_ingested == result n_events;
+     outcome["worker_seqs"] (the "seq" values of the raw worker event messages, JobOutcome.worker_seqs, T315) is consecutive (each = previous + 1) with n_events entries, the first being the worker log's first event; client totals_by_origin[worker host] == result totals.
+  7. C6 (validation r1 minor: data requests go to CDN/Xet URLs, so the file is identified through the redirect chain):
+     result wire not None; body_bytes == totals meta+header+weight; hosts all huggingface.co or end with .hf.co.
+     For each wire request record (P1 T015 fields: url, orig_path, range, location): its repo = owner/name parsed from
+     the record's own URL when it matches "/{owner}/{name}/resolve/{rev}/{path}", else the repo of the earlier record
+     whose `location` equals this URL (followed transitively); its file = orig_path. Every record that carries a Range
+     header must have orig_path and repo resolved (else FAIL "unattributed ranged request <url>"), and its range
+     "bytes=a-b" must lie inside [0, header bound of (repo, orig_path)) or inside one planned read [start, end) of the
+     plan model with that repo and path. Records without a Range header must have an orig_path that is not a weight
+     file (.safetensors/.gguf) or no orig_path at all (API calls).
+  8. C7: (a) audit_before files == 0; (b) result disk.peak_bytes <= plan disk_bytes; (c) purge ok, dir_absent,
+     resident_after 0, bytes_removed == bytes_written == bytes_planned (+ index.json bytes: compare
+     bytes_written == bytes_planned and bytes_removed >= bytes_written); (d) in live_events the COMPUTE purge note
+     precedes "PURGE check: disk_resident=0 files=0 scratch=absent"; (e) audit_after files == 0 and bytes == 0.
+  9. C8: exactly one outcome per label, status "succeeded", exit_code 0.
+  10. C9: wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <= env.max_rss_bytes.
+  11. C10: base reference (index 0, role "reference"; references = [base, *independent] + controls [control] by
+      construction) status
+      "tested", null_ok True, attribution control_ok True,
+      n_tested == depth, n_attributed / depth >= MIN_ATTRIBUTED_FRAC, share of blocks with primary == 0 >=
+      MIN_PRIMARY_FRAC, median_z_adj >= MIN_MEDIAN_Z_ADJ.
+  11b. C10b (validation r2 major 2), for each name in target["independent"] (reference index 1 + k, role "reference",
+      card_key repo == name): status "tested", null_ok True, attribution control_ok True, n_tested == depth,
+      n_attributed <= MAX_INDEPENDENT_ATTRIBUTED, and the number of blocks whose primary == that index is 0. One row per
+      condition; target["independent"] empty -> no rows.
+  12. C11: control (the last reference, index 1 + len(independent), role "control") status "tested", n_tested == depth, n_attributed (its tests with z_adj >=
+      crit under leave-one-out, T314) <= MAX_CONTROL_ATTRIBUTED, attribution control_ok True.
+  13. C12: loaded Card schema card.v3; validate_attribution == []; len(blocks) == depth; store.find_attribution(subject key, reference keys (base, then the independent candidate if any), control keys) hits the
+      same object; card.object_id(files) == entry.object; build_view strip of the subject stack has depth cells with
+      attribution.status set and primary_title == base_title for attributed cells.
+  14. C13: second["cached"] is True, second["jobs"] == 0, n_requests == 0, second object == first object.
+  15. C14 (kind gguf only): weights.format "gguf"; quant.method "gguf"; "Q4_K" in quant.types; the subject scan log's
+      header bytes for the GGUF path == files[0].gguf.infos_end <= data_offset and its totals.weight == 0; subject stack
+      prefix "model.layers"; for every block the subject gate/up shapes equal the base Card's.
+  16. C15 (kind text_encoder only): key.component == "text_encoder"; the subject Card's
+      stats.tokenizer_minhash.source_file is in TE_TOKENIZER_FILES (whichever file the repo ships, as resolved by P2
+      T104; validation r1 major 6: the Qwen-Image tokenizer layout is V). These two clauses are also evaluated at E3
+      from the stored header-scan Card (attribution None), so a layout surprise surfaces before P4_PLAN. With an
+      attribution: subject_stack.depth == depth_of(card) (text config); other_stacks has an entry whose reason starts
+      with "no probe basis".
+  17. C16: every DISCLAIMERS string and ATTRIBUTION_CAVEAT appear in text; view["disclaimers"] == DISCLAIMERS and
+      view["attribution"]["caveat"] == ATTRIBUTION_CAVEAT.
+acceptance:
+  tests:
+    - "test_literals: every FROZEN_* equals the plan.md 4.9 literal and the live module constant; thresholds equal plan.md 2.3/2.4 numbers; P4_REPOS has 7 repos including allenai/OLMo-2-1124-7B; te max_wall_s 5400"
+    - "test_c10b_independent: te attribution with the independent candidate 0/28 attributed -> PASS; 1 attributed block -> FAIL; status abstain -> FAIL; primary pointing at it in 1 block -> FAIL; the 70b row (no independent) -> no C10b rows"
+    - "test_c1_hf_token_and_disk: hello has_hf_token False -> C1 FAIL; disk_free_bytes = reserve + 1 with disk_needed 0 -> PASS, with disk_needed 2 -> FAIL"
+    - "test_each_check_pass_and_fail: for C0-C16 one hand-built passing input and at least one failing input per condition listed in behavior (e.g. C11 with 1 control test above crit fails; C11 reads the control at the last reference index; C10 with control_ok False fails; C10 at 0.9375 (15/16) fails; C7 with audit_after 1 file fails; C4 with via below-threshold fails; C13 with 1 request fails; C3 with one extra read fails expected_plan_bytes)"
+    - "test_c1_code_identity: hello code_id == client code_id with different git_commit values -> PASS; differing code_id -> FAIL; hello wire_audit_available False -> FAIL; C2 with plan_code_id equal -> PASS, differing -> FAIL"
+    - "test_c6_redirect_chain: records [resolve URL of org/a file x.safetensors with Range -> 302 location L; L (cdn host, orig_path x.safetensors via location) with Range] -> the second record is attributed to (org/a, x.safetensors) and checked against the plan; a ranged record with no resolvable orig_path -> FAIL; a range 1 byte past a planned read -> FAIL"
+    - "test_c15_tokenizer_files: source_file 'tokenizer/vocab.json' -> PASS; 'tokenizer/tokenizer.json' -> PASS; 'text_encoder/tokenizer.json' -> FAIL; attribution None evaluates only the key and tokenizer rows"
+    - "test_expected_plan_bytes_independent: on a T310 plan of T313 fixtures, expected_plan_bytes equals plan bytes_planned; removing one norm read from the plan makes it differ"
+  commands:
+    - pytest -q tests/test_exit_expectations_p4.py
+    - pytest -q
+out_of_scope:
+  - running anything (T321)
+invariants_touched: [1, 2, 4, 5]
+decisions: [D71, D72]

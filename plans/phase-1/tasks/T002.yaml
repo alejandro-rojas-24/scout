@@ -68,8 +68,16 @@ behavior: |
      - Else, if p ends with any other WEIGHT_EXTENSIONS entry: all bytes are weight.
      - Else: all bytes are meta (this includes "*.safetensors.index.json", "@api/revision" and README.md).
      Raise ValueError if start < 0 or end_exclusive < start.
-  2. ByteLog is thread-safe: one threading.Lock guards seq, totals, events and header lens.
-     seq starts at 1 and increments per event.
+  2. ByteLog is thread-safe with two locks, always acquired in the order emit -> state:
+     - a state threading.Lock guards seq, totals, events, header lens and reservations; it is never held while
+       on_event runs;
+     - a separate emit threading.RLock is held by stage/note/record and preflight's budget check from appending an
+       event until its on_event callback returns, so on_event sees seq strictly 1..n in order. Read-only views,
+       set_header_len and release take only the state lock. Re-entrant calls from on_event on the same thread do
+       not deadlock; an on_event that blocks on another thread that is writing to the same ByteLog will.
+     seq starts at 1 and increments per event. LogEvent.bytes_by_class and LogEvent.totals are read-only
+     MappingProxyType snapshots. set_header_len raises ValueError if N < 0 or if the path is already registered
+     with a different N (same N is a no-op).
   3. stage(s): raise StageOrderError if current_stage is not None and s < current_stage. Otherwise set it and
      emit event "stage_start" with bytes 0. Calling it again with the same stage is allowed (no-op event
      still emitted).
@@ -89,11 +97,24 @@ behavior: |
      (or "NONE" if no stage yet), ts = time.time(), bytes = nbytes, bytes_by_class = the classification,
      range = (start, start+nbytes) if start is not None else None, totals = a snapshot after the update.
      If release is not None, the reservation is removed in the same critical section as the totals update.
-     event must be "fetch" or "retry" (else ValueError). Append it and call on_event outside the lock.
-     Exceptions raised by on_event propagate.
+     event must be "fetch", "retry" or "error" (else ValueError). "error" with nbytes > 0 records the body bytes of a
+     non-2xx response (callers use the pseudo-path "@error", so it is classified as meta). Under the emit lock: append
+     it under the state lock, release the state lock, then call on_event (so callbacks run in seq order).
+     Exceptions raised by on_event propagate; the event stays recorded and the emit lock is released.
   6. note(event, note, path): event must be in {"error","refused","card_written"}; emits a 0-byte event.
   7. to_card_dict returns JSON-serializable data only.
-decisions: []
+decisions:
+  - "ReadThresholdExceeded.__init__(requested, total, threshold, message=None): message defaults to the spec's threshold text; __reduce__ added so it pickles. Other errors use plain Exception(*args); exit_code is a class attribute (1 unless the spec says otherwise)."
+  - "events_since(seq) returns events with seq strictly greater than seq (so events_since(0) is everything and polling with the last seen seq gives only new events)."
+  - "totals always has exactly the three keys meta/header/weight; no aggregate key."
+  - "preflight refused events (weight and threshold) are logged with source/url/range/status None, bytes 0 and path set. The threshold refusal event is appended in the same state-lock section as the budget check. The whole budget check runs under the emit lock (see next decision), so a slow on_event also delays preflight."
+  - "REVISED at coordinator request (P4 validation: remote log ingest needs consecutive seq 1..n; matches T301's change to the P1 contract): on_event is called in strict seq order. There are two locks: a state threading.Lock and a separate emit threading.RLock. Lock order is always emit -> state. stage/preflight(budget)/record/note hold the emit lock from appending the event until on_event returns. The state lock is released before on_event runs, and read-only views (totals, events, reserved, header_len, current_stage) and set_header_len/release take only the state lock, so there is no lock-order inversion. Re-entrant calls from on_event on the same thread re-acquire the RLock without deadlock; a nested event gets the next seq and its callback starts before the outer one returns, so callbacks still start in strict seq order. Caveat: an on_event that blocks waiting for another thread that is itself calling record/note/stage/preflight on the same ByteLog will deadlock, so callbacks must not do that. If on_event raises, the event is already recorded and counted, and the emit lock is released."
+  - "record raises ValueError for nbytes < 0 (validated before any state change, like the event-name check). path None is classified as meta (treated as '')."
+  - "classify_range uses the header length as given; it does not validate header_len >= 0. The threshold budget counts meta + header + open reservations; weight bytes recorded honestly do not consume the non-weight budget."
+  - "stage() accepts an int and coerces it via Stage(stage)."
+  - "Review fixes (coordinator request): LogEvent.bytes_by_class and LogEvent.totals are MappingProxyType over private copies, so a returned event cannot be mutated and to_card_dict() is unaffected; to_dict() converts them back to plain dicts. Side effect: LogEvent can no longer be pickled or deepcopied (mappingproxy is not picklable); nothing in P1 needs that, and to_dict() is the serialization path."
+  - "Review fixes: set_header_len raises ValueError for N < 0 or for a path already registered with a different N; re-registering the same N is a no-op. This keeps the classification of already-recorded events stable."
+  - "Review fixes: behavior items 2 and 5 in this YAML were edited at the coordinator's request to describe the two-lock design, the read-only event mappings and the set_header_len rules (this goes beyond the decisions-only rule, and was explicitly requested)."
 acceptance:
   tests:
     - "classify_range table: safetensors with N=None: [0,8)->header 8, [0,16)-> header 8 + weight 8; with N=100: [8,108) all header, [100,120) -> header 8 + weight 12; model.bin [0,4) -> weight 4; config.json -> meta; model.safetensors.index.json -> meta; MODEL.SAFETENSORS is treated case-insensitively"
@@ -103,6 +124,7 @@ acceptance:
     - "record(release=id) frees the reservation; release is idempotent"
     - "stage order: HEADERS then RESOLVE raises StageOrderError; RESOLVE, HEADERS, META, REPORT succeeds"
     - "thread safety: 8 threads x 1000 record() calls of 1 meta byte -> totals.meta == 8000, seqs unique and contiguous 1..N"
+    - "record(event='error', path='@error', nbytes=10) adds 10 to totals.meta; record(event='bogus') raises ValueError"
     - "record of a mixed range counts weight honestly (weight > 0 in totals); record never raises on weight"
     - "on_event receives every event in order; to_card_dict round-trips through json.dumps"
   commands:

@@ -1,5 +1,7 @@
 # Phase 1 plan: Single architecture view
 
+Status: PLANNED — approved by orchestrator under human directive (review disabled), 2026-09-28
+
 ## 1. Goal
 
 Given a Hub repo at a pinned revision or a local folder, scout reads only the
@@ -24,6 +26,26 @@ These are the keys of `DEFAULT_EXPECTATIONS` (T016).
   decision is logged in `log.jsonl` before the run, and is followed by a plan
   revision that adds an expectation function with tests (T016). It is never done
   after a FAIL without that prior record.
+
+**Source and budget (fixed).**
+- The exit check always uses the endpoint `https://huggingface.co`. `exit_check.py`
+  and `pin_exit.py` exit 1 if `HF_ENDPOINT` is set to anything else, and
+  `pin_exit.py` removes `HF_ENDPOINT` from its subprocess environment.
+- The C1 budget is fixed at 10.0 s. There is no `--budget-s` or endpoint flag.
+- C12 asserts that every request on the wire went to `huggingface.co` or `*.hf.co`,
+  and that every Card's `source.endpoint` is `https://huggingface.co`.
+- The final JSON summary line records all of the following:
+  - endpoint
+  - budget_s
+  - the sorted hosts contacted
+  - `git rev-parse HEAD`, plus a dirty flag
+  - hostname
+- The EXIT line's hostname must equal the PIN line's hostname; otherwise the run is
+  invalid and is repeated on the pinning host.
+
+**C1 is never waived.** A C1 FAIL (over 10 s) keeps Phase 1 open. The remedy is
+performance work followed by a full rerun. There is no waiver, no budget change and
+no partial credit.
 
 **Pins.** `exit/pins.json` maps each target to a 40-hex commit SHA. It is committed
 with the literal value `"UNPINNED"` in T015. At EXIT, on a machine that can reach
@@ -89,7 +111,7 @@ that records for every request:
 It maps each redirect target back to its original resolve path, so opaque Xet or CDN
 URLs are still attributed to the right file.
 
-**C0 once, then common checks for every target (C1–C11). C6 and C9 are sanity checks, not evidence:**
+**C0 once, then common checks for every target (C1–C12). C6 and C9 are sanity checks, not evidence:**
 
 | # | Check | Threshold |
 |---|-------|-----------|
@@ -105,6 +127,7 @@ URLs are still attributed to the right file.
 | C9 | `weights.params_total` | `== Σ numel` over the Parquet rows |
 | C10 | wire (CountingTransport): every request whose original path ends in `.safetensors` carries `Range: bytes=a-b`, and `b + 1 <= 8 + header_len` of that file from the Card; there are no such requests without `Range` | true for all requests |
 | C11 | wire: Σ response body bytes over all requests, including 3xx | `==` ByteLog `meta + header + weight` total, so no unlogged fetch path exists |
+| C12 | wire hosts and provenance | every request host is `huggingface.co` or a subdomain of `hf.co`, and every Card has `source.endpoint == "https://huggingface.co"` |
 
 **E1 Qwen/Qwen3-8B @pin: 1 Card, component null**
 
@@ -205,6 +228,9 @@ byte offsets. The caller never supplies the class.
 - **meta**: every other byte. This covers Hub API JSON responses (logged path
   `@api/revision`), `model_index.json`, `*.index.json`, `config.json` and
   `README.md`.
+- Non-2xx response bodies (errors) are counted as `error` events under the
+  pseudo-path `@error` (meta). An error body on a `.safetensors` URL is therefore
+  never classified as header or weight.
 - Redirect (3xx) bodies are counted. `HubSource` follows redirects itself, at most
   5 hops, and logs each 3xx body as a `fetch` event with path `@redirect`, class
   meta and the target host in `note`.
@@ -434,7 +460,7 @@ tests/helpers/fakehub.py               T003  httpx.MockTransport fake Hub + CDN
 | A weight byte slips through (the invariant fails) | Preflight refusal (T002 unit test). The exit wire checks C10 and C11 are independent of ByteLog. FakeHub counts CDN request ranges, and T010 asserts that every served range ends at or before `8+N`. Exit C2 and C3 (header bytes exactly Σ(8+N)). |
 | Server ignores Range or CDN returns 200 | T005 `test_range_ignored` checks honest counting plus an error. C3 would catch it live. |
 | Xet/CDN redirect drops Range or needs auth | `HubSource` follows redirects manually (≤ 5 hops): it resends Range, drops Authorization on a host change, and logs the 3xx body. FakeHub redirects every LFS read to a separate host with an absolute Location. With `meta_redirect="relative307"`, it also answers non-LFS resolves with a 307 and a relative `/api/resolve-cache/...` Location, like the current Hub. Both paths are used in T005 and in the T015 offline test. Live: E1–E3. |
-| 10 s budget on MoE (16 shards × 2 ranged reads × 2 hops) | Headers are fetched with a thread pool (8 workers) and one shared `httpx.Client` (keep-alive). Critical path ≈ 1 API call + ⌈16/8⌉ × 4 sequential round trips ≈ 9 RTTs, which is about 2 s at 200 ms RTT. C1 measures it; a latency-only FAIL goes to a human. |
+| 10 s budget on MoE (16 shards × 2 ranged reads × 2 hops) | Headers are fetched with a thread pool (8 workers) and one shared `httpx.Client` (keep-alive). Critical path ≈ 1 API call + ⌈16/8⌉ × 4 sequential round trips ≈ 9 RTTs, which is about 2 s at 200 ms RTT. C1 measures it. A C1 FAIL keeps the phase open; the fix is performance work and a rerun, never a waiver. |
 | Hub unreachable from build container | Offline suite with FakeHub; exit run on a host that has access (D3). |
 | Concurrent reads overshoot the threshold | Atomic reservation in `preflight()`. T002 test: 8 threads each request threshold/4 and at most 4 succeed. |
 | Graph too large for real diffusers VAEs | The view collapses every integer segment. The T001 fixture mirrors Wan-VAE naming, and T011 asserts ≤ 100 non-tensor nodes. |
@@ -551,4 +577,36 @@ Rejected (partially):
     9 RTTs (about 2 s at 200 ms), so the 10 s budget is not at risk on any normal host.
   - A latency-only C1 FAIL goes to a human per the plan.
   - Recorded in later.md.
+
+### Round 3 (under human directive: review disabled; minors go to FUTURE_IMPROVEMENTS.md)
+
+**Major (exit run not bound to its source and budget)**, resolved in §2 "Source and
+budget", T015 and T016:
+- the endpoint is hard-coded to huggingface.co, and a foreign `HF_ENDPOINT` makes the
+  run fail
+- `--budget-s` is removed; `BUDGET_S = 10.0`
+- new check C12 covers the allowed wire hosts and the Card endpoint
+- the summary line records endpoint, budget, hosts contacted, git commit and dirty flag
+- the PIN and EXIT hostnames must match
+- a C1 FAIL keeps the phase open and is never waived
+
+Offline tests cover:
+- a foreign endpoint
+- the removed flag
+- a disallowed host
+- the summary keys
+
+**Cheap minors fixed:**
+- **Error bodies (r3-m1, invariant 2):** logged as `error` events under `@error`, in
+  T002 and T005.
+- **Symlinked local files (r3-m10):** stat follows file symlinks, and a broken link
+  raises an error (T004).
+- **Concurrent Card writes (r3-m12):** temp names come from `mkstemp` (T009).
+- **Fused-expert MoE (r3-m8):** detected with a warning only (T008). Scheduling
+  fused-expert support is deferred.
+- **Per-target CountingTransport switching (r3-m11):** resolved in T015. Targets run
+  sequentially, each with its own `make_server` bound to a fresh `CountingTransport`.
+
+Every other unresolved minor from r1, r2 and r3, including the rejected ones, is
+listed in `/FUTURE_IMPROVEMENTS.md` under "Phase 1".
 

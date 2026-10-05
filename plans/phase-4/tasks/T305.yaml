@@ -1,0 +1,101 @@
+id: T305
+title: Dequantisation - GGML type table, vectorised GGUF decoders (F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K), FP8 E4M3/E5M2 + companion scales, QUANT_PARAMS, quantisation detection
+depends_on: [T303]
+files:
+  - scout/dequant.py
+  - tests/test_dequant.py
+route: opus
+spec_complete: true
+interface: |
+  scout/dequant.py (numpy only; no IO):
+    QUANT_PARAMS: dict       # EXACTLY the plan.md 4.9 literal
+    GGML_TYPES: dict[int, tuple[str, int, int]] = {
+        0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20), 6: ("Q5_0", 32, 22),
+        7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34), 9: ("Q8_1", 32, 36), 10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110),
+        12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176), 14: ("Q6_K", 256, 210), 15: ("Q8_K", 256, 292),
+        16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98), 19: ("IQ1_S", 256, 50),
+        20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+        24: ("I8", 1, 1), 25: ("I16", 1, 2), 26: ("I32", 1, 4), 27: ("I64", 1, 8), 28: ("F64", 1, 8),
+        29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2), 34: ("TQ1_0", 256, 54), 35: ("TQ2_0", 256, 66), 39: ("MXFP4", 32, 17)}
+        # (name, elements per block, bytes per block); V: check against ggml.h at a pinned llama.cpp commit (plan.md 3.6)
+    GGML_BY_NAME: dict[str, tuple[int, int, int]]                  # name -> (id, block elems, block bytes)
+    FLOAT_DTYPES: frozenset[str] = frozenset({"F32", "F16", "BF16", "F64"})
+
+    def tensor_nbytes(dtype: str, numel: int) -> int              # GGML names and safetensors float/int/F8 names;
+                                                                   # numel % block elems != 0 -> QuantError
+    def row_nbytes(dtype: str, n_cols: int) -> int                 # bytes of one row of n_cols elements
+    def decodable(dtype: str) -> bool                              # FLOAT_DTYPES | gguf_decodable | fp8_dtypes
+    def decode(raw: bytes | memoryview | numpy.ndarray, dtype: str, shape: tuple[int, ...], *,
+               out: str = "float32") -> numpy.ndarray
+        # element decode, C-contiguous, dtype float32 or float64 ("float64"); FP8 returns UNSCALED values
+    def decode_rows(raw, dtype: str, shape: tuple[int, int], rows: Sequence[int], *, out: str = "float32") -> numpy.ndarray
+        # raw = the whole tensor's bytes; returns (len(rows), shape[1]) in the given row order
+    def fp8_table(dtype: str) -> numpy.ndarray                     # 256 float64 values for F8_E4M3 / F8_E5M2
+    def companion_scale_name(name: str, names: Collection[str]) -> str | None
+    def apply_scale(w: numpy.ndarray, scale: numpy.ndarray, block_size: tuple[int, int] | None) -> numpy.ndarray
+    def detect_quant(config_raw: dict | None, dtype_counts: dict[str, int], fmt: str) -> dict | None   # plan.md 4.1 quant.v1
+behavior: |
+  1. raw is taken as a uint8 numpy view (no copy when possible). expected = tensor_nbytes(dtype, prod(shape)); a size
+     mismatch -> QuantError(f"{dtype}: expected {expected} B for shape {shape}, got {n}"). Undecodable dtype ->
+     QuantError(f"{dtype} is not decodable in P4").
+  2. Float decoders: F32 '<f4', F64 '<f8', F16 '<f2', BF16 = uint16 view (little-endian) -> uint32 << 16 -> view float32.
+  3. GGUF block decoders (vectorised over blocks; a tensor is rows x (cols/block) blocks in row-major order; the
+     layouts are exactly T303 behavior 1-5, i.e. ggml dequantize_row_q8_0/q4_0/q4_K/q5_K/q6_K):
+     Q8_0: B = raw.reshape(-1, 34); d = B[:, :2].view('<f2').astype(f32); q = B[:, 2:].view(int8); d*q.
+     Q4_0: d = B[:, :2]; qs = B[:, 2:18]; lo = qs & 0xF, hi = qs >> 4; values = concat([lo, hi], axis=1) - 8, times d.
+     Q4_K: d = B[:, 0:2] f16, dmin = B[:, 2:4] f16, S = B[:, 4:16], qs = B[:, 16:144].
+       sc[j], mn[j] for j < 4: S[j] & 63, S[j+4] & 63; for j >= 4: sc = (S[j+4] & 0xF) | ((S[j-4] >> 6) << 4),
+       mn = (S[j+4] >> 4) | ((S[j] >> 6) << 4). For c in 0..3: out[64c:64c+32] = d*sc[2c]*(qs[32c:32c+32] & 0xF) - dmin*mn[2c];
+       out[64c+32:64c+64] = d*sc[2c+1]*(qs[32c:32c+32] >> 4) - dmin*mn[2c+1].
+     Q5_K: as Q4_K with qh = B[:, 16:48], qs = B[:, 48:176]; low nibbles from qs as Q4_K; add 16 where bit (2c) of qh[l]
+       (first half of chunk c) / bit (2c+1) (second half) is set.
+     Q6_K: ql = B[:, 0:128], qh = B[:, 128:192], sc = B[:, 192:208].view(int8), d = B[:, 208:210] f16; for n in 0..1,
+       l in 0..31: q1 = ((ql[64n+l] & 0xF) | (((qh[32n+l] >> 0) & 3) << 4)) - 32; q2 = ((ql[64n+l+32] & 0xF) | (((qh[32n+l] >> 2) & 3) << 4)) - 32;
+       q3 = ((ql[64n+l] >> 4) | (((qh[32n+l] >> 4) & 3) << 4)) - 32; q4 = ((ql[64n+l+32] >> 4) | (((qh[32n+l] >> 6) & 3) << 4)) - 32;
+       out[128n+l] = d*sc[8n + l//16]*q1; out[128n+l+32] = d*sc[8n + l//16 + 2]*q2; out[128n+l+64] = d*sc[8n + l//16 + 4]*q3;
+       out[128n+l+96] = d*sc[8n + l//16 + 6]*q4.
+     All arithmetic in float32 (as ggml), then cast to `out`.
+  4. FP8: fp8_table("F8_E4M3"): s = b >> 7, e = (b >> 3) & 0xF, m = b & 7; e == 0 -> m/8 * 2^-6; e == 15 and m == 7 -> NaN;
+     else (1 + m/8) * 2^(e-7); sign applied. fp8_table("F8_E5M2"): e = (b >> 2) & 0x1F, m = b & 3; e == 0 -> m/4 * 2^-14;
+     e == 31 -> inf (m == 0) else NaN; else (1 + m/4) * 2^(e-15). decode = table[raw].reshape(shape).
+  5. Any non-finite value after decode -> QuantError(f"{dtype}: non-finite values after decode").
+  6. decode_rows: float and FP8 dtypes slice rows by element offset; block dtypes by row_nbytes(dtype, cols) (cols must
+     be a multiple of the block size, else QuantError); decode each selected row's bytes with decode(..., (1, cols)).
+  7. companion_scale_name(name, names): first of name + s for s in QUANT_PARAMS["fp8_scale_suffixes"] that is in names; else None.
+  8. apply_scale(w, scale, block_size): m, n = w.shape; s = numpy.asarray(scale, float64).
+     numel 1 -> w * s.item(); shape (m,) or (m, 1) -> w * s.reshape(m, 1);
+     2-D (ceil(m/b0), ceil(n/b1)) with block_size (b0, b1) (default QUANT_PARAMS["fp8_default_block"] when None) ->
+     w * numpy.repeat(numpy.repeat(s, b0, 0), b1, 1)[:m, :n]; anything else -> QuantError("unsupported scale shape").
+     Result dtype = w.dtype.
+  9. detect_quant(config_raw, dtype_counts, fmt):
+     a. fmt == "gguf": undecodable = sorted(t for t in dtype_counts if t not in QUANT_PARAMS["gguf_decodable"]);
+        {"version": "quant.v1", "method": "gguf", "source": "gguf-header", "types": dict(sorted(dtype_counts.items())),
+         "dequantizable": not undecodable, "reason": None if not undecodable else "not decodable in P4: " + ", ".join(undecodable),
+         "block_size": None}.
+     b. safetensors: qc = config_raw.get("quantization_config") or (config_raw.get("text_config") or {}).get("quantization_config")
+        (config_raw None -> {}); f8 = [t for t in dtype_counts if t in QUANT_PARAMS["fp8_dtypes"]]. qc is None and no f8 -> None.
+     c. method = str(qc.get("quant_method", "unknown")).lower() if qc else "fp8"; source = "config.quantization_config" if qc
+        else "dtype"; block = qc.get("weight_block_size") if qc else None (a 2-list of ints, else None).
+     d. method in QUANT_PARAMS["unsupported_methods"] -> dequantizable False, reason f"{method}: packed weights are not decoded in P4".
+        elif f8 -> dequantizable True, reason None. else -> dequantizable False, reason f"{method}: no decodable storage dtype ({', '.join(sorted(dtype_counts))})".
+  10. No scipy, no IO, no raw cosine.
+acceptance:
+  tests:
+    - "test_params_literal: QUANT_PARAMS == plan.md 4.9 literal; GGML_TYPES has the listed 32 entries"
+    - "test_nbytes: tensor_nbytes('Q4_K', 256*3) == 432; ('Q8_0', 64) == 68; ('BF16', 10) == 20; ('F8_E4M3', 10) == 10; ('Q4_K', 100) -> QuantError; row_nbytes('Q6_K', 512) == 420"
+    - "test_decode_matches_reference: for each of Q8_0, Q4_0, Q4_K, Q5_K, Q6_K: 20 random blocks built with T303 pack_* (rng 5, random d/dmin in [1e-3, 1], random sc/mn/q in range) -> decode(...) equals T303 ref_decode_block element-wise within 1e-6 relative (float32)"
+    - "test_decode_encode_roundtrip: T303 encode(x (8, 1024) rng 1, t) -> decode error bounds of T303 test_encode_roundtrip; shape (8, 1024) and C-contiguity; out='float64' dtype"
+    - "test_float_decoders: F32/F16/BF16 decode of known bytes (BF16 0x3F80 -> 1.0; 0xC000 -> -2.0)"
+    - "test_fp8_tables: E4M3: 0x38 -> 1.0, 0x7E -> 448.0, 0x01 -> 2^-9, 0x7F NaN, 0x80 -> -0.0; E5M2: 0x3C -> 1.0, 0x7C -> inf, 0x7D NaN; decode of a tensor containing 0x7F -> QuantError"
+    - "test_apply_scale: per-tensor, per-row (m,) and (m,1), block (2,2) on a (3,5) matrix with block (2,3) including the ragged edge; bad shape -> QuantError"
+    - "test_decode_rows: rows [5, 0, 3] of a (6, 512) Q4_K tensor == decode(...)[[5, 0, 3]]; same for BF16 and F8_E4M3"
+    - "test_companion: companion_scale_name('a.weight', {'a.weight_scale_inv'}) -> 'a.weight_scale_inv'; with both suffixes present the _scale_inv one wins; none -> None"
+    - "test_detect_quant: gguf with {'Q4_K': 3, 'F32': 2} -> dequantizable True; with 'IQ2_XS' -> False and reason names it; config {'quantization_config': {'quant_method': 'gptq'}} -> dequantizable False; {'quant_method': 'fp8', 'weight_block_size': [128, 128]} + F8_E4M3 counts -> True, block_size [128, 128]; plain BF16 config -> None; text_config nesting found"
+    - "test_errors: size mismatch and undecodable dtype ('Q2_K', 'I32') -> QuantError"
+  commands:
+    - pytest -q tests/test_dequant.py
+    - pytest -q
+out_of_scope:
+  - GGUF header parsing (T304); planning companion reads (T310); sigma/anchor integration (T308)
+invariants_touched: [4]
+decisions: [D65, D67]

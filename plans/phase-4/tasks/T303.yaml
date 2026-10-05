@@ -1,0 +1,93 @@
+id: T303
+title: GGUF fixture writer + ggml block encoders and scalar reference decoders (test-only, independent of scout)
+depends_on: [T103]
+files:
+  - tests/helpers/gguf_fixtures.py
+  - tests/test_gguf_fixtures.py
+route: sonnet
+spec_complete: true
+interface: |
+  tests/helpers/gguf_fixtures.py (test-only; numpy + struct; imports tests.helpers.weights_fixtures.to_bf16_bytes; NO scout imports):
+    GGUF_VALUE_TYPES = {"UINT8": 0, "INT8": 1, "UINT16": 2, "INT16": 3, "UINT32": 4, "INT32": 5, "FLOAT32": 6,
+                        "BOOL": 7, "STRING": 8, "ARRAY": 9, "UINT64": 10, "INT64": 11, "FLOAT64": 12}
+    GGML_TYPE_IDS = {"F32": 0, "F16": 1, "Q4_0": 2, "Q8_0": 8, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14, "BF16": 30}
+    BLOCK = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "Q4_0": (32, 18), "Q8_0": (32, 34),
+             "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210)}          # (elements, bytes) per block
+
+    def pack_q8_0(d: float, q: Sequence[int]) -> bytes             # 32 ints in [-127, 127]
+    def pack_q4_0(d: float, q: Sequence[int]) -> bytes             # 32 ints in [0, 15]
+    def pack_q4_k(d: float, dmin: float, sc: Sequence[int], mn: Sequence[int], q: Sequence[int]) -> bytes
+        # sc, mn: 8 ints in [0, 63]; q: 256 ints in [0, 15]
+    def pack_q5_k(d: float, dmin: float, sc: Sequence[int], mn: Sequence[int], q: Sequence[int]) -> bytes   # q in [0, 31]
+    def pack_q6_k(d: float, scales: Sequence[int], q: Sequence[int]) -> bytes
+        # scales: 16 ints in [-128, 127]; q: 256 ints in [-32, 31]
+    def ref_decode_block(gtype: str, block: bytes) -> list[float]  # scalar pure-Python reference (loops, no numpy)
+    def encode(a: numpy.ndarray, gtype: str) -> bytes              # RTN encoder, row-major; last dim % block elements == 0
+    def write_gguf(path: pathlib.Path, tensors: list[tuple[str, str, numpy.ndarray]], kv: dict[str, tuple],
+                   *, version: int = 3, alignment: int = 32) -> dict
+        # tensors: (gguf name, gtype, array in PyTorch order: 2-D (out, in) or 1-D); kv values: (type name, value), arrays:
+        # ("ARRAY", (elem type name, [values])); returns {"infos_end", "data_offset", "offsets": {name: int},
+        # "nbytes": {name: int}, "size": int}
+    def llama_kv(*, n_layers: int, hidden: int, inter: int, n_heads: int, n_kv_heads: int, tokens: list[str],
+                 token_types: list[int] | None = None, arch: str = "llama", eps: float = 1e-5, rope: float = 10000.0,
+                 ctx: int = 4096, file_type: int = 15, tokenizer_model: str = "gpt2", merges: list[str] = ()) -> dict
+    def hf_to_gguf_names(w: dict[str, numpy.ndarray]) -> dict[str, numpy.ndarray]
+        # inverse of plan.md 4.9 GGUF_PARAMS.name_map (model.layers.{i}.X -> blk.{i}.Y, embed/norm/lm_head); other names unchanged
+behavior: |
+  Bit layouts (little-endian; fp16 = numpy.float16 bytes; these mirror ggml's dequantize_row_* and T305's decoders):
+  1. Q8_0 block (34 B): d fp16 | qs int8[32]. value_i = d * qs[i].
+  2. Q4_0 block (18 B): d fp16 | qs uint8[16]; qs[j] = q[j] | (q[j+16] << 4). value_j = (q[j] - 8) * d, value_{j+16} likewise.
+  3. Q4_K block (144 B): d fp16 | dmin fp16 | scales uint8[12] | qs uint8[128].
+     scales: for j in 0..3: scales[j] = (sc[j] & 63) | ((sc[j+4] >> 4) << 6); scales[j+4] = (mn[j] & 63) | ((mn[j+4] >> 4) << 6);
+     scales[j+8] = (sc[j+4] & 0xF) | ((mn[j+4] & 0xF) << 4).
+     qs: for c in 0..3, l in 0..31: qs[32c + l] = q[64c + l] | (q[64c + 32 + l] << 4).
+     value_{64c+l} = d*sc[2c]*(q[64c+l]) - dmin*mn[2c]; value_{64c+32+l} = d*sc[2c+1]*q[64c+32+l] - dmin*mn[2c+1].
+  4. Q5_K block (176 B): d fp16 | dmin fp16 | scales[12] (as Q4_K) | qh uint8[32] | qs uint8[128].
+     low 4 bits of q in qs exactly as Q4_K; high bit: q[64c+l] >= 16 sets bit (2c) of qh[l]; q[64c+32+l] >= 16 sets bit
+     (2c+1) of qh[l]. Values as Q4_K with q in [0, 31].
+  5. Q6_K block (210 B): ql uint8[128] | qh uint8[64] | scales int8[16] | d fp16.
+     u = q + 32 (0..63). For n in 0..1, l in 0..31, with base = 128n: u1=u[base+l], u2=u[base+l+32], u3=u[base+l+64], u4=u[base+l+96]:
+     ql[64n+l] = (u1 & 0xF) | ((u3 & 0xF) << 4); ql[64n+l+32] = (u2 & 0xF) | ((u4 & 0xF) << 4);
+     qh[32n+l] = (u1 >> 4) | ((u2 >> 4) << 2) | ((u3 >> 4) << 4) | ((u4 >> 4) << 6).
+     Scale of value index v: n = v // 128, r = v % 128, quarter = r // 32, l = r % 32 -> scales[8n + l//16 + 2*quarter].
+     value_v = d * scale * q[v].
+  6. F32/F16: raw little-endian; BF16: to_bf16_bytes (P2 T103).
+  7. ref_decode_block implements 1-6 with explicit Python loops (it is the independent oracle for T305).
+  8. encode(a, gtype) RTN, per block along the last axis, always using the fp16-ROUNDED d/dmin in later arithmetic:
+     Q8_0: amax = max|x|; d = fp16(amax/127); q = clip(round(x/d), -127, 127) (d == 0 -> q = 0).
+     Q4_0: m = x[argmax |x|] (signed, first on ties); d = fp16(m / -8); q = clip(round(x/d) + 8, 0, 15) (d == 0 -> q = 8).
+     Q4_K / Q5_K (Q = 15 / 31): per 32-sub-block: mn_f = max(0, -min(x)); sc_f = (max(x) + mn_f) / Q;
+       d = fp16(max(sc_f)/63); dmin = fp16(max(mn_f)/63); sc = clip(round(sc_f/d), 0, 63) (d == 0 -> 0);
+       mn = clip(round(mn_f/dmin), 0, 63) (dmin == 0 -> 0); q = clip(round((x + dmin*mn)/(d*sc)), 0, Q) (d*sc == 0 -> 0).
+     Q6_K: per 16-sub-block sc_f = max|x|/31; d = fp16(max|sc_f|/127); sc = clip(round(sc_f/d), -128, 127) (d == 0 -> 0);
+       q = clip(round(x/(d*sc)), -32, 31) (d*sc == 0 -> 0).
+     numpy round is round-half-to-even; that is what the encoder uses (decoders do not care).
+  9. write_gguf: magic b"GGUF", u32 version, u64 n_tensors, u64 n_kv; each KV: u64 key length + utf-8 key, u32 value
+     type, value (STRING = u64 length + bytes; ARRAY = u32 elem type, u64 count, elements; BOOL = 1 byte); if
+     "general.alignment" is not in kv it is NOT added (default 32 applies) unless alignment != 32, then it is added as
+     UINT32. Tensor infos in the given order: name string, u32 n_dims, u64 dims in GGUF order (reversed PyTorch shape),
+     u32 ggml type id, u64 offset (relative to the data start; each tensor starts at the next multiple of alignment).
+     infos_end = position after the last info; data_offset = align_up(infos_end, alignment); zero padding; data.
+  10. llama_kv returns {"general.architecture": ("STRING", arch), f"{arch}.block_count": ("UINT32", n_layers),
+      f"{arch}.embedding_length": ("UINT32", hidden), f"{arch}.feed_forward_length": ("UINT32", inter),
+      f"{arch}.attention.head_count": ("UINT32", n_heads), f"{arch}.attention.head_count_kv": ("UINT32", n_kv_heads),
+      f"{arch}.attention.layer_norm_rms_epsilon": ("FLOAT32", eps), f"{arch}.rope.freq_base": ("FLOAT32", rope),
+      f"{arch}.context_length": ("UINT32", ctx), "general.file_type": ("UINT32", file_type),
+      "tokenizer.ggml.model": ("STRING", tokenizer_model), "tokenizer.ggml.tokens": ("ARRAY", ("STRING", tokens)),
+      "tokenizer.ggml.token_type": ("ARRAY", ("INT32", token_types or [1]*len(tokens))),
+      "tokenizer.ggml.merges": ("ARRAY", ("STRING", list(merges)))}.
+acceptance:
+  tests:
+    - "test_pack_sizes: each pack_* returns exactly BLOCK[gtype][1] bytes"
+    - "test_ref_decode_handpacked: for each K-type, a block with d=0.5, dmin=0.25, sc=[1..8], mn=[8..1] (Q6_K: scales [-8..7]) and q = a fixed pattern (i*7 % (Q+1)) decodes to the closed-form values of behavior 3-5 exactly (float equality)"
+    - "test_encode_roundtrip: x = rng(0) normal (4, 512) float32 -> ref-decoded encode(x, t) has relative Frobenius error <= 0.01 (Q8_0), 0.03 (Q6_K), 0.06 (Q5_K), 0.12 (Q4_K), 0.12 (Q4_0); F16/BF16/F32 exact up to the dtype's rounding"
+    - "test_write_gguf_layout: write 3 tensors (Q4_K 8x256, F32 256, F16 4x32) + llama_kv(tokens of 50 strings) -> an independent struct-based walk in the test reproduces infos_end, data_offset % 32 == 0, offsets multiples of 32, size == data_offset + last offset + last nbytes, magic/version fields"
+    - "test_alignment_kv: alignment=64 adds general.alignment UINT32 64 and data_offset % 64 == 0"
+    - "test_hf_to_gguf_names: model.layers.3.mlp.gate_proj.weight -> blk.3.ffn_gate.weight; model.embed_tokens.weight -> token_embd.weight; lm_head.weight -> output.weight"
+  commands:
+    - pytest -q tests/test_gguf_fixtures.py
+    - pytest -q
+out_of_scope:
+  - scout's decoders (T305) and parser (T304)
+invariants_touched: []
+decisions: [D65, D66]

@@ -1,0 +1,53 @@
+id: T308
+title: Quantised σ-sample and anchor reads - GGUF quant dtypes eligible (QUANT_PARAMS.sample_dtypes), dequantising decode, block-quantised anchor row ranges; float plans byte-identical to P3
+depends_on: [T204, T205, T206, T303, T305, T313]
+files:
+  - scout/gate.py
+  - scout/sigma.py
+  - scout/cka.py
+  - tests/test_quant_sampling.py
+route: opus
+spec_complete: true
+interface: |
+  scout/sigma.py (P2 T107 / P3 T204; SIGMA_PARAMS, SUPPORTED_DTYPES, compute_all, compute_with_stats unchanged):
+    SAMPLE_DTYPES: frozenset[str] = SUPPORTED_DTYPES | frozenset(QUANT_PARAMS["sample_dtypes"])
+    def decode_tensor(raw: bytes, dtype: str, shape: tuple[int, int]) -> numpy.ndarray
+        # dtype in SUPPORTED_DTYPES -> the P2 path, unchanged; dtype in QUANT_PARAMS["sample_dtypes"] ->
+        # scout.dequant.decode(raw, dtype, shape, out="float64"); else SigmaError (as P2)
+  scout/gate.py (P2 T106 / P3 T206):
+    σ-role eligibility: `dtype in SUPPORTED_DTYPES` becomes `dtype in sigma.SAMPLE_DTYPES` (every other rule unchanged)
+    anchor rows: the byte size of one embedding row is scout.dequant.row_nbytes(dtype, hidden) (for float dtypes this
+    equals hidden * dtype bytes, so float plans are byte-identical); anchor eligibility accepts SAMPLE_DTYPES
+  scout/cka.py (P3 T205; CKA_PARAMS unchanged):
+    find_embedding(...): dtype accepted when in CKA_PARAMS["dtypes"] or in QUANT_PARAMS["sample_dtypes"]
+behavior: |
+  1. No frozen literal changes: SIGMA_PARAMS, CKA_PARAMS and ALIGN_PARAMS stay equal to their P2/P3 literals (P2 C10 and
+     P3 C5 keep passing). The extension is expressed through QUANT_PARAMS (T305) only.
+  2. gate.plan_sample: the per-layer byte cap uses each tensor's true nbytes (already Parquet/TensorInfo nbytes), so a
+     Q4_K v_proj costs 0.5625 B per weight. A role whose tensors are a mix of eligible and ineligible dtypes across
+     blocks keeps P2's rule (the first ineligible tensor drops the role with a reason naming the dtype).
+  3. Anchor reads of a block-quantised embedding: row r occupies [8 + header_len + data_begin + r*row_nbytes,
+     ... + (r+1)*row_nbytes); hidden % block elements != 0 -> the anchor unit is skipped with reason
+     "embedding rows not block-aligned". Coalescing of consecutive ids unchanged.
+  4. Anchor decode (the T207 COMPUTE path calls sigma.decode_tensor for the coalesced rows with shape (n_rows, hidden)):
+     works unchanged because each row is whole blocks.
+  5. sigma.decode_tensor never scales FP8 (FP8 is not in sample_dtypes; FP8 in σ/anchors stays deferred, plan.md 11).
+  6. Import rule: scout.cka is reachable from scout.features (P3 C10 walk), so it may import scout.dequant but nothing
+     from scout.hub/sources/scan/gate; scout.dequant imports only numpy and scout.errors.
+acceptance:
+  tests:
+    - "test_p3_plan_unchanged: the P3 T207 anchors+sample plan of the P3 synthetic fixture (BF16) has the same plan_id, reads and bytes before and after this change (golden values computed by calling the functions on the fixture in the test with the float path)"
+    - "test_gguf_sigma_plan: a GGUF Q4_K file written by T303 write_gguf from glu_weights(BASE) (hf_to_gguf_names); the test builds the SafetensorsHeader/TensorInfo list itself from write_gguf's offsets (header_len = data_offset - 8, canonical HF names; scout.gguf is NOT used, it lands in the same wave) -> plan_sample reads attn.v and attn.k of every block with ranges [8+header_len+data_begin, ...+nbytes) and bytes == 16 * 2 * tensor_nbytes('Q4_K', 128*256)"
+    - "test_quantised_sigma_r: sigma curves (sigma_values of decode_tensor) of the k/v tensors of weights_fixtures.family_weights(FamilySpec(seed=1)) as BF16 bytes vs T303 encode(.., Q4_K) bytes of the same weights (hidden 128 is not a multiple of 256, so this test uses FamilySpec(seed=1, hidden=256, head_dim=64)) through P2 layercorr.compare + in_run_null on identity alignment -> median_r >= 0.95 (plan.md 3.7: 0.93-1.00 measured) and diag_top1_frac >= 0.8"
+    - "test_quantised_anchor_rows: anchor rows of a Q4_K embedding decode (via sigma.decode_tensor on the coalesced read) equal dequant.decode of the whole embedding at those rows; CKA of BF16 vs Q4_K anchors >= 0.999 (plan.md 3.7)"
+    - "test_find_embedding_quant: find_embedding accepts Q4_K/Q6_K/Q8_0 embeddings; still rejects F8_E4M3 and I32"
+    - "test_params_unchanged: SIGMA_PARAMS, CKA_PARAMS equal the P2/P3 frozen literals (imported from scripts.exit_expectations_p2/p3)"
+    - "test_cka_imports: importing scout.features in a subprocess does not load scout.hub, scout.sources, scout.scan or scout.gate"
+  commands:
+    - pytest -q tests/test_quant_sampling.py
+    - pytest -q
+out_of_scope:
+  - FP8 in σ/anchor plans (companion reads; deferred, plan.md 11)
+  - scan integration of GGUF (T307)
+invariants_touched: [2, 4]
+decisions: [D65, D67]

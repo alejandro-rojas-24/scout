@@ -1,0 +1,118 @@
+id: T404
+title: "Retrain fixtures (test-only) - a tiny tied-embedding Llama family actually trained on CPU (base, fine-tuned derivative, independent control, a derivative with one re-drawn block), a WordLevel tokenizer, a low-entropy Markov-chain text dataset in Parquet, measured against the P4 attribution and the re-initialisation damage; the retrain extra in pyproject.toml"
+depends_on: [T003, T212, T313, T314, T317]
+files:
+  - tests/helpers/retrain_fixtures.py
+  - tests/test_retrain_fixtures.py
+  - pyproject.toml
+route: opus
+spec_complete: true
+interface: |
+  pyproject.toml: [project.optional-dependencies] gains
+    retrain = ["torch>=2.4,<3", "transformers>=4.51,<6", "tokenizers>=0.20,<1"]
+    and the existing dev list gains the same three strings (nothing else changes).
+
+  tests/helpers/retrain_fixtures.py (test-only; imports numpy, pyarrow, torch, transformers, tokenizers and
+  tests.helpers.attrib_fixtures (T313: write_st_repo); no scout imports):
+    # FROZEN constants (test_frozen asserts the literals). They were chosen by the planner from MEASURED runs
+    # (plan.md 2.4 "Rehearsal fixture", validation r1 major 6); changing one to make a test pass is hand-tuning.
+    RT_N_WORDS = 1022
+    RT_BRANCHING = 4
+    RT_PROBS = (0.7, 0.1, 0.1, 0.1)       # successor probabilities, in the order the successors were drawn
+    RT_CHAIN_SEED = 11
+    RT_DIMS = {"n_layers": 8, "hidden": 128, "inter": 128, "n_heads": 4, "n_kv_heads": 2, "head_dim": 32}
+    RT_CONTROL_INTER = 96
+    RT_TIED = True                        # tie_word_embeddings, as the exit subject Qwen2.5-0.5B-Instruct
+    RT_TRAIN = {"steps": 400, "batch": 16, "seq": 64, "lr": 0.003}
+    RT_FINETUNE = {"steps": 60, "batch": 16, "seq": 64, "lr": 0.0003}
+    RT_SEEDS = {"base": 1, "control": 2, "finetune": 3, "text_train": 21, "text_eval": 22, "redraw": 4}
+    RT_FLAGGED = (1, 2, 5, 6)
+    RT_REDRAWN_BLOCK = 3
+    RT_TEXT_WORDS = {"train": 200000, "eval": 20000}
+
+    def rt_vocab() -> list[str]                    # ["<unk>", "<eos>"] + [f"w{i}" for i in range(RT_N_WORDS)] (1024)
+    def rt_tokenizer_json() -> bytes
+    def markov_text(seed: int, n_words: int) -> str
+    def write_text_dataset(root: pathlib.Path) -> dict   # {"root", "train_file": "data/train.parquet", "eval_file": "data/test.parquet"}
+    def llama_config(inter: int) -> dict                  # the literal in behavior 4
+    def train_model(config: dict, seed: int, text: str, *, steps: int, batch: int, seq: int, lr: float,
+                    init_state: dict | None = None) -> dict[str, numpy.ndarray]    # float32 state dict (no lm_head when tied)
+    def write_family(root: pathlib.Path) -> dict[str, pathlib.Path]
+        # {"base", "derived", "control", "redrawn", "data"}; cached: returns at once when root/"DONE" exists
+    rt_family: a pytest fixture (scope "session") -> write_family(tmp_path_factory.getbasetemp() / "rt_family")
+behavior: |
+  1. rt_tokenizer_json(): json.dumps({"version": "1.0", "truncation": None, "padding": None, "added_tokens": [{"id": 0,
+     "content": "<unk>", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": True},
+     {"id": 1, "content": "<eos>", ...same flags}], "normalizer": None, "pre_tokenizer": {"type": "WhitespaceSplit"},
+     "post_processor": None, "decoder": None, "model": {"type": "WordLevel", "vocab": {t: i for i, t in
+     enumerate(rt_vocab())}, "unk_token": "<unk>"}}).encode(). It must load with tokenizers.Tokenizer.from_str and
+     encode "w5 w7" to ids [7, 9]; the P2 tokenizer reader sees type WordLevel and the P3 normalisation is "plain".
+  2. markov_text(seed, n): chain = numpy.random.default_rng(RT_CHAIN_SEED); succ[i] = chain.choice(RT_N_WORDS,
+     RT_BRANCHING, replace=False) for i in range(RT_N_WORDS), in that order and with no other draw from `chain`; every
+     word uses the probabilities RT_PROBS over its successors in drawn order. rng = default_rng(seed); w =
+     int(rng.integers(RT_N_WORDS)); emit n words f"w{w}", each next w = succ[w][rng.choice(RT_BRANCHING, p=RT_PROBS)];
+     the text is "".join(word + ("\n" if (k + 1) % 64 == 0 else " ") for k, word in enumerate(words)).rstrip().
+     (r0 drew Dirichlet probabilities; measured, the derivative was then far from converged, so retraining improved its
+     loss and moved its argmax away from the unmodified model: top-1 agreement fell from 0.96 to 0.83 while ppl_ratio
+     fell to 0.95. With a clear top successor every trained model agrees on the argmax.)
+  3. write_text_dataset(root): train = markov_text(RT_SEEDS["text_train"], RT_TEXT_WORDS["train"]), eval with
+     "text_eval" and "eval"; each written as a Parquet file with one string column "text", one row per line
+     (pyarrow.parquet.write_table, compression "zstd"), at data/train.parquet and data/test.parquet; README.md =
+     "---\nlicense: cc0-1.0\n---\n# synthetic markov text\n".
+  4. llama_config(inter) = {"model_type": "llama", "architectures": ["LlamaForCausalLM"], "vocab_size": 1024,
+     "hidden_size": 128, "intermediate_size": inter, "num_hidden_layers": 8, "num_attention_heads": 4,
+     "num_key_value_heads": 2, "head_dim": 32, "max_position_embeddings": 128, "rms_norm_eps": 1e-06,
+     "rope_theta": 10000.0, "hidden_act": "silu", "initializer_range": 0.02, "tie_word_embeddings": RT_TIED,
+     "attention_bias": False, "mlp_bias": False, "torch_dtype": "float32"}.
+  5. train_model(config, seed, text, ...): torch.manual_seed(seed); torch.use_deterministic_algorithms(True);
+     model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**{k: v for k, v in config.items() if k not in
+     ("model_type", "architectures", "torch_dtype")})) in float32 on CPU; init_state given -> load_state_dict(init_state
+     as tensors, strict=False) with only "lm_head.weight" allowed missing (tied). ids = tokenizers.Tokenizer.from_str(
+     rt_tokenizer_json().decode()).encode(text).ids; per step numpy.random.default_rng(seed) picks `batch` random
+     windows of seq + 1 tokens (start in [0, len(ids) - seq - 1)); AdamW(lr, betas (0.9, 0.95), weight_decay 0), no
+     schedule, no clipping; loss = model(input_ids=x, labels=x).loss; returns {name: float32 numpy} of
+     model.state_dict() without "lm_head.weight" (tied: the file has no lm_head, as the exit subject).
+  6. write_family(root): base = train_model(llama_config(RT_DIMS["inter"]), RT_SEEDS["base"], train text, **RT_TRAIN);
+     derived = train_model(same config, RT_SEEDS["finetune"], markov_text(RT_SEEDS["finetune"], 50000),
+     **RT_FINETUNE, init_state=base); control = train_model(llama_config(RT_CONTROL_INTER), RT_SEEDS["control"], train
+     text, **RT_TRAIN); redrawn = derived with block RT_REDRAWN_BLOCK's mlp.gate_proj/up_proj/down_proj replaced by
+     numpy.random.default_rng(RT_SEEDS["redraw"]).normal(0, 0.02, shape) (float32, in the order gate, up, down). Each is
+     written with T313 write_st_repo(root / name, w, a GluSpec-compatible spec of these dims, rt_vocab(), dtype="F32",
+     readme=...); its tokenizer.json is
+     then overwritten with rt_tokenizer_json() and its config.json with llama_config(...). The derived and redrawn
+     READMEs carry front matter "base_model: base" and "license: apache-2.0"; base and control carry "license:
+     apache-2.0". data = write_text_dataset(root / "data")["root"]. Finally write root/"DONE". Total runtime on 4 CPU
+     cores <= 180 s (planner: 176 s on one thread of a loaded 4-core host).
+  7. Measured by the planner on this exact recipe (plan.md 2.4 "Rehearsal fixture"; scratch re-implementation of the P4
+     statistic and of the T405/T406 loop, transformers 5.18, torch 2.14 CPU): eval ppl base 3.44, derived 2.93, control
+     3.34; P4 attribution derived vs base with control: 8/8 attributed, z_adj 10.6 each (crit 5.20), control z
+     -1.43..0.98, control LOO max 0.8; redrawn: block 3 z_adj -0.31 (not attributed), 7 others attributed; control as
+     subject vs base: 0 attributed. Re-initialising RT_FLAGGED (T405 reinit_blocks, seed 20260929): ppl_ratio 1.324,
+     top1 0.937 (quality_ok False); rehearsal-budget retraining: step 50 ppl_ratio 1.096 (not ok), step 100 1.048 /
+     0.996 (stop under the persistence rule), step 150 1.022 (confirmation, flagged still not attributed); maximum
+     flagged z_adj over 400 steps 1.96. Re-initialising only (2, 5) gave ppl_ratio 1.075 and top1 0.991 and recovered
+     by the first eval, which is why four blocks are flagged.
+acceptance:
+  tests:
+    - "test_frozen: every RT_* constant equals its literal"
+    - "test_tokenizer: tokenizers.Tokenizer.from_str(rt_tokenizer_json().decode()).encode('w5 w7\\nw9').ids == [7, 9, 11]; json has model type WordLevel"
+    - "test_markov_deterministic: markov_text(21, 1000) is identical across calls; every word is w0..w1021; exactly 1000 words; the empirical frequency of each word's first-drawn successor over markov_text(21, 200000) is within 0.05 of 0.7 (pooled over all words)"
+    - "test_dataset_files: write_text_dataset writes two Parquet files with a single 'text' column; each <= 2 MiB; README front matter license cc0-1.0"
+    - "test_family_shapes: write_family -> 5 entries; base/derived/redrawn have 8 blocks of gate (128, 128), control gate (96, 128); no lm_head tensor in any file; config tie_word_embeddings true; every safetensors file parses; tokenizer.json equals rt_tokenizer_json()"
+    - "test_family_quality: for base, derived and control, eval perplexity on the eval text (first 16 windows of 64 tokens) lies in [2.0, 60.0] (RETRAIN_PARAMS.baseline_ppl_range, so the rehearsal's forward check passes)"
+    - "test_family_relations: derived gate weights are within relative Frobenius distance 0.2 of base per block; control gate shapes differ from base; redrawn differs from derived only in block 3's MLP tensors"
+    - "test_family_attribution (validation r1 major 6; the P4 code unchanged): scout.attribute.attribute(derived dir, [base dir], controls=[control dir], store=tmp CardStore, backend=InProcessBackend(tmp), gate_threshold_bytes=0, exact confirmation from a plan_only call) -> base status tested, null_ok, control_ok, 8 of 8 attributed, control 0 leave-one-out hits; the same with redrawn as subject -> block RT_REDRAWN_BLOCK not attributed and the 7 others attributed; control dir as subject against [base] with controls [derived] -> 0 attributed"
+    - "test_reinit_damages_quality (validation r1 major 6): load derived with transformers (local_files_only), zero the MLP output of every RT_FLAGGED block (down_proj.weight = 0) -> on the eval windows exp(CE - CE_derived) > 1.05 or top-1 agreement with derived < 0.90 (planner: 1.324 and 0.937), so the rehearsal must exercise quality recovery"
+    - "test_runtime: write_family on a fresh tmp dir finishes in <= 180 s (marker: slow is NOT used; the fixture is session-cached)"
+  commands:
+    - pip install -e '.[dev]'
+    - pytest -q tests/test_retrain_fixtures.py
+    - pytest -q
+out_of_scope:
+  - any scout code; the retrain plan, loop or job (T403-T407)
+invariants_touched: []
+decisions: [D82]
+notes: |
+  Re-routed to opus in r1 (validation r1 major 6): the constants are measured, and if test_family_attribution or
+  test_reinit_damages_quality fails under the real P4 code, the fix is a judged fixture change reported to the planner
+  (a plan revision), never a silent constant edit.

@@ -1,0 +1,108 @@
+id: T407
+title: "Worker retrain job - retrain spec (kind 'retrain') and its validation, run_retrain_job (lock + sweep, inspect, data read and sha check in META, re-plan and exact-pair check, disk check, gated FULL_DOWNLOAD, COMPUTE = run_loop with offline env, purge in finally, PURGE check, result), abort on client death, worker dispatch and the retrain-env subcommand"
+depends_on: [T315, T316, T402, T406]
+files:
+  - scout/retrain/spec.py
+  - scout/retrain/job.py
+  - scout/jobs/spec.py
+  - scout/jobs/worker.py
+  - tests/test_retrain_job.py
+route: opus
+spec_complete: true
+interface: |
+  scout/retrain/spec.py:
+    def make_retrain_spec(*, rplan: RetrainPlan, decision: GateDecision, subject_target: str, base_target: str,
+                          control_targets: list[str], blocks: list[int], budget_name: str, data: DataSpec,
+                          parent_object: str, endpoint: str, scratch_root: str | None, wire_audit: bool,
+                          client_hostname: str, git_commit: str | None, now: datetime | None = None) -> dict
+        # = scout.jobs.spec.make_spec(plan=rplan.plan, decision=decision, subject_target=subject_target,
+        #   reference_targets=[base_target], control_targets=control_targets, ...) | {"kind": "retrain",
+        #   "retrain_params_digest": retrain_params_digest(), "retrain": {"blocks", "budget", "data": {"repo",
+        #   "revision_sha", "train_file", "eval_file"}, "parent_object"}}   (data.revision_sha = the pinned revision)
+    def validate_retrain_spec(spec: dict) -> list[str]
+  scout/jobs/spec.py (P4 T315): validate_spec(spec): when spec.get("kind") == "retrain", the P4 checks run with the kind
+    check skipped and `from scout.retrain.spec import validate_retrain_spec` problems are appended; otherwise
+    byte-identical behaviour and messages. make_spec and params_digest unchanged.
+  scout/retrain/job.py:
+    def run_retrain_job(spec: dict, *, scratch_root: pathlib.Path, emit: Callable[[dict], None],
+                        client_factory: Callable[[], httpx.Client] | None = None, endpoint: str | None = None,
+                        token: str | None = None, disk_usage: Callable[[str], Any] = shutil.disk_usage,
+                        wall_clock: Callable[[], float] = time.time) -> dict      # retrain JobResult (plan.md 4.4)
+    class AbortFlag:                      # set by emit failures from any thread
+        def __init__(self) -> None; def set(self) -> None; def is_set(self) -> bool
+  scout/jobs/worker.py (P4 T316):
+    main(): a job spec with kind "retrain" is run by scout.retrain.job.run_retrain_job (imported inside main) with the
+    same emit, message and exit-code handling as attribute jobs; new subcommand
+    `python -m scout.jobs.worker retrain-env` -> prints json.dumps({"type": "retrain_env", **scout.retrain.model.
+    environment()}) and returns 0. hello, sweep, audit and attribute jobs unchanged.
+behavior: |
+  1. validate_retrain_spec: kind == "retrain"; exactly 1 reference; >= 1 control; retrain_params_digest 64 hex;
+     retrain.blocks non-empty ascending distinct ints; retrain.budget in RETRAIN_PARAMS["budgets"]; retrain.data.repo a
+     Hub dataset id or an absolute path; revision_sha 40-hex for Hub, non-empty for local; train_file/eval_file
+     strings; parent_object 64 hex. A key containing "token" or "authorization" anywhere -> problem (as P4).
+  2. run_retrain_job, in order (every emitted message goes through a wrapper: an OSError from emit sets the AbortFlag
+     and is re-raised as BackendError in the calling thread; the heartbeat thread swallows it after setting the flag):
+     a. validate_spec(spec) problems -> JobError; params_digest() and retrain_params_digest() must equal the spec's
+        ("worker code differs from client"); endpoint check as P4 T316 step 1.
+     b. ByteLog with on_event emitting events (P4); heartbeat thread every JOB_PARAMS["heartbeat_s"] (P4 message format).
+     c. with WorkerLock(scratch_root): sweep_before = sweep(scratch_root).
+     d. token/client as P4 T316 step 4 (wire audit included).
+     e. insp = scan.inspect_all([subject] + [base] + controls, log, ...) (RESOLVE, HEADERS, META). Still in META:
+        ds = DataSpec(spec.retrain.data.repo, spec.retrain.data.revision_sha, spec.retrain.data.train_file,
+        spec.retrain.data.eval_file); dsrc = data_source(ds, log.view("data:"), client=..., endpoint=..., token=...);
+        dsrc.resolve(); files = resolve_data(dsrc.files(), ds, dsrc.revision_sha); lic =
+        data_license(dsrc); train_bytes = dsrc.read_file(train); eval_bytes = dsrc.read_file(eval); for a Hub file with
+        lfs_sha256, sha256(bytes) must equal it, else RetrainRefused(f"data file {path}: sha256 mismatch") (0 weight
+        bytes, no scratch dir).
+     f. rp = plan_retrain(LoadedModel subject, base, controls=..., blocks=spec.retrain.blocks, data_files=files,
+        budget_name=spec.retrain.budget, data_license=lic, threshold_bytes=min(spec.plan.threshold_bytes,
+        DEFAULT_GATE_THRESHOLD_BYTES), host, scratch_root, disk_free_bytes). rp.plan_id != spec.plan.plan_id or
+        rp.plan.bytes_cap != spec.plan.bytes_cap -> log.note("gate", format_retrain_plan(rp)); PlanMismatch (0 weight
+        bytes). Disk check as P4 (DiskSpaceError).
+     g. FULL_DOWNLOAD: run_full_gate(rp.plan, log, spec_confirmer(spec.confirmation)); emit gate; grant; ScratchDir.create;
+        download.download_plan(rp.plan, sources, scratch, log) (P4, unchanged).
+     h. log.stage(COMPUTE) (revokes the grant). With os.environ temporarily updated by RETRAIN_PARAMS["offline_env"]
+        and by the cache redirection (validation r1 minor, C7 scope): HOME, TMPDIR, XDG_CACHE_HOME, HF_HOME,
+        TORCH_HOME and TRITON_CACHE_DIR = <scratch job dir>/env/<name> (created empty first), and tempfile.tempdir set
+        to <job dir>/env/TMPDIR, so any file torch, transformers, tokenizers or triton writes during COMPUTE lands
+        inside the job dir and is counted by the post-purge 0-file audit (the env subtree is deleted by scratch.purge
+        like everything else; run_retrain_job counts the files and bytes under env/ right before scratch.purge() and puts
+        them in the result as env_files / env_bytes; the P4 purge report is unchanged). Everything is restored afterwards: provider = ScratchProvider(scratch, rp.plan, block_sizes); inputs = LoopInputs(
+        attrib_plan=rp.attrib_plan, models, vocabs (as P4 T316), provider, subject_config=subject card config.raw,
+        subject_names=[r.tensor for r in the subject ModelPlan reads], tokenizer_json=the subject's tokenizer.json bytes
+        (from the inspection's tokenizer read), train_texts=read_texts(train), eval_texts=read_texts(eval),
+        recipe=rp.recipe, budget_name, device=select_device(), lineage={"parent": subject card key, "parent_object":
+        spec.retrain.parent_object}, license={"subject": subject model_card license, "references": [{title, license}
+        for base and controls], "data": lic}); holder = []; retrain = run_loop(inputs, abort=flag.is_set,
+        note=lambda s: log.note("job", s), on_baseline=holder.append); baseline attribution = holder[0] (behavior 3).
+        finally: scratch.purge() and the P4 purge note; report.ok false -> PurgeError.
+     i. PURGE check (P4 T316 step 9).
+     j. result = P4 JobResult fields (plan_id, purge, disk, totals, n_events, stage_s, wall_s, rss_peak_bytes, wire,
+        git_commit, scout_version, sweep_before) + {"attribution": baseline attribution.v1 (job None), "retrain":
+        retrain, "retrain_env": environment(), "env_files": int, "env_bytes": int}; emitted as the result message by worker.main.
+  3. Baseline attribution hand-off: T406's run_loop calls on_baseline exactly once with the baseline attribution.v1
+     right after computing it (T406 interface); this task edits nothing in loop.py.
+  4. Abort: when the AbortFlag is set (client gone), the Trainer raises Aborted at its next step or eval chunk; the
+     finally purges; the worker exits with the error message path of P4 (exit 7).
+  5. Nothing is written outside the scratch job dir; after the purge the job dir is absent; bytes_written ==
+     rp.plan.bytes_planned.
+acceptance:
+  tests:
+    - "fixtures: T404 rt_family (local folders for subject derived, base, control, and the data folder); specs built with T403 plan_retrain from client-side scans (tmp store) and make_retrain_spec with an exact cli-flag decision, gate threshold 0, budget 'rehearsal'"
+    - "test_validate_retrain_spec: a valid spec -> []; missing parent_object, budget 'huge', blocks [5, 2], a nested 'hf_token' key -> problems; scout.jobs.spec.validate_spec on the same spec -> [] and on a P4 attribute spec -> unchanged result (P4 tests pass)"
+    - "test_run_retrain_job_direct: run_retrain_job(spec, emit=collector) -> result retrain.outcome 'success', validate_retrain == [], attribution (baseline) validates; purge ok, bytes_written == bytes_planned; scratch audit 0 files; totals.weight within [bytes_planned, bytes_cap]; events contain 'retrain eval step' notes and the COMPUTE purge note before the PURGE check note; exactly 1 gate message via job-spec; data files logged as META fetch events of class meta"
+    - "test_run_retrain_job_local_backend: T315 LocalBackend (real subprocess) + run_job_via -> succeeded; n_ingested == result n_events; client totals.weight == worker totals.weight"
+    - "test_recipe_changed_refused: spec with retrain.blocks [2] while the confirmed plan was built for [2, 5] -> PlanMismatch, 0 weight bytes, no scratch dir"
+    - "test_data_sha_mismatch: FakeHub dataset (T402) with lfs_sha256 on, InProcessBackend-style direct call, scout.retrain.job's sha256 helper monkeypatched to return a wrong digest -> RetrainRefused (exit 10), 0 weight bytes, no scratch dir"
+    - "test_abort_on_broken_pipe: emit raises BrokenPipeError for heartbeat messages once COMPUTE started (heartbeat_s monkeypatched to 0.01) -> the job raises within 2 trainer steps of the flag (Trainer.step spy counts), scratch dir absent, purge note emitted"
+    - "test_offline_env_restored: during run_loop os.environ has HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1 (spy); afterwards the previous values are back"
+    - "test_cache_dirs_in_job_dir (validation r1 minor): during run_loop HOME, TMPDIR, XDG_CACHE_HOME, HF_HOME, TORCH_HOME, TRITON_CACHE_DIR and tempfile.gettempdir() all lie under the scratch job dir (spy); a file written to tempfile.gettempdir() by a monkeypatched Trainer.step appears in the result's env_files == 1 and is gone after the purge (audit 0 files); afterwards every variable has its previous value"
+    - "test_retrain_env_cli: `python -m scout.jobs.worker retrain-env` prints one JSON line with type retrain_env and every plan.md 4.4 key; exit 0"
+    - "test_attribute_jobs_unchanged: the P4 T316 test module passes unchanged (full suite)"
+  commands:
+    - pytest -q tests/test_retrain_job.py
+    - pytest -q
+out_of_scope:
+  - the client, the Card and the store (T408); CLI (T414)
+invariants_touched: [1, 2]
+decisions: [D83, D84, D96]

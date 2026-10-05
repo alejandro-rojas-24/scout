@@ -1,0 +1,107 @@
+id: T213
+title: Set scanner (plan-only / confirm-plans) for labeled + library repos, library manifest, pins_p3, pin_exit --phase 3
+depends_on: [T116, T201, T207, T218]
+files:
+  - scripts/p3_set.py
+  - library/manifest.yaml
+  - exit/pins_p3.json
+  - scripts/pin_exit.py
+  - .gitignore
+  - tests/test_p3_set.py
+  - tests/test_pin_exit_p3.py
+route: opus
+spec_complete: true
+interface: |
+  library/manifest.yaml (committed; schema library.v1):
+    schema: library.v1
+    entries:            # exactly the 16 entries of plan.md 3.6, in that table order
+      - {repo: Qwen/Qwen2.5-0.5B, family: qwen, note: "", verify: false}
+      ...               # verify true for deepseek-ai/DeepSeek-V3-Base, deepseek-ai/deepseek-llm-7b-base, google/gemma-2-9b,
+                        # mistralai/Mistral-7B-v0.1 (gate status)
+  exit/pins_p3.json: {repo: "UNPINNED"} for the 51 repos of labeled ∪ library, keys sorted
+  exit/ledger_p3.jsonl is NOT created or committed by this task (the first real append at E2 creates it; tests use tmp paths)
+  .gitignore: += "cards/"
+
+  scripts/p3_set.py:
+    from scripts.exit_check_p2 import parse_confirm_plans, format_confirm_plans      # P2 T116
+    from scripts.exit_check import CountingTransport                                 # P1 T015
+    def load_manifest(path) -> list[dict]          # validates schema, families in {qwen, llama, deepseek, mistral, gemma}, unique repos
+    def p3_targets(labeled_path, manifest_path) -> list[str]      # sorted(labeled repos ∪ library repos)
+    def scan_set(pins: dict[str, str], out_dir: Path, *, mode: str, confirm_plans: dict[str, int] | None = None,
+                 endpoint: str = HF_ENDPOINT_URL, client_factory: Callable[[], httpx.Client] | None = None,
+                 display: Callable[[str], None] = <stderr>, gate_threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES,
+                 claims_out: dict | None = None, ledger_path: Path | None = None) -> dict
+        # returns the SCAN payload dict (plan.md 4.9); when ledger_path is given it also appends it as a SCAN entry
+        # via scripts.p3_ledger.append (T218) BEFORE returning
+    def card_file_hashes(out_dir: Path, repo: str, pin: str) -> dict | None
+        # {"json": sha256 hex, "parquet": sha256 hex} of card_paths(out_dir, repo, pin, None); None if either file is missing
+    def main(argv=None) -> int
+      # subcommand `scan`: --pins (default exit/pins_p3.json) --labeled (default groundtruth/labeled_v1.yaml)
+      #   --manifest (default library/manifest.yaml) --out (default cards/p3) --ledger (default exit/ledger_p3.jsonl);
+      #   exactly one of --plan-only | --confirm-plans ID:CAP,...
+behavior: |
+  1. main scan: HF_ENDPOINT foreign -> 1 (P1 message). HF_TOKEN unset/empty -> print "gated repos (meta-llama, google/gemma,
+     mistralai) need HF_TOKEN for an account that accepted their licences" and return 3. targets = p3_targets(...);
+     set(pins) != set(targets) -> print "C0 target set" row + FAIL, return 1. Any pin not 40-hex -> "pins not set: run
+     `python scripts/pin_exit.py --phase 3`", return 2. Then scan_set.
+  2. scan_set: targets in sorted order, strictly sequential. Per repo:
+     - log = ByteLog(); counting = CountingTransport(httpx.HTTPTransport()) unless client_factory is given (tests: FakeHub);
+       client = httpx.Client(transport=counting) or client_factory().
+     - If a Card already exists at card_paths(out_dir, repo, pin, None) and loads with schema card.v2 and options all true:
+       skip (record "existing") in both modes. Never re-read weights for an existing Card.
+     - confirmer: mode "plan" -> lambda plan: (record plan; gate.decision(plan, approved=False, via="no-confirmer",
+       bytes_confirmed=None)); mode "confirm" -> gate.flag_confirmer(plan_id, cap) where (plan_id, cap) is the entry of
+       confirm_plans matching the displayed plan's id; missing -> display "NOT CONFIRMED: plan {id} (cap {cap}) is not in
+       --confirm-plans" and decline. The plan text is displayed by run_gate (gate_display=display) BEFORE any decision.
+     - scan(f"{repo}@{pin}", out_dir, log, client=client, endpoint=endpoint, tokenizer=True, sample=True, anchors=True,
+       confirmer=confirmer, gate_threshold_bytes=gate_threshold_bytes, gate_display=display).
+       mode plan: gate_threshold_bytes is forced to 0 (whatever was passed), so run_gate never auto-approves and every
+       plan reaches the declining confirmer: GateDeclined is expected (record the plan), no Card is written and 0 weight
+       bytes are read in plan mode. (This keeps every sampled Card later than the FREEZE_LABELED ledger entry, exit C1.)
+       mode confirm: success -> Card written.
+       Zero-read plans (both modes): if scan returns without GateDeclined and the written Card has an empty
+       fetch_log.gate and a note "sigma: nothing sampleable" (P2 T108 skips SAMPLED_READ/COMPUTE when plan.reads is
+       empty), record the repo under "zero_read", status "ZERO-READ", delete that Card's files (card_paths json + parquet;
+       0 weight bytes were read, so nothing else exists) and display "ZERO-READ PLAN: {repo}: no sigma roles and no anchor
+       rows; replace it by a plan revision before FREEZE (plan.md 2.1)".
+       Any other ScoutError: record {"repo", "error": str(e), "exit_code"} and continue with the next repo.
+     - After each repo: record plan (plan_id, bytes_planned, bytes_cap, n_reads, number of anchor rows), totals
+       (meta/header/weight) and the model-card claims. Claims: from the written Card's model_card.base_model when a Card
+       exists; otherwise (plan mode, declined) fetched with a separate source of the same kind at the same pin:
+       HubSource(repo, pin, log2, client=client, endpoint=endpoint).resolve(); read_file("README.md") (meta bytes only; log2's
+       meta total is added to the repo's meta_bytes) and parsed with scout.metadata.parse_model_card(raw).base_model.
+       Weight bytes stay 0 on this path (log2 never grants).
+  3. Output: a table `repo | status | bytes_planned | bytes_cap | weight_bytes | claims`; then "TOTAL PLANNED: {sum} B
+     ({GiB:.2f} GiB)" and, in plan mode, "CONFIRM WITH: --confirm-plans " + format_confirm_plans(declined plans in target
+     order). The payload is {"mode", "plans", "confirm_plans", "weight_bytes", "meta_bytes", "claims", "zero_read",
+     "errors", "card_files", "git_commit", "git_dirty"} where card_files = {repo: card_file_hashes(...)} for every target
+     that has a Card at the end of a confirm run (including "existing" ones), and {} in plan mode. main passes
+     ledger_path=--ledger, so the entry is appended by the script itself (p3_ledger.append(path, "SCAN", payload); a
+     LedgerError -> print it and return 1; nothing is appended by hand). The payload is also printed as the last line,
+     as JSON {"step": "SCAN", "phase": 3, "ledger_seq": entry seq, **payload}. Exit 0 iff no errors,
+     zero_read == [] and (plan mode) every repo has either a plan or a Card, (confirm mode) every repo has a Card v2 with
+     options all true; zero_read non-empty -> exit 1.
+  4. pin_exit.py --phase 3: targets = p3_targets(default paths); default pins exit/pins_p3.json; HF_TOKEN required (3);
+     git env as P2 (GIT_CONFIG_* header); PIN line gains "phase": 3. --phase 1/2 unchanged.
+  5. Weight bytes are only ever read inside scan() under the P2 gate; this script adds no read path.
+acceptance:
+  tests:
+    - "tests/test_p3_set.py uses FakeHub (client_factory=hub.client, endpoint=HUB) with 3 repos from T207-style fixtures (one big enough to exceed a threshold of 0)"
+    - "test_plan_mode: default gate_threshold_bytes (64 MiB, larger than every fixture plan) -> still every plan is declined (threshold forced to 0), no Card written, 0 weight bytes for every repo; no cdn range inside any tensor data; the SCAN dict has 3 plans; output contains 'CONFIRM WITH: --confirm-plans' with the 3 id:cap pairs; claims parsed from README"
+    - "test_confirm_mode: confirm_plans from the plan run -> 3 Cards card.v2 with options all true; weight_bytes == bytes_planned per repo"
+    - "test_ledger_entries: plan run then confirm run with ledger_path=tmp -> p3_ledger.read_ledger gives 2 SCAN entries (mode plan, mode confirm), chain intact; the confirm payload's card_files has the 3 repos and each hash equals hashlib.sha256 of the Card JSON / Parquet bytes on disk; the plan payload's card_files == {}; a pre-broken ledger (one byte flipped) -> main returns 1 and the file is unchanged"
+    - "test_missing_plan_declined: confirm_plans without one id -> 'NOT CONFIRMED' displayed; that repo has no Card; exit code non-zero"
+    - "test_zero_read_flagged: a 4th fixture repo with 4 layers (P2 T106 test_plan_shallow: no sigma reads) and no tokenizer.json (so no anchor unit) -> plan mode: 'ZERO-READ PLAN: <repo>' displayed, SCAN dict zero_read == [repo], no Card file left for it, main exit 1; the other 3 repos are unaffected"
+    - "test_existing_card_skipped: second confirm run makes 0 cdn weight requests (FakeHub cdn_reads unchanged)"
+    - "test_main_guards: HF_TOKEN unset -> 3; foreign HF_ENDPOINT -> 1; wrong target set -> 1; UNPINNED -> 2; both/neither mode flags -> 2"
+    - "test_manifest: library/manifest.yaml loads; 16 entries; families exactly {qwen, llama, deepseek, mistral, gemma}; every family has >= 1 entry; p3_targets(real files) has 51 repos; exit/pins_p3.json keys == p3_targets"
+    - "tests/test_pin_exit_p3.py: fake run_cmd: agree -> 0 with 51 repos written; HF_TOKEN unset -> 3; phase 1 and 2 behaviour unchanged (existing tests pass)"
+  commands:
+    - pytest -q tests/test_p3_set.py tests/test_pin_exit_p3.py tests/test_pin_exit.py tests/test_pin_exit_p2.py
+    - pytest -q
+    - "at EXIT only: python scripts/pin_exit.py --phase 3; python scripts/p3_set.py scan --plan-only; (FREEZE labeled); python scripts/p3_set.py scan --confirm-plans <line>"
+out_of_scope:
+  - training/eval (T214, T217)
+  - a Card store or cache beyond skipping an existing complete Card (P4)
+invariants_touched: [1, 2, 6]
+decisions: [D46, D54]

@@ -1,0 +1,93 @@
+id: T406
+title: "Retrain loop - baseline fingerprint and refusal, forward check, re-initialisation, training with eval points, re-fingerprint through RetrainProvider with the unchanged P4 attribute(), stop rule, outcomes, retrained digest, release, retrain.v1 assembly"
+depends_on: [T401, T405]
+files:
+  - scout/retrain/loop.py
+  - tests/test_retrain_loop.py
+route: opus
+spec_complete: true
+interface: |
+  scout/retrain/loop.py (imports scout.attrib, scout.retrain.model, scout.retrain.train, scout.retrain.params,
+  scout.caveats, scout.card (validate_retrain); torch only through model/train):
+    class RetrainProvider:                       # scout.attrib.TensorProvider
+        def __init__(self, inner: TensorProvider, overrides: dict[str, numpy.ndarray], *, subject_index: int = 0) -> None
+        def tensor(self, model: int, name: str) -> numpy.ndarray      # overrides[name] for the subject, else inner
+        def rows(self, model: int, name: str, rows: Sequence[int]) -> numpy.ndarray   # always inner (embeddings unchanged)
+    def summarize(att: dict, blocks: list[int]) -> dict
+        # {"base_status", "null_ok", "control_ok", "flagged": [{index, z, z_adj, z_pair, crit, attributed}],
+        #  "unflagged_attributed", "unflagged_tested", "control_hits"}; base = the first reference with role "reference"
+    def flags(row: dict, params: dict = RETRAIN_PARAMS) -> tuple[bool, bool]      # (signal_dropped, quality_ok), plan.md 4.2
+    @dataclass(frozen=True)
+    class LoopInputs:
+        attrib_plan: FullPlan; models: dict[int, LoadedModel]; vocabs: dict[int, VocabIds | None]
+        provider: TensorProvider; subject_config: dict; subject_names: list[str]; tokenizer_json: bytes
+        train_texts: list[str]; eval_texts: list[str]; recipe: dict; budget_name: str; device: str
+        lineage: dict; license: dict            # plan.md 4.2 lineage (statement filled here) and license (question filled here)
+    def run_loop(inp: LoopInputs, *, abort: Callable[[], bool] = lambda: False, note: Callable[[str], None] = lambda s: None,
+                 on_baseline: Callable[[dict], None] = lambda att: None,
+                 clock: Callable[[], float] = time.monotonic, now: Callable[[], str] | None = None) -> dict   # retrain.v1, job None
+behavior: |
+  1. Baseline fingerprint: att0 = scout.attrib.attribute(inp.attrib_plan, inp.models, inp.vocabs, inp.provider,
+     computed_at=now()); on_baseline(att0) (the worker stores it as the Card's stats.attribution). b = summarize(att0, blocks). baseline.flagged = b.flagged. ok = b.base_status == "tested" and
+     b.null_ok and b.control_ok and all(f.attributed for f in b.flagged); reason when not ok, first match:
+     f"base not tested ({status})", "null_ok false", "control_ok false: the control model is not a valid null",
+     f"block {i} is not attributed to the base at baseline". Not ok -> outcome "refused_baseline", trace [],
+     final_attribution None, retrained_digest None, baseline eval_loss/ppl None; return (no model is built).
+  2. Model: model = build_model(inp.subject_config, lambda n: inp.provider.tensor(0, n), inp.subject_names, inp.device).
+     ids_train = tokenize(inp.tokenizer_json, inp.train_texts); ids_eval likewise; b = budget(inp.budget_name);
+     train_w = windows(ids_train, b.seq_len); eval_w = windows(ids_eval, b.seq_len, b.n_eval_seqs); either empty ->
+     RetrainError("not enough data tokens for one window"). recipe.data.n_train_tokens / n_eval_tokens = len(ids).
+  3. Forward check (before any re-initialisation): ev = Trainer(model, [], train_w, b, device=inp.device,
+     seed=recipe.seed, abort=abort) (trainable=[] creates no optimiser; T405); L0, ref = ev.baseline(eval_w) (ref = the
+     unmodified subject's argmax tokens, kept in RAM); ppl0 = exp(L0); baseline.eval_loss/ppl set. ppl0 outside RETRAIN_PARAMS["baseline_ppl_range"] (inclusive) ->
+     outcome "refused_forward_check", reason f"baseline perplexity {ppl0:.2f} outside [lo, hi]: the forward pass does
+     not reproduce the model", trace []; release(model); return.
+  4. trainable = reinit_blocks(model, recipe.stack_prefix, recipe.blocks, recipe.reinit.init_std, recipe.reinit.seed);
+     trainer = Trainer(model, trainable, train_w, b, device=inp.device, seed=recipe.seed, abort=abort).
+     gate_up = the gate and up names among trainable. Right after re-initialisation (before any step): (Lr, ar) =
+     trainer.evaluate(eval_w, ref); reinit = {"eval_loss": Lr, "ppl_ratio": exp(Lr - L0), "top1_agreement": ar}
+     (the "MLP removed" state; reported, never a stop point); reinit_digest = digest(tensors_of(model, trainable),
+     trainable) (validation r1 minor: the exit compares it with retrained_digest to show training changed the weights).
+  5. For s in 1..b.max_steps: loss = trainer.step(). When s % b.eval_every == 0: (L, agree) = trainer.evaluate(eval_w,
+     ref); ov = tensors_of(model, gate_up); att = attribute(inp.attrib_plan, inp.models, inp.vocabs,
+     RetrainProvider(inp.provider, ov), computed_at=now()); row = {step: s, train_loss: loss (the last step's),
+     eval_loss: L, ppl_ratio: exp(L - L0), top1_agreement: agree, **summarize(att, blocks),
+     signal_dropped, quality_ok = flags(row), wall_s: clock() - t_start}; append; note(f"retrain eval step {s}: ppl_ratio
+     {r:.3f} top1 {a:.3f} flagged_attributed {k}/{K}"); keep att as last_att.
+     Stop rule with persistence (plan.md 3.1 step 5, 4.2; validation r1 major 2): keep `candidate` = the previous row
+     when it had both flags. If candidate is set and this row has signal_dropped -> outcome "success", stop_step =
+     candidate.step, confirm_step = s, post_stop_max_z_adj = max non-null flagged z_adj of this row, final_attribution
+     = att (this row's); break. Otherwise candidate = this row if it has both flags and s + eval_every <= max_steps,
+     else None. (A drop seen at one look only is never a stop; the loop always measures one more interval.)
+  6. No break: outcome from the last row per plan.md 4.2 (signal_persists / quality_not_recovered / neither /
+     unconfirmed when the last row has both flags), stop_step None, confirm_step None, post_stop_max_z_adj None,
+     final_attribution = last_att, reason = the failed flags spelled out.
+  7. retrained_digest = digest(tensors_of(model, trainable), trainable); then release(model, trainer) (every tensor
+     reference dropped; CUDA cache emptied). The finally around steps 2-7 always calls release, also on Aborted.
+  8. Assemble retrain.v1 (plan.md 4.2): params RETRAIN_PARAMS, budget, recipe, env = {device, device_name, dtype
+     ("bf16-autocast" on cuda, "float32" on cpu), torch, transformers, tokenizers, cuda} from environment(), baseline,
+     reinit (None when refused), reinit_digest (None when refused), trace, outcome, stop_step, confirm_step,
+     post_stop_max_z_adj, reason, final_attribution, retrained_digest, weights_kept False, lineage = inp.lineage |
+     {"relation": "partial-mlp-retrain", "statement": RETRAIN_CAVEAT}, license = inp.license | {"question":
+     LICENSE_QUESTION}, caveat RETRAIN_CAVEAT, job None, computed_at now(). Every float rounded to 6 decimals.
+     validate_retrain(result) must be [] (else AssertionError: a bug, never data).
+acceptance:
+  tests:
+    - "fixtures: T404 rt_family; subject derived, base, control; attrib plan from T403 plan_retrain(...).plan restricted to its attribution part (plan_attribution with the same models); a numpy TensorProvider over the fixture safetensors files (test helper in this file); rehearsal budget; device cpu"
+    - "test_loop_success (rt_family, the T404 frozen fixture; numbers measured by the planner in plan.md 2.4 'Rehearsal fixture'): blocks list(RT_FLAGGED) -> outcome 'success'; baseline.ok with every flagged block attributed; recovery is exercised: reinit.top1_agreement < 0.90 or reinit.ppl_ratio > 1.05 (quality_ok False right after re-initialisation) and the first trace row has quality_ok False; at stop_step and confirm_step every flagged block is not attributed while base tested, null_ok and control_ok; unflagged_attributed == unflagged_tested == 8 - len(RT_FLAGGED) at both rows; ppl_ratio <= 1.05 and top1_agreement >= 0.90 at stop_step; confirm_step == stop_step + 50 == last trace step; retrained_digest != reinit_digest; validate_retrain == []; confirm_step <= 400"
+    - "test_refused_baseline: subject redrawn, blocks [3] -> outcome 'refused_baseline', reason names block 3, no model built (build_model spy not called)"
+    - "test_refused_forward_check: Trainer.baseline monkeypatched to return loss 10.0 -> 'refused_forward_check', trace []"
+    - "test_signal_persists: Trainer.step monkeypatched so that after the real step it copies the base's gate/up (permuted rows) into the flagged blocks -> no row has signal_dropped; outcome 'signal_persists' (quality stubbed ok) and final_attribution attributes the flagged blocks"
+    - "test_quality_not_recovered: Trainer.evaluate monkeypatched to return (L0 + 1.0, 0.5) -> outcome 'quality_not_recovered' after max_steps; stop_step None"
+    - "test_transient_drop_not_a_stop (validation r1 major 2): attribute() wrapped so that the flagged block is reported attributed at the second eval only (a drop at the first eval, back at the second, dropped from the third on; quality stubbed ok) -> stop_step is the third eval step, confirm_step the fourth; the first eval is never the stop"
+    - "test_unconfirmed: quality stubbed ok only at the last eval step -> outcome 'unconfirmed', stop_step None"
+    - "test_abort_releases: abort flips to True after 3 steps -> Aborted raised; release was called (spy)"
+    - "test_provider_overrides: RetrainProvider returns overrides only for model 0 and only for the given names; rows() always delegates"
+    - "test_summarize_flags: hand-built attribution (tests/helpers/retrain_records.make_attribution) -> summarize values; flags() truth table over the 4 combinations"
+  commands:
+    - pytest -q tests/test_retrain_loop.py
+    - pytest -q
+out_of_scope:
+  - downloads, scratch, jobs and messages (T407); the Card (T408)
+invariants_touched: [1, 4]
+decisions: [D81, D83, D98]

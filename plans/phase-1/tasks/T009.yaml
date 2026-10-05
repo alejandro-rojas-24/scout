@@ -54,13 +54,28 @@ behavior: |
      structure.places[name], file, dtype, shape (list), numel, nbytes, data_begin, data_end; all stat_* are null.
      Build it with pyarrow.Table.from_pydict(..., schema=PARQUET_SCHEMA). Then replace the schema metadata with
      {b"schema_version", b"repo", b"revision_sha", b"component"} (component "" for None).
-  4. write_card: mkdir parents. Write JSON (indent=2, ensure_ascii=False, UTF-8) to f"{json_path}.tmp-{pid}", then
-     os.replace. Write parquet (pyarrow.parquet.write_table, compression "zstd") to a temp name, then os.replace.
+  4. write_card: mkdir parents. Temp files are created with tempfile.mkstemp(dir=json_path.parent, prefix=f".{name}.",
+     suffix=".tmp") so concurrent writers (two server threads scanning the same target) never share a temp name.
+     Write JSON (indent=2, ensure_ascii=False, UTF-8) to its temp file, then os.replace. Write parquet
+     (pyarrow.parquet.write_table, compression "zstd") to its own mkstemp temp file, then os.replace.
      Parquet first, then JSON, so a JSON file never points at a missing parquet. On any exception, remove the temp
      files and re-raise. Write nothing else, anywhere.
   5. load_card: json.load plus pyarrow.parquet.read_table(json_path.parent / card["tensors_parquet"]). Raise ScoutError if
      schema_version != "card.v0".
-decisions: []
+decisions:
+  - "PARQUET_SCHEMA list columns (shape, stat_spectral_topk, stat_sigma_curve) use a child field named 'element' (pa.list_(pa.field('element', t))). pyarrow renames list children to 'element' on a Parquet round trip, so with 'item' the loaded table would not equal the built one. The arrow types are otherwise exactly plan 4.3."
+  - "Columns not marked '(nullable)' in plan 4.3 are nullable=False in PARQUET_SCHEMA; stack_prefix, block_index, expert_index and all stat_* are nullable. Parquet preserves this on round trip."
+  - "Row sort key is (file, data_begin, data_end, name). The tie-breakers only matter for zero-size tensors that share data_begin, and they keep the order deterministic."
+  - "card_paths raises ScoutError if the repo slug, revision_sha or component slug is '', '.', '..' or contains '/', '\\' or NUL. Component names come from model_index.json keys, which a hostile repo controls, so without this check a key such as '../x' could write outside out_dir. load_card applies the same check to card['tensors_parquet']."
+  - "build_card raises ScoutError if structure.n_tensors != the total tensor count across headers, or if a header tensor is missing from structure.places. Without these checks the Card and the Parquet could silently disagree."
+  - "scan.elapsed_s is coerced with float(). metadata in weights.files is copied into a new dict."
+  - "(Orchestrator decision, review round 1, revised in escalation round 3.) write_card fsyncs each temp file before os.replace. Before any write it records json_existed = paths.json_path.exists(). On any exception (BaseException) it removes the temp files that have not been moved into place. If the JSON write or replace fails after the Parquet was put in place, write_card removes that Parquet only if not json_existed and not paths.json_path.exists(). So a failed first write leaves no Card files behind. A failed rescan keeps the existing JSON and the new Parquet: for a given key (repo, sha, component) the table is deterministic from the same headers, so the existing JSON still points at a valid, matching Parquet and load_card keeps working. In the single-writer case, a JSON file never points at a missing Parquet."
+  - "(Orchestrator decision, review round 1) build_card first serializes and encodes the card with json.dumps(card, indent=2, ensure_ascii=False).encode('utf-8'). A UnicodeError there, for example from a lone surrogate in config.raw, a README field or safetensors __metadata__, becomes ScoutError('card contains unencodable text: ...'). The Parquet table build is wrapped so that UnicodeError and pa.ArrowException become ScoutError, which covers a lone surrogate in a tensor name. BuiltCard keeps its interface fields (card, table, paths). write_card encodes the same card again, which is deterministic, BEFORE mkdir or any temp file. After the first os.replace the only remaining failures are IO errors. The JSON is written as those pre-encoded bytes."
+  - "(Escalation round 3) Known narrow window with concurrent FIRST writers of the same key: writer A places the Parquet, writer B places the same Parquet, A's JSON step fails and A sees no JSON yet, so it unlinks the Parquet. B then places its JSON, which points at a missing Parquet until the next successful write. This needs two simultaneous first scans of one key plus an IO failure in exactly one of them. load_card then raises FileNotFoundError (not a corrupt read), and a rescan repairs it. A lock or Card store is Phase 4 scope (Card cache/store is out_of_scope here)."
+  - "Temp files keep mkstemp's 0600 mode. They are not chmod-ed to the umask, because reading the umask (os.umask set/restore) is not thread-safe. This tool is used by one person, and the server runs as the same user."
+  - "load_card raises ScoutError if the JSON is not an object, if schema_version != card.v0, or if tensors_parquet is not a plain file name. OSError and JSON decode errors propagate unchanged."
+  - "tests/helpers/cards.py::build_fixture_card reads model_index.json (if present) during RESOLVE and sets has_weights per component by trying select_weight_files. It uses scanned_at='2026-01-01T00:00:00Z' and elapsed_s=0.0 and only passes file_sizes for the selected shard files."
+  - "Extra tests beyond the acceptance list: test_pipeline_component, test_atomic_json_failure_leaves_no_temp (os.replace of the JSON fails; asserts no tmp, JSON or Parquet remains), test_failed_rewrite_keeps_existing_card (write OK, then a rewrite whose JSON os.replace fails; load_card still returns the original card and table and exactly the 2 Card files remain), test_lone_surrogate_in_config_refused, test_lone_surrogate_in_tensor_name_refused, test_load_rejects_wrong_version, and in test_paths a '../evil' component that must be refused."
 acceptance:
   tests:
     - "tests/helpers/cards.py: def build_fixture_card(root: Path, out_dir: Path, component: str | None = None) -> BuiltCard. It uses LocalSource + ByteLog (stages RESOLVE, HEADERS, META, REPORT) + select_weight_files/parse_index + read_header + parse_config/parse_model_card + analyze + build_card, with no scan.py. T011 reuses it."
@@ -70,6 +85,7 @@ acceptance:
     - "test_roundtrip: write_card then load_card gives an equal dict and an equal table"
     - "test_atomic: monkeypatch pq.write_table to raise -> no files left under out_dir (glob '**/*' has no files)"
     - "test_fetch_log_embedded: card['fetch_log']['totals']['weight'] == 0 and events non-empty, with counting 'http-body-bytes-yielded'"
+    - "test_concurrent_write: 8 threads write_card the same BuiltCard at once -> no exception; final JSON and parquet load; no '*.tmp' files remain"
     - "test_only_card_files: after write_card, out_dir holds exactly 2 files"
   commands:
     - pytest -q tests/test_card.py

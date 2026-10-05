@@ -1,0 +1,208 @@
+id: T416
+title: "P5 exit expectations - frozen retrain target, report targets and P5 literals; C0-C17 as pure check functions (reusing the P4 C4-C8 functions for the job plumbing)"
+depends_on: [T320, T403, T406, T411, T412]
+files:
+  - scripts/exit_expectations_p5.py
+  - tests/test_exit_expectations_p5.py
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_expectations_p5.py:
+    from scripts.exit_expectations import Check                      # P1 T016
+    import scripts.exit_expectations_p4 as p4                        # P4 T320 (check_env, check_gate, check_log,
+                                                                     # check_wire, check_disk, check_intervention, Env)
+    P5_RETRAIN_TARGET: dict = {"label": "retrain", "subject": "Qwen/Qwen2.5-0.5B-Instruct", "base": "Qwen/Qwen2.5-0.5B",
+        "controls": ("HuggingFaceTB/SmolLM2-360M",), "blocks": (6, 12, 18), "budget": "exit",
+        "data": {"repo": "Salesforce/wikitext", "train_file": "wikitext-2-raw-v1/train-00000-of-00001.parquet",
+                 "eval_file": "wikitext-2-raw-v1/test-00000-of-00001.parquet"},
+        "max_wall_s": 7200, "max_compute_s": 5400}
+    P5_REPORT_TARGETS: tuple[dict, ...] = (
+        {"label": "retrain", "subject": "Qwen/Qwen2.5-0.5B-Instruct", "component": None, "pins": "p3",
+         "run": ("system1", "attribution", "retrain"), "not_run": ("system2",)},
+        {"label": "te", "subject": "Qwen/Qwen-Image", "component": "text_encoder", "pins": "p4",
+         "run": ("attribution",), "not_run": ("system1", "system2", "retrain")},
+        {"label": "negative", "subject": "HuggingFaceTB/SmolLM2-1.7B", "component": None, "pins": "p3",
+         "run": ("system1",), "not_run": ("system2", "attribution", "retrain")})
+    P5_REPOS: frozenset[str]        # {subject, base, control, data repo} of P5_RETRAIN_TARGET (4)
+    MIN_BASELINE_ATTRIBUTED_FRAC = 0.95; MIN_UNFLAGGED_ATTRIBUTED_FRAC = 0.95; MAX_CONTROL_HITS = 0
+    MAX_CRASH_RERUNS = 2   # crash reruns (no result message) allowed per freeze without a refreeze
+    MAX_RSS_BYTES = 48 * 2**30; MIN_GPU_MEM_BYTES = 32 * 2**30; TORCH_MIN = (2, 4); TRANSFORMERS_RANGE = ((4, 51), (6, 0))
+    FROZEN_RETRAIN_PARAMS, FROZEN_REPORT_PARAMS, FROZEN_LINT_PARAMS, FROZEN_READER_PARAMS: dict    # plan.md 4.8 literals
+    @dataclass(frozen=True)
+    class Env5:                         # the only knobs the offline rehearsal may override (never a threshold)
+        p4: p4.Env = p4.Env(); require_cuda: bool = True; min_gpu_mem_bytes: int = MIN_GPU_MEM_BYTES
+        budget: str = "exit"; require_ledger: bool = True
+
+    def check_target_set(pins_p5: dict, pins_p3: dict, pins_p4: dict, report_targets=P5_REPORT_TARGETS) -> list[Check]   # C0
+    def check_env(hello: dict, retrain_env: dict, client_code: dict, disk_needed: int, env: Env5 = Env5()) -> list[Check]  # C1
+    def check_frozen(client: dict, retrain_env: dict, entries: list[dict], client_code: dict, *, step: str,
+                     inputs_now: dict, env: Env5 = Env5()) -> list[Check]                                                   # C2
+        # client = {"retrain_params_digest", "report", "lint", "reader"} literals as imported on the client
+        # inputs_now = {"pins_sha256": sha256 of the pins_p5 bytes now, "model_sha256": sha256 of the JEV model file now,
+        #               "ledger_lines": {"p3": {seq: line_sha256}, "p4": {...}}} (the runner reads them; pure here)
+    def check_plan(rplan: dict, models: list[tuple[dict, pyarrow.Table]], data_files: list[dict]) -> list[Check]            # C3
+    def check_resources(result: dict, target: dict) -> list[Check]                                                         # C9
+        # = p4.check_resources("retrain", result, target, p4.Env(max_rss_bytes=MAX_RSS_BYTES)) (48 GiB, not P4's bound)
+    def check_baseline(retrain_card: dict) -> list[Check]                                                                  # C10
+    def check_loop_integrity(retrain_card: dict) -> list[Check]                                                            # C11a
+    def check_signal_drop(retrain_card: dict) -> list[Check]                                                               # C11b
+    def check_quality(retrain_card: dict) -> list[Check]                                                                   # C12
+    def check_card_v4(store: CardStore, entry: StoreEntry, parent_object: str) -> list[Check]                              # C13
+    def check_caveats(text: str, view: dict) -> list[Check]                                                                # C14
+    def check_report(target: dict, lint_result: dict, file_sha256: str, reports_entry: dict | None, bundle: dict) -> list[Check]   # C15
+    def check_reader(label: str, samples: list[dict], *, reader: str, canary: bool, s2_metas: list[dict] | None,
+                     waived: str | None, blind: bool | None, expected_host: str = "api.anthropic.com",
+                     discarded: list[int] = ()) -> list[Check]                                              # C16 / C17
+        # discarded = seqs of P5_READ_ATTEMPT entries of this reader for this P5_REPORTS with no P5_READER (C16 FAIL)
+        # samples = per-sample score dicts (real report) or canary_detection dicts (canary); llm: 3 samples, human: 1
+    def check_one_shot(entries: list[dict]) -> list[Check]                                                                 # C18
+    OUTCOME_ROW_PREFIXES: tuple[str, ...] = ("C11b", "C12")   # D100: outcome rows; every other row gates
+    def is_outcome_row(row: Check) -> bool                       # row.name.startswith(any OUTCOME_ROW_PREFIXES)
+    def row_verdict(row: Check) -> str                           # "PASS" if ok; "FINDING" if not ok and outcome row; else "FAIL"
+    def gating_ok(rows: list[Check]) -> bool                     # all(row.ok for row in rows if not is_outcome_row(row))
+    QUALIFIERS: tuple[str, ...] = ("after refreeze", "after rerun", "with finding", "with waiver")   # fixed order
+    STATUSES: tuple[str, ...]   # 17 strings: for every subset c of QUALIFIERS (in QUALIFIERS order, subsets
+        # enumerated by the bitmask 0..15 with bit i = QUALIFIERS[i]): "PASS" if not c else "PASS " + ", ".join(c);
+        # then "FAIL". E.g. "PASS", "PASS after refreeze", "PASS after rerun", "PASS after refreeze, after rerun",
+        # "PASS with finding", ..., "PASS after refreeze, after rerun, with finding, with waiver", "FAIL"
+    def crash_attempts(entries: list[dict]) -> list[dict]
+        # under the LAST P5_FREEZE: every P5_RETRAIN with crash true, plus every P5_ATTEMPT that no P5_RETRAIN names
+        # in attempt_seq (the client was killed before it could record a result; validation r2 minor) -> one dict
+        # {seq, kind: "crash" | "client killed"} each, in ledger order
+    def read_attempts(entries: list[dict]) -> list[dict]
+        # every P5_READ_ATTEMPT with {seq, reports_seq, reader, recorded: seq of the P5_READER with attempt_seq == its
+        # seq or None, unreachable: bool (that P5_READER has unreachable true)}
+    def exit_status(entries: list[dict], rows: list[Check], outcome: str | None) -> tuple[str, list[str], str]
+        # (status in STATUSES, notes, printed last line); outcome = the retrain.v1 outcome of the passing P5_RETRAIN
+    ALLOWED_DATASET_PATHS: tuple[str, ...] = ("api", "README.md", "train_file", "eval_file")   # C6 data rule (below)
+behavior: |
+  Each function returns Check(target, name, expected, actual, ok) rows exactly as plan.md 2.3 states:
+  1. C0: set(pins_p5) == P5_REPOS; every pin 40-hex; pins_p5[r] == pins_p3[r] for the 3 model repos; for each report
+     target, its subject pin exists in the named pins file (pins_p3 or pins_p4) - the rehearsal passes its own dicts.
+  2. C1: p4.check_env(hello, client_code, disk_needed, env.p4) rows, plus: retrain_env.error is None; torch version >=
+     TORCH_MIN (parsed major.minor); cuda_available is True when env.require_cuda; device_name non-empty when
+     env.require_cuda; gpu_mem_total_bytes >= env.min_gpu_mem_bytes when env.require_cuda; transformers version in
+     TRANSFORMERS_RANGE (lower inclusive, upper exclusive); tokenizers non-null.
+  3. C2: scout.retrain.params.RETRAIN_PARAMS == FROZEN_RETRAIN_PARAMS, scout.report.bundle.REPORT_PARAMS ==
+     FROZEN_REPORT_PARAMS, scout.report.lint.LINT_PARAMS == FROZEN_LINT_PARAMS, scout.report.reader.READER_PARAMS ==
+     FROZEN_READER_PARAMS; retrain_env.retrain_params_digest == client retrain_params_digest (when retrain_env given);
+     scout.attrib.ATTRIB_PARAMS == p4.FROZEN_ATTRIB_PARAMS (likewise QUANT, GGUF, JOB, STORE) and the P2/P3 parameters
+     equal the exit_expectations_p2/p3 frozen literals (the comparisons p4.check_frozen makes, without its P4_PLAN
+     clause); ledger order: a P5_FREEZE exists, the last P5_FREEZE
+     precedes every P5_PLAN/P5_ATTEMPT/P5_REPORTS/P5_READER counted for this step, and every entry after it has code_id
+     == its code_id == client_code["code_id"]; each P5_FREEZE after a P5_ATTEMPT, P5_REPORTS, P5_READ_ATTEMPT or
+     P5_READER has a non-empty refreeze_reason (listed in actual; validation r2 minor: the same entry set as T417
+     behavior 2 and exit_status below); the freeze payload's params equal the literals and its targets equal
+     P5_RETRAIN_TARGET / P5_REPORT_TARGETS; env.require_clean (p4 Env) -> client_code dirty False.
+     Freeze inputs (validation r1 minor; plan.md 2.1): at every step after the freeze, inputs_now.pins_sha256 == the
+     last P5_FREEZE's pins_sha256, inputs_now.model_sha256 == its model_sha256, and for p3 and p4 the line sha256 at
+     the freeze's cited_ledgers.<name>.head_seq equals its head_line_sha256 (entries appended after that head are
+     allowed). Each failed comparison is its own row naming the input.
+  4. C3: models [subject, base, control] roles; subject reads cover every Parquet row of the subject Card once and
+     sum == weights.tensor_bytes_total; for base and control, p4.expected_plan_bytes([...], attribution part) equals the
+     plan's bytes for them and their reads equal the attribution plan's; bytes_cap == bytes_planned + slack by the P4
+     rule; disk_bytes == bytes_planned; data files == the target's two paths, sizes equal the dataset listing, sum <=
+     FROZEN_RETRAIN_PARAMS["data_max_bytes"]; recipe.blocks == target blocks, budget == env.budget.
+  5. C4-C8 are the P4 functions (check_gate, check_log, check_wire, check_disk, check_intervention) applied to the retrain
+     job with label "retrain"; plus, defined HERE (validation r1 minor; the runner only calls them):
+     - C6 "dataset requests": every worker wire request whose URL path contains "/datasets/" is one of exactly
+       (a) GET /api/datasets/<data repo>/revision/<pin> (the listing; ALLOWED_DATASET_PATHS "api"), (b)
+       /datasets/<data repo>/resolve/<pin>/README.md (the licence, "README.md"), (c) /datasets/<data repo>/resolve/
+       <pin>/<train_file> and (d) .../<eval_file> (redirect targets of (b)-(d) on *.hf.co are attributed to their
+       origin request, as P4 check_wire does for model files); every (c)/(d) body is read exactly once in full; any
+       other dataset path -> FAIL naming it. Function: check_dataset_wire(wire: list[dict], target: dict, pins: dict)
+       -> list[Check] (one row).
+     - C7 "no checkpoint written": purge.bytes_written == plan.bytes_planned; the post-purge audit (which now covers
+       the redirected HOME/TMPDIR/HF_HOME/TORCH_HOME/TRITON_CACHE_DIR/XDG_CACHE_HOME under the job dir, T407) reports 0
+       files and 0 bytes; result env_files and env_bytes are shown in actual (not thresholded).
+  6. C9 (check_resources): wall_s <= target max_wall_s; stage_s["COMPUTE"] <= max_compute_s; rss_peak_bytes <=
+     MAX_RSS_BYTES (48 GiB; Env5 has no knob for it, so the rehearsal checks the same bound).
+  7. C10 (stats.attribution = baseline, stats.retrain.baseline): base reference status tested, null_ok, control_ok;
+     attributed fraction of the base over tested blocks >= 0.95; control n_attributed == 0; every recipe block's
+     baseline.flagged.attributed True; baseline.ppl within FROZEN_RETRAIN_PARAMS["baseline_ppl_range"].
+  8. C11a loop integrity (validation r1 major 1 and minor: rows a correct build passes deterministically, kept apart
+     from the empirical outcome): validate_retrain(r) == []; outcome not refused; reinit present and "re-initialisation
+     changed the forward pass": reinit.ppl_ratio > 1.0 or reinit.top1_agreement < 1.0; "training changed the weights":
+     retrained_digest != reinit_digest; the trace has a row at every multiple of eval_every from eval_every to its last
+     step (no gap); every trace row's flagged entries carry non-null z (the re-fingerprint ran on the live tensors);
+     the baseline flagged z values differ from the last row's (the provider served the retrained tensors); at EVERY
+     trace row unflagged_attributed / unflagged_tested >= MIN_UNFLAGGED_ATTRIBUTED_FRAC (localisation: frozen blocks
+     keep the signal; measured min z_adj 38.3 vs crit 5.20, plan.md 2.4). Row names start with "C11a".
+     C11b signal drop (OUTCOME row, D100; names start with "C11b"): outcome == "success"; at the stop row AND the confirm
+     row (persistence rule, plan.md 3.1 step 5): base_status "tested", null_ok, control_ok, no flagged block attributed,
+     control_hits == 0; confirm_step == stop_step + eval_every <= max_steps; post_stop_max_z_adj shown in actual. For a
+     non-success outcome the row is not ok and actual names the outcome and the last row's flagged z_adj.
+  9. C12 quality (OUTCOME row, D100; names start with "C12"): the stop row's (the last row's when stop_step is None)
+     ppl_ratio <= max_ppl_ratio and top1_agreement >= min_top1_agreement (from the frozen literal).
+  10. C13: schema card.v4; validate_retrain == []; validate_attribution(stats.attribution) == []; lineage.parent_object ==
+      parent_object; weights_kept is False; store.load(entry) returns the Card; card.object_id of the stored files ==
+      entry.object.
+  11. C14: text and view each contain the three DISCLAIMERS, ATTRIBUTION_CAVEAT, RETRAIN_CAVEAT and LICENSE_QUESTION
+      (the view: view.disclaimers, view.attribution.caveat, view.retrain.caveat, view.retrain.license_question).
+  12. C15: lint_result.ok and every row count 0 (one Check per lint row); file_sha256 == reports_entry.sha256 (when the
+      entry is given); bundle.sections statuses equal target run/not_run; answer_key_sha256 in the entry equals
+      reader.key_sha256(reader.answer_key(bundle)).
+  13. C16/C17 (plan.md 3.8; validation r1 majors 3 and 4): one row per file (three reports and the canary).
+      llm: len(samples) == READER_PARAMS["llm_samples"] and reader.llm_verdict(samples, canary=...) ok (a real report:
+      >= 2 of 3 samples passed; the canary: >= 2 of 3 samples failed_as_required); every s2_meta has served_model
+      non-null, request_host == expected_host (the rehearsal passes "stub.invalid") and requested_model ==
+      FROZEN_READER_PARAMS["llm_model"] (validation r2 minor: the measuring instrument is the frozen one; a mismatch is
+      a FAIL that only a refreeze can follow); unavailable samples count as failed samples; a non-empty `discarded`
+      -> FAIL "reading started at seq <s> was not recorded" (validation r2 major 4). human: exactly one sample per file; a real report passed, the canary failed_as_required; blind
+      is True. waived non-empty -> a single row "C17 waived" with ok True and actual "WAIVED: <reason>" (listed in
+      P5_EXIT waivers).
+  14. C18 one-shot protocol (validation r1 major 3; P3 one-shot pattern): over the ledger since the FIRST P5_FREEZE:
+      (a) after every P5_RETRAIN that is not a crash (payload crash False) and did not pass, the next P5_ATTEMPT is
+      preceded by a P5_FREEZE with a refreeze_reason; after a passing P5_RETRAIN no further P5_ATTEMPT exists under the
+      same freeze; (b) at most one P5_REPORTS per P5_FREEZE; (c) at most one P5_READER per (reports_seq, reader);
+      (d) at most MAX_CRASH_RERUNS (2) crash reruns per freeze, counting crash_attempts (crash P5_RETRAIN entries AND
+      P5_ATTEMPT entries without a P5_RETRAIN: a killed client is a crash, validation r2 minor); (e) read attempts
+      (validation r2 major 4): every P5_READER of reader llm has attempt_seq naming an earlier P5_READ_ATTEMPT with
+      the same reports_seq and reader; a P5_READ_ATTEMPT without its P5_READER (killed or raised after the attempt
+      was recorded) is a CONSUMED reading: any later P5_READ_ATTEMPT or P5_READER for the same (reports_seq, reader)
+      under the same freeze -> FAIL; a P5_READER with unreachable true (every call failed before any response) does
+      not consume the reading, and must have no sample with a non-null served_model; (c) counts consuming P5_READER
+      entries and unrecorded P5_READ_ATTEMPT entries together. Any violation -> FAIL naming the entries (the runner
+      refuses them, so a violation means a hand-edited ledger or a runner bug). actual lists every refreeze reason,
+      every crash rerun (with its kind), every unrecorded or unreachable read attempt and every waiver.
+  15. exit_status(entries, rows, outcome) (D100, validation r1 majors 1 and 3, r2 minor): "FAIL" if not
+      gating_ok(rows). Otherwise four qualifiers, in QUALIFIERS order: "after refreeze" = some P5_FREEZE follows a
+      P5_ATTEMPT, P5_REPORTS, P5_READ_ATTEMPT or P5_READER entry (the earlier evidence was superseded, whatever its
+      result; the same entry set as C2); "after rerun" = crash_attempts(entries) is non-empty (a crash rerun under the
+      last freeze, a killed client included: the operator may have watched the live eval notes before the rerun, so a
+      rerun is never shown as a plain PASS); "with finding" = some outcome row is not ok; "with waiver" = C17 waived.
+      status = "PASS" if none, else "PASS " + ", ".join(present qualifiers); it is always one of STATUSES. notes =
+      every refreeze reason, every crash attempt, the outcome, the waiver reason. Printed line = "EXIT CHECK (P5): " +
+      status with each qualifier followed by its detail in parentheses: "after refreeze (<reason>; <reason>)", "after
+      rerun (<kind> at seq <s>; ...)", "with finding (<outcome>)", "with waiver (<reason>)", e.g.
+      "EXIT CHECK (P5): PASS after rerun (crash at seq 6)" or "EXIT CHECK (P5): PASS after refreeze (gpu node
+      rebooted), with finding (signal_persists)". FAIL prints "EXIT CHECK (P5): FAIL" and the failed gating rows. A
+      refreeze, a rerun or a finding is never shown as a plain PASS.
+acceptance:
+  tests:
+    - "test_literals: every FROZEN_* equals the plan.md 4.8 literal and the module constant it mirrors; P5_RETRAIN_TARGET and P5_REPORT_TARGETS equal the plan.md 2.1 tables"
+    - "test_each_check_pass_and_fail: for every function, one passing fixture and one failing fixture per clause (e.g. C11 with outcome success but the stop row control_ok False -> FAIL; C12 with ppl_ratio 1.0500001 -> FAIL, 1.05 -> PASS; C0 with a model pin differing from pins_p3 -> FAIL; C15 with one lint row count 1 -> FAIL; C16 with correct 9 but Q8 wrong -> FAIL)"
+    - "test_c2_ledger_order: a P5_PLAN before any P5_FREEZE -> FAIL; a refreeze after P5_ATTEMPT without reason -> FAIL; with reason -> PASS and the reason in actual; a P5_REPORTS entry with another code_id -> FAIL"
+    - "test_c1_retrain_env: cuda False with require_cuda -> FAIL; require_cuda False -> PASS; transformers '6.0.0' -> FAIL; '4.51.0' -> PASS"
+    - "test_c3_recount: a plan missing one subject tensor -> FAIL naming it; data file size mismatch -> FAIL"
+    - "test_c17_waiver: waived 'no independent reader' -> one row ok True with actual starting 'WAIVED'"
+    - "test_c2_freeze_inputs: a pins sha, a model sha or the P3 line at the frozen head differing from the freeze -> FAIL row naming it; an entry appended to the P3 ledger after the head -> PASS"
+    - "test_c6_dataset_wire: the four allowed dataset requests -> PASS; an extra GET of /datasets/<repo>/resolve/<pin>/other.parquet -> FAIL naming it; the train file read twice -> FAIL"
+    - "test_c11a_integrity: reinit ppl_ratio 1.0 and top1 1.0 -> FAIL ('re-initialisation changed the forward pass'); retrained_digest == reinit_digest -> FAIL; a trace with a gap -> FAIL; last-row flagged z equal to the baseline's -> FAIL"
+    - "test_c11b_persistence: success record whose confirm row has control_ok False -> FAIL; confirm_step > max_steps -> FAIL"
+    - "test_c16_k_of_n: llm samples 2 of 3 passed -> PASS; 1 of 3 -> FAIL; canary 2 of 3 failed_as_required -> PASS, 1 of 3 -> FAIL; 2 samples given -> FAIL"
+    - "test_c18_one_shot: a P5_ATTEMPT after a non-crash failed P5_RETRAIN without an intervening refreeze -> FAIL; with a refreeze -> PASS; two P5_READER llm for one reports_seq -> FAIL; two P5_REPORTS under one freeze -> FAIL; three crash reruns -> FAIL"
+    - "test_exit_status: all rows ok and no refreeze -> 'PASS' and line 'EXIT CHECK (P5): PASS'; a P5_FREEZE (reason 'r1') after a P5_RETRAIN -> 'PASS after refreeze' and line 'EXIT CHECK (P5): PASS after refreeze (r1)'; a P5_FREEZE (reason 'r2') after a P5_READER only -> 'PASS after refreeze'; waived -> 'PASS with waiver'; both -> 'PASS after refreeze, with waiver'; one gating FAIL row -> 'FAIL'; all 16 qualifier combinations produce exactly the 16 non-FAIL STATUSES, len(STATUSES) == 17"
+    - "test_after_rerun (validation r2 minor): under one freeze a P5_RETRAIN crash true (seq 6) then a passing P5_RETRAIN -> 'PASS after rerun' and line 'EXIT CHECK (P5): PASS after rerun (crash at seq 6)'; a P5_ATTEMPT (seq 5) with no P5_RETRAIN naming it, then a passing attempt -> 'PASS after rerun' and the detail 'client killed at seq 5'; three crash attempts of either kind -> C18 FAIL"
+    - "test_c18_read_attempts (validation r2 major 4): P5_READ_ATTEMPT (llm, reports 9) then its P5_READER -> PASS; P5_READ_ATTEMPT without P5_READER then a second P5_READ_ATTEMPT for the same reports_seq -> FAIL naming both; P5_READ_ATTEMPT + P5_READER unreachable true (all served_model null), then a second attempt + P5_READER -> PASS; an unreachable P5_READER with one non-null served_model -> FAIL; a P5_READER without attempt_seq -> FAIL"
+    - "test_c16_frozen_model_and_discarded: a sample meta with requested_model 'claude-other' -> C16 FAIL; discarded [12] -> C16 FAIL naming seq 12"
+    - "test_c2_refreeze_after_reader (validation r2 minor): a P5_FREEZE without refreeze_reason after a P5_READER (no P5_ATTEMPT or P5_REPORTS after the previous freeze) -> C2 FAIL"
+    - "test_outcome_rows (D100): a signal_persists record -> C11b row not ok, row_verdict 'FINDING', gating_ok True, exit_status 'PASS with finding' and line ending 'with finding (signal_persists)'; a C11a row not ok -> row_verdict 'FAIL' and status 'FAIL'; C12 with stop_step None evaluates the last row"
+    - "test_c11a_unflagged: a trace row with unflagged 20/21 -> PASS (0.952); 19/21 -> FAIL (C11a, gating)"
+  commands:
+    - pytest -q tests/test_exit_expectations_p5.py
+    - pytest -q
+out_of_scope:
+  - running anything (T417, T418)
+invariants_touched: [1, 2, 5]
+decisions: [D87, D88, D93, D94, D95]

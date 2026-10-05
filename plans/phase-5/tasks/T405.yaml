@@ -1,0 +1,95 @@
+id: T405
+title: "Retrain compute core (torch, imported only inside functions) - environment report, model build from decoded scratch tensors via transformers from_config, data reading and tokenisation, MLP re-initialisation and freezing, the training step with the frozen schedule, eval loss and top-1 agreement, tensor export for re-fingerprinting, digest, release; no disk writes"
+depends_on: [T305, T314, T403, T404]
+files:
+  - scout/retrain/model.py
+  - scout/retrain/train.py
+  - tests/test_retrain_compute.py
+route: opus
+spec_complete: true
+interface: |
+  scout/retrain/model.py (module level imports: stdlib, numpy, pyarrow, scout.retrain.params, scout.errors only; torch,
+  transformers and tokenizers are imported INSIDE functions):
+    class RetrainError(ScoutError): exit_code = 10
+    def environment() -> dict
+        # {"torch": str|None, "torch_cuda": str|None, "cuda_available": bool, "device_name": str|None,
+        #  "gpu_mem_total_bytes": int|None, "transformers": str|None, "tokenizers": str|None,
+        #  "retrain_params_digest": retrain_params_digest(), "error": str|None}; never raises (ImportError -> error text)
+    def select_device() -> str                          # "cuda" if torch.cuda.is_available() else "cpu"
+    def read_texts(path: str, data: bytes) -> list[str]
+        # ".parquet": pyarrow.parquet.read_table(BytesIO(data)).column("text") as Python strings (None rows skipped);
+        # missing column -> RetrainError("data file {path} has no 'text' column"); ".txt": data.decode("utf-8") as one text
+    def tokenize(tokenizer_json: bytes, texts: list[str]) -> numpy.ndarray       # int64 ids of "\n".join(texts)
+    def windows(ids: numpy.ndarray, seq_len: int, limit: int | None = None) -> numpy.ndarray
+        # non-overlapping (n, seq_len) int64 windows from the start; the tail shorter than seq_len is dropped; first `limit`
+    def build_model(config_raw: dict, tensor: Callable[[str], numpy.ndarray], names: list[str], device: str) -> "torch.nn.Module"
+    def reinit_blocks(model, stack_prefix: str, blocks: list[int], init_std: float, seed: int) -> list[str]
+        # returns the trainable parameter names (gate, up, down of each block, block order); freezes every other parameter
+    def tensors_of(model, names: list[str]) -> dict[str, numpy.ndarray]         # float32 CPU copies, (out, in)
+    def digest(arrays: dict[str, numpy.ndarray], order: list[str]) -> str        # "sha256:" + hex over float32 LE bytes in order
+    def release(*objs) -> None                          # del references, gc.collect(), torch.cuda.empty_cache() when CUDA
+
+  scout/retrain/train.py (torch imported inside functions/methods):
+    def lr_at(step: int, budget: dict, params: dict = RETRAIN_PARAMS) -> float
+    class Trainer:
+        def __init__(self, model, trainable: list[str], train_windows: numpy.ndarray, budget: dict, *, device: str,
+                     seed: int, abort: Callable[[], bool] = lambda: False, params: dict = RETRAIN_PARAMS) -> None
+        step_count: int
+        def step(self) -> float                        # one optimiser step; returns the batch loss (float)
+        def baseline(self, eval_windows: numpy.ndarray) -> tuple[float, numpy.ndarray]   # (mean CE, argmax int32 array)
+        def evaluate(self, eval_windows: numpy.ndarray, ref_argmax: numpy.ndarray) -> tuple[float, float]
+            # (mean CE, top-1 agreement with ref_argmax)
+    class Aborted(ScoutError): exit_code = 7          # raised by step()/evaluate() when abort() is true
+behavior: |
+  1. build_model: from transformers import AutoConfig, AutoModelForCausalLM; raw = dict(config_raw); config =
+     AutoConfig.for_model(raw.pop("model_type"), **{k: v for k, v in raw.items() if k not in ("architectures",
+     "transformers_version", "torch_dtype", "dtype", "quantization_config")}); model = AutoModelForCausalLM.from_config(config)
+     (float32; no download: from_config never touches the hub); sd = {n: torch.from_numpy(numpy.ascontiguousarray(
+     tensor(n), dtype=numpy.float32)) for n in names}; missing, unexpected = model.load_state_dict(sd, strict=False);
+     unexpected non-empty -> RetrainError listing them; missing must be [] or ["lm_head.weight"] with
+     config.tie_word_embeddings true (then model.tie_weights()), else RetrainError. model.to(device); model.eval().
+  2. reinit_blocks: for each block i: module = model.get_submodule(f"{stack_prefix}.{i}.mlp"); g = torch.Generator(
+     device="cpu").manual_seed(seed + i); gate_proj.weight and up_proj.weight <- torch.randn(shape, generator=g) *
+     init_std (then moved to the device); down_proj.weight <- zeros. Every parameter's requires_grad = False, then True
+     for those three per block. Names returned as f"{stack_prefix}.{i}.mlp.gate_proj.weight", up, down.
+  3. lr_at(s, b): peak = params["lr"]; s < b["warmup_steps"] -> peak * (s + 1) / b["warmup_steps"]; else progress =
+     (s - warmup) / max(1, b["max_steps"] - warmup); peak * (0.1 + 0.9 * 0.5 * (1 + cos(pi * progress))).
+  4. Trainer: trainable may be [] (baseline/evaluate only: no optimiser is created and step() raises ValueError).
+     AdamW over the trainable parameters only (lr from lr_at, betas, weight_decay from params); sampler rng =
+     numpy.random.default_rng(seed); step(): abort() -> raise Aborted("client gone: aborting retrain"); idx =
+     rng.integers(0, len(train_windows), b["batch_size"]); x = windows[idx] as a torch tensor on device; loss =
+     model(input_ids=x, labels=x).loss under torch.autocast("cuda", dtype=torch.bfloat16) on CUDA (no autocast on CPU);
+     backward; clip_grad_norm_(trainable, params["grad_clip"]); set the lr; optimizer step; zero_grad(set_to_none=True);
+     step_count += 1. On CPU the trainer calls torch.use_deterministic_algorithms(True) and torch.manual_seed(seed).
+  5. baseline/evaluate: torch.no_grad(), model.eval() then back to train mode; windows in chunks of b["batch_size"];
+     CE per token over positions 0..seq-2 predicting 1..seq-1 (float32 log-softmax), mean over all tokens;
+     argmax of the logits at positions 0..seq-2 (int32); agreement = mean(argmax == ref_argmax). abort() is checked
+     before every chunk.
+  6. tensors_of returns detached float32 CPU numpy copies. digest: sha256 over b"".join(arrays[n].astype("<f4").tobytes()
+     for n in order).
+  7. No function in scout/retrain may write a file: no call to torch.save, save_pretrained, save_file, numpy.save,
+     tofile, or open() in a write/append mode (static AST test below; T406/T407 inherit the test by scanning the whole
+     package).
+acceptance:
+  tests:
+    - "fixtures: T404 rt_family; tensors read directly from its safetensors files with numpy (test helper)"
+    - "test_environment: environment() has every key; on this CPU host cuda_available False, torch str, error None; with torch import blocked (sys.modules['torch'] = None in a subprocess) error names torch and nothing raises"
+    - "test_build_model_matches_from_pretrained: build_model(derived config, tensors, names, 'cpu') logits on 2 windows equal transformers.LlamaForCausalLM.from_pretrained(derived dir, local_files_only=True) logits within 1e-5"
+    - "test_build_model_tied: a tiny Qwen2 config with tie_word_embeddings true (random init in the test, tensors without lm_head) -> loads; lm_head shares the embedding; an unexpected extra tensor -> RetrainError"
+    - "test_read_tokenize_windows: rt_family data parquet -> texts; tokenize matches tokenizers directly; windows shapes; missing text column -> RetrainError"
+    - "test_reinit: reinit_blocks(model, 'model.layers', [2, 5], 0.02, 20260929) -> gate/up std within 10 % of 0.02, down all zero, requires_grad only on the 6 returned names; logits equal those of the derived model with blocks 2 and 5's MLP forward replaced by zeros (hook) within 1e-5"
+    - "test_lr_schedule: lr_at at steps 0, warmup-1, warmup, max_steps for the exit budget equal the closed-form values (1e-5, 1e-3, 1e-3, 1e-4)"
+    - "test_trainer_deterministic_cpu: two Trainers with the same seed on the rehearsal budget give identical losses for 5 steps; the trainable tensors change and every frozen tensor is bit-identical after the steps"
+    - "test_eval_metrics: evaluate(model, eval, baseline argmax of the same model) -> agreement 1.0 and the same loss as baseline()"
+    - "test_abort: abort=lambda: True -> step() raises Aborted before touching the optimiser"
+    - "test_digest: digest of the same arrays twice is equal; one flipped float changes it"
+    - "test_no_save_calls: AST walk over every scout/retrain/*.py file: no call whose attribute or name is save, save_pretrained, save_file, save_model, tofile, and no open() with a mode containing 'w', 'a' or 'x'"
+    - "test_core_imports_without_torch: subprocess with sys.modules['torch'] = None and sys.modules['transformers'] = None: import scout.cli, scout.jobs.worker, scout.retrain.params, scout.retrain.plan, scout.retrain.model, scout.retrain.train succeed"
+    - "test_no_network_in_compute: with socket.socket.connect monkeypatched to raise and HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE set, build_model + 3 Trainer steps + evaluate succeed"
+  commands:
+    - pytest -q tests/test_retrain_compute.py
+    - pytest -q
+out_of_scope:
+  - the loop, the stop rule and attribution (T406); jobs (T407)
+invariants_touched: [1, 2]
+decisions: [D81, D82, D83]

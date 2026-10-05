@@ -34,7 +34,9 @@ behavior: |
      kind="local", repo=f"local:{root}", local_path=str(root), requested_revision=None, endpoint=None,
      revision_kind="local-stat-hash". revision_sha is "" until resolve().
   2. resolve(): walk root recursively with os.walk (sorted). Skip any directory or file whose name starts with "."
-     and follow no symlinked directories. Collect RepoFile(relpath, st_size). Compute
+     and follow no symlinked directories (os.walk followlinks=False). Files are stat'ed with os.stat(path) which FOLLOWS
+     symlinks (HF-cache snapshots are symlinks into ../blobs/), so size/mtime are the target's; a broken symlink ->
+     ScoutError(f"broken symlink {rel}"). Reads open the path normally (following the link). Collect RepoFile(relpath, st_size). Compute
      revision_sha = sha256("\n".join(f"{rel}\t{size}\t{st_mtime_ns}" for sorted rel).encode()).hexdigest().
      Log a "fetch" event with nbytes=0, path="@local/stat", source="local", note=f"{n} files".
      No file contents are read.
@@ -47,7 +49,30 @@ behavior: |
      record(start=start, nbytes=len(data), release=r); log.release(r) in finally. If len(data) < length raise HeaderError(f"short read {path}").
      Return data.
   5. Never write any file. Never read a byte that preflight did not approve.
-decisions: []
+decisions:
+  - "resolve() does not call log.stage(); the caller enters RESOLVE (T010 does log.stage(RESOLVE) before source.resolve()). 'logs under RESOLVE' means the @local/stat event lands in whatever stage the caller set. resolve() may be called repeatedly; each call re-walks, re-hashes and logs one more 0-byte @local/stat event (record with start=None, so range is None)."
+  - "files(), read_file() and read_range() before resolve() raise ScoutError (no implicit resolve)."
+  - "Symlinks (plan r3-m10): os.walk(followlinks=False) lists a symlink to a directory under dirnames, so it is silently not descended into. File symlinks are stat'ed with os.stat (follows), may point outside root (HF cache ../../blobs/), and are opened normally. Any OSError from os.stat on a path that is a symlink (missing target, ELOOP) -> ScoutError(f'broken symlink {rel}'); an OSError on a non-symlink re-raises unchanged."
+  - "Non-regular files after following links (fifos, sockets, devices) are skipped from files() so a read can never block on them."
+  - "Hidden filter applies at every depth (any dir or file name starting with '.', e.g. .git/, sub/.cache/, .hidden.json); hidden paths are not in files(), so read_file returns None and read_range raises ScoutError for them."
+  - "Reads check that the file has not changed since resolve(): after open, os.fstat (no bytes read) must match the (st_size, st_mtime_ns) captured by resolve(), else ScoutError('<path> changed since resolve(); re-run resolve'). This keeps read bytes consistent with revision_sha and with the size preflight approved. read_file reads at most the resolved size (f.read(size)), never more than preflight approved; if fewer bytes arrive it records them and raises ScoutError('short read ...')."
+  - "read_range: path not in files() -> ScoutError. The record() happens before the short-read check, so bytes actually read are logged even when HeaderError('short read {path}') is raised. Negative start/length surface as ValueError from preflight's classify_range, before any open."
+  - "Both reads call log.release(r) in finally even after record(release=r); release is idempotent, so this covers every exit path (refusal raises inside preflight and creates no reservation)."
+  - "Reads use the builtin open() (looked up at call time) so tests can spy/monkeypatch builtins.open. elapsed_ms is perf_counter time from just before open to after read."
+  - "Source is a plain typing.Protocol (not runtime_checkable) to match the interface as written. The @local/stat pseudo-path is exposed as module constant STAT_PATH."
+  - "Built against the T002 follow-ups: no LogEvent dict is mutated, and set_header_len is called once per path in tests."
+  - "REVIEW r1 (orchestrator decision 1): resolve() records each listed file's realpath and (st_dev, st_ino) alongside (size, mtime_ns). Reads also require fstat (st_dev, st_ino) to match resolve(), so a link retargeted after resolve() raises 'changed since resolve()' instead of using a stale classification."
+  - "REVIEW r1 (orchestrator decision 2): each file has an effective classification name passed to both preflight and record. If the file's own repo-relative name is weight-class it is used unchanged (normal safetensors header semantics). Otherwise its aliases are the realpath basename and the basenames of every other listed file on the same (st_dev, st_ino); if any alias is weight-class the effective name is f'{rel} -> {alias}' (ends with the alias's weight extension, so preflight refuses it and logs a refused event under that name). If the chosen alias is .safetensors (preferred when several), the read is refused outright with WeightReadRefused and a 'refused' note, before preflight, so no [0,8) header bytes are ever read through an alias. Consequence: a non-weight file whose content is byte-identical to a weight file in an HF cache (same blob) is refused; this errs safe. Non-aliased files keep their own name, so log paths are unchanged for normal reads."
+  - "REVIEW r1 (orchestrator decision 3): link targets outside root remain allowed (HF cache ../../blobs). The @local/stat note is f'{n} files' followed, when any listed file is a symlink, by '; symlinks: ' + '; '.join(f'{rel} -> {realpath}') sorted by rel."
+  - "REVIEW r1 minor 2: os.walk gets onerror that raises ScoutError(f'cannot list {exc.filename}: {exc.strerror}'); tested by monkeypatching os.scandir to raise PermissionError for one subdir."
+  - "REVIEW r1 minor 3: the test open spy patches builtins.open, io.open and os.open."
+  - "REVIEW r1 nit 4 and the extensionless-alias limitation are recorded in plans/phase-1/later.md (one line each), the only edit outside this task's files."
+  - "REVIEW r2 item 1 (symlink chains): resolve() follows every listed file's symlink chain with os.readlink hop by hop (_link_chain); relative targets are joined to the link's directory without normpath so the OS resolves '..' physically. More than MAX_SYMLINK_HOPS=40 hops (or a cycle) -> ScoutError('symlink chain too long <rel> ...'). The chain is walked before os.stat, so a 41-hop chain reports 'too long' rather than ELOOP's 'broken symlink'. A readlink OSError on a listed link -> 'broken symlink <rel>'."
+  - "REVIEW r2 item 1/2 alias set: aliases are pooled per target (st_dev, st_ino): the basename of every listed file on that inode, every hop basename of those files' chains, their realpath basename, and the names (plus hop names) of hidden files in walked directories on the same inode. A listed file is classified against the whole pool, so a hard link sharing an inode with a chained symlink's target inherits that chain's weight-named hop too."
+  - "REVIEW r2 item 2 (hidden aliases): hidden files in walked (non-hidden) directories are stat'ed (following links) and their chain walked, but they never enter files(), revision_sha or the note. Any OSError or too-long chain on a hidden file is ignored (hidden files never fail resolve()). Hidden directories (.git/, .cache/) are still not walked."
+  - "REVIEW r2 item 2 follow-up: resolve() also records st_nlink, and the read-time fstat check requires it to match; a hard link added after resolve() (e.g. a new hidden .x.bin) makes the read raise 'changed since resolve()'. New symlinks pointing at a listed file after resolve() are not detectable this way (recorded in later.md)."
+  - "REVIEW r2 item 3 (format mismatch): when rel ends in .safetensors and any alias has a different weight extension (.bin, .pt, ...), the effective name is f'{rel} -> {alias}' (first in sorted order), so preflight refuses it with a 'refused' event before any open. Extensionless aliases (HF blobs) and other .safetensors names keep rel and normal header semantics. Other weight-extension rels are unchanged (already refused)."
+  - "REVIEW r2 item 4 (note, supersedes r1 decision 3's realpath listing): the @local/stat note is f'{n} files' plus, when any listed file is a symlink, '; symlinks: ' + '; '.join(entries) for links sorted by rel. Each entry is f'{rel} -> {target}', target = os.path.relpath(realpath, root) in posix form when realpath is under root/../.. (os.path.commonpath), else '<outside>/<realpath basename>'. At most MAX_NOTE_LINKS=20 entries; the rest become a final entry '(+K more)'. test_stat_note_lists_symlink_realpaths was rewritten as test_stat_note_lists_symlink_targets_relative because its absolute-path assertion is what item 4 forbids."
 acceptance:
   tests:
     - "test_resolve_no_reads: monkeypatch builtins.open to fail on anything under root during resolve(); resolve succeeds; files and sizes are correct; revision_sha is 64-hex and stable across two calls; touching a file (mtime) changes it"
@@ -55,6 +80,7 @@ acceptance:
     - "test_read_range_header: after reading 8 bytes and set_header_len, reading [8,8+N) counts header bytes only; totals.weight == 0"
     - "test_weight_refused: read_range(shard, 8+N, 4) raises WeightReadRefused and open() is never called (spy)"
     - "test_bin_refused: read_file('pytorch_model.bin') raises WeightReadRefused"
+    - "test_symlinked_files: an HF-cache-shaped fixture (snapshots/<sha>/model.safetensors -> ../../blobs/<hash>) -> size equals the blob size; read_header-style reads (8 bytes, then N) succeed; a broken link raises ScoutError"
     - "test_hidden_skipped: .git/ contents are excluded from files()"
   commands:
     - pytest -q tests/test_local_source.py

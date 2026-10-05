@@ -1,0 +1,101 @@
+id: T311
+title: Job scratch directory - disk accounting, purge with verification, flock-based orphan sweeper, read-only audit, global worker lock, JOB_PARAMS
+depends_on: [T301]
+files:
+  - scout/jobs/__init__.py
+  - scout/jobs/scratch.py
+  - tests/test_scratch.py
+route: opus
+spec_complete: true
+interface: |
+  scout/jobs/__init__.py:
+    JOB_PARAMS: dict          # EXACTLY the plan.md 4.9 literal
+  scout/jobs/scratch.py (stdlib + numpy only; Linux/macOS fcntl):
+    LOCK_NAME = ".lock"; WORKER_LOCK_NAME = ".worker.lock"; INDEX_NAME = "index.json"; PENDING_GRACE_S = 300
+
+    def scratch_root_default() -> pathlib.Path
+        # env JOB_PARAMS["scratch_root_env"] if set and non-empty, else Path(JOB_PARAMS["scratch_root_default"]).expanduser()
+
+    @dataclass(frozen=True)
+    class PurgeReport:
+        job_id: str; files_removed: int; bytes_removed: int; bytes_written: int; resident_after: int; dir_absent: bool
+        @property ok -> bool          # dir_absent and resident_after == 0 and bytes_removed >= bytes_written
+        def to_dict(self) -> dict     # plan.md 4.5 PurgeReport (incl. "ok")
+
+    @dataclass(frozen=True)
+    class SweepReport:
+        root: str; orphans: list[dict]; active: list[str]; stray: list[str]; bytes_found: int; bytes_removed: int
+        def to_dict(self) -> dict
+
+    class ScratchDir:
+        @classmethod
+        def create(cls, root: pathlib.Path, job_id: str, log: ByteLog | None = None) -> "ScratchDir"
+        path: pathlib.Path; job_id: str
+        def tensor_path(self, model: int, tensor: str) -> pathlib.Path
+        def allocate(self, model: int, tensor: str, size: int) -> pathlib.Path
+        def write(self, model: int, tensor: str, offset: int, data: bytes) -> None       # thread-safe
+        def read(self, model: int, tensor: str) -> numpy.ndarray                        # uint8 copy via numpy.fromfile (never mmap)
+        def expected_sizes(self) -> dict[tuple[int, str], int]
+        @property bytes_written -> int
+        def resident_bytes(self) -> int                                                 # sum of st_size of files under path (0 if absent)
+        def purge(self) -> PurgeReport                                                  # idempotent
+
+    def sweep(root: pathlib.Path, *, dry_run: bool = False, only_job: str | None = None) -> SweepReport
+    def audit(root: pathlib.Path) -> dict      # {"root", "files": int, "bytes": int, "dirs": [str]}; lock files excluded; read-only
+
+    class WorkerLock:                           # context manager; flock(LOCK_EX) on root/WORKER_LOCK_NAME
+        def __init__(self, root: pathlib.Path, wait_s: float = JOB_PARAMS["lock_wait_s"], poll_s: float = 1.0) -> None
+        # waits up to wait_s (polling LOCK_NB); timeout -> JobError("worker busy: another job holds <path>")
+behavior: |
+  1. create (no sweep race; validation r1 minor): root.mkdir(parents=True, exist_ok=True, mode=0o700); job_id must
+     match ^[A-Za-z0-9TZ_-][A-Za-z0-9TZ._-]{7,79}$ (no leading dot; else ValueError); path = root/job_id; path exists ->
+     JobError "scratch dir exists". tmp = root / f".pending-{job_id}-{secrets.token_hex(4)}"; tmp.mkdir(mode=0o700);
+     open tmp/.lock and flock(LOCK_EX | LOCK_NB) and KEEP the fd open until purge (the lock is what marks the job
+     alive); write index.json {"job_id", "tensors": {}} (no weights); then os.rename(tmp, path) (atomic; the open fd and
+     its flock move with the inode). A directory under its final name therefore always has a held .lock from the
+     moment it appears, so a concurrent sweep can never see it unlocked.
+  2. tensor_path(model, tensor) = path / f"m{model}" / (hashlib.sha1(tensor.encode()).hexdigest()[:16] + ".bin").
+     allocate creates the parent dir and an empty file (no preallocation), records the expected size and updates
+     index.json {"tensors": {"m<model>/<file>": {"tensor", "size"}}}. Allocating the same (model, tensor) twice -> ValueError.
+  3. write: under a lock, os.pwrite at offset into the allocated file (opened O_WRONLY), rejecting offset + len > expected
+     size (ValueError); bytes_written += len; if log: log.disk_add(len(data)).
+  4. read: numpy.fromfile(path, dtype=uint8); size != expected -> JobError("incomplete tensor <tensor>").
+  5. purge (idempotent; a second call returns the first report): for every file under path except .lock: size =
+     lstat().st_size, unlink, files_removed += 1, bytes_removed += size; then unlink .lock, close the lock fd (releases
+     flock), rmdir all dirs bottom-up; resident_after = resident_bytes() (fresh walk; 0 when the dir is absent);
+     dir_absent = not path.exists(); if log: log.disk_release(min(bytes_removed, log.disk_resident)). Never raises for
+     a missing file; OSError on unlink/rmdir is recorded (the report is then not ok) and re-raised after the attempt on
+     every remaining file.
+  6. sweep(root, dry_run, only_job): root missing -> empty report. For each child directory d of root (sorted; if
+     only_job only that name and its ".pending-<job_id>-*" siblings): a ".pending-*" directory younger than
+     PENDING_GRACE_S = 300 s (st_mtime) is skipped and listed in active (a create() in progress); an older one is
+     treated like any other directory. lock = d/.lock; if lock exists: open it and try flock(LOCK_EX | LOCK_NB);
+     BlockingIOError -> active (skip). Acquired or no .lock -> orphan: count files and bytes (lstat, not following symlinks); unless
+     dry_run delete everything under d (unlink files, rmdir bottom-up) and set removed True. Files directly under root
+     other than WORKER_LOCK_NAME -> stray (reported, never deleted). bytes_found sums orphan bytes; bytes_removed sums
+     deleted bytes.
+  7. audit(root): walk (no locking, no deletion): count files and bytes except any file named .lock or .worker.lock;
+     dirs = sorted immediate child directory names.
+  8. WorkerLock: root.mkdir(parents=True, exist_ok=True); open root/.worker.lock (a+); loop flock(LOCK_EX | LOCK_NB);
+     on BlockingIOError sleep poll_s until wait_s elapsed -> JobError. __exit__ unlocks and closes.
+  9. No function follows symlinks out of root; symlinks found inside are unlinked, not followed.
+acceptance:
+  tests:
+    - "test_params_literal: JOB_PARAMS == plan.md 4.9 literal"
+    - "test_write_read_purge: create, allocate 2 tensors (100 B, 50 B), write in 3 chunks from 2 threads, read equals the bytes; log.disk_resident == 150 then 0 after purge; report ok, files_removed 3 (2 tensors + index.json), bytes_removed >= 150, dir_absent; second purge returns the same report"
+    - "test_write_bounds: offset + len beyond the allocated size -> ValueError; double allocate -> ValueError; bad job_id -> ValueError"
+    - "test_read_incomplete: a partially written tensor -> JobError"
+    - "test_sweep_active_skipped: a live ScratchDir (lock held in this process via a second fd in a child process) is reported active and untouched"
+    - "test_sweep_orphan_after_kill: a child process (multiprocessing, spawn) creates a ScratchDir, writes 1 MiB, then os.kill(SIGKILL) itself; sweep(dry_run=True) reports 1 orphan with bytes >= 1 MiB and removes nothing; sweep() removes it; audit(root) then files 0, bytes 0"
+    - "test_create_sweep_race: 4 threads loop sweep(root) while the main thread runs 50 x (ScratchDir.create, write 1 KiB, check the file is still there, purge) -> every write/read succeeds, no job dir is ever reported as orphan, no .pending-* dir remains; a .pending-x dir with mtime set 301 s in the past and no .lock is removed as an orphan, a fresh one is skipped"
+    - "test_sweep_no_lock_is_orphan: a directory without .lock is an orphan; a stray root file is reported and kept; .worker.lock is not stray"
+    - "test_worker_lock: a child holds WorkerLock; WorkerLock(root, wait_s=0.3, poll_s=0.05) in the parent raises JobError('worker busy...'); after the child exits it succeeds"
+    - "test_scratch_root_default: env var set -> that path; unset -> ~/.cache/scout/scratch expanded (monkeypatched HOME)"
+    - "test_no_mmap: ScratchDir.read returns a numpy array that does not share memory with a file (numpy.shares_memory false / base is not a memmap)"
+  commands:
+    - pytest -q tests/test_scratch.py
+    - pytest -q
+out_of_scope:
+  - downloading (T312); the worker runner (T316); the CLI (T319)
+invariants_touched: [1]
+decisions: [D59]

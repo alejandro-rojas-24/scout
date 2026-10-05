@@ -1,0 +1,43 @@
+id: T302
+title: RepoFile.lfs_sha256 from the Hub API siblings (weights content digest input); FakeHub option to serve it
+depends_on: [T003, T004, T005, T101]
+files:
+  - scout/sources.py
+  - scout/hub.py
+  - tests/helpers/fakehub.py
+  - tests/test_lfs_sha.py
+route: sonnet
+spec_complete: true
+interface: |
+  scout/sources.py:
+    @dataclass(frozen=True)
+    class RepoFile:
+        path: str
+        size: int | None
+        lfs_sha256: str | None = None          # NEW, last, defaulted (P1 constructor calls unchanged)
+  scout/hub.py:
+    HubSource.resolve() fills RepoFile.lfs_sha256 from the API response (already requested with ?blobs=true)
+  tests/helpers/fakehub.py (P1 T003, extended):
+    FakeHub.add_repo(..., lfs_sha256: bool = False)   # NEW keyword; other parameters unchanged
+behavior: |
+  1. In HubSource.resolve, for each sibling s of the /api/models/.../revision/<rev>?blobs=true response:
+     lfs = s.get("lfs"); lfs_sha256 = lfs["sha256"] if isinstance(lfs, dict) and isinstance(lfs.get("sha256"), str)
+     and re.fullmatch(r"[0-9a-f]{64}", lfs["sha256"]) else None. Size handling is unchanged.
+  2. LocalSource always sets lfs_sha256 = None (no content hashing: that would read weight bytes).
+  3. FakeHub: when add_repo(..., lfs_sha256=True), every sibling whose path has a WEIGHT_EXTENSIONS suffix gets
+     "lfs": {"sha256": hashlib.sha256(file bytes).hexdigest(), "size": len(bytes)}. Default False keeps every P1-P3
+     FakeHub response byte-identical.
+  4. No byte accounting changes: the API response is already counted as meta.
+acceptance:
+  tests:
+    - "test_lfs_from_api: FakeHub repo with lfs_sha256=True -> HubSource.files() weight files carry the sha256 of their bytes; config.json has None"
+    - "test_lfs_absent: default FakeHub -> every lfs_sha256 None; ByteLog totals identical to a P1 resolve of the same repo"
+    - "test_lfs_malformed: a sibling with lfs {'sha256': 'XYZ'} or lfs null -> None"
+    - "test_local_none: LocalSource files have lfs_sha256 None"
+  commands:
+    - pytest -q tests/test_lfs_sha.py
+    - pytest -q
+out_of_scope:
+  - computing the Card content digest (T306/T307)
+invariants_touched: [2]
+decisions: [D62]

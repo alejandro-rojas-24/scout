@@ -1,0 +1,148 @@
+id: T409
+title: "Report bundle report.v1 - subject Card selection per section, library and explicit references, System 1 analysis inputs, optional System 2, ledger citations for every Card and the JEV model, licences, summary slots, regenerate command"
+depends_on: [T212, T218, T309, T401]
+files:
+  - scout/report/__init__.py
+  - scout/report/bundle.py
+  - tests/test_report_bundle.py
+route: opus
+spec_complete: true
+interface: |
+  scout/report/__init__.py: docstring only.
+  scout/report/bundle.py (imports scout.store, scout.card, scout.analysis, scout.jev, scout.system2 (optional path only),
+  scout.caveats, yaml, json, hashlib; NEVER scout.hub, scout.sources, scout.scan, scout.gate, torch):
+    REPORT_PARAMS: dict                    # EXACTLY the plan.md 4.8 literal
+    def report_params_digest() -> str      # sha256 of canonical JSON of REPORT_PARAMS
+    LEDGER_NAMES = ("p3", "p4", "p5")
+    @dataclass(frozen=True)
+    class ReportInputs:
+        store: CardStore
+        model_path: pathlib.Path | None                 # JEV model file (models/jev_v1.json)
+        library_manifest: pathlib.Path | None           # library/manifest.yaml
+        pins: pathlib.Path | None                       # pins file for library entries and unpinned targets
+        ledgers: dict[str, pathlib.Path]                # name in LEDGER_NAMES -> path (missing files allowed)
+        references: tuple[str, ...] = ()               # extra reference targets repo@sha[#component]
+        s2_client: S2Client | None = None
+        s2_config: S2Config | None = None
+    def parse_subject(target: str, pins: dict[str, str]) -> dict      # card key; unpinned repo -> pins lookup, else ValueError
+    def select_cards(store: CardStore, key: dict) -> dict
+        # {"analysis": StoreEntry|None, "attribution": StoreEntry|None, "retrain": StoreEntry|None}
+    def attribution_reference_cards(store: CardStore, attribution_card: dict) -> list[tuple[dict, StoreEntry | None]]
+        # one (reference record, entry) per stats.attribution.references[] (role reference or control) in that order;
+        # entry = store.find(*card_key) (newest, P4 find semantics) or None when the store has no Card for the key
+    def cite(entry_files: tuple[str, str], object_id: str, key: dict, ledgers: dict[str, list[dict]]) -> dict | None
+    def cite_model(model_sha256: str, ledgers: dict[str, list[dict]]) -> dict | None
+    def line_sha256(entry: dict) -> str                # sha256 of p3_ledger.canonical(entry) (the line without "\n")
+    def read_entries(path: pathlib.Path, *, upto_seq: int | None = None) -> tuple[list[dict], str | None]
+        # (entries with seq <= upto_seq (all when None), error or None); verifies the hash chain of that prefix only
+    def ledger_heads(ledgers: dict[str, pathlib.Path]) -> dict[str, int]   # {name: seq of the last entry} of each file
+    def build_bundle(target: str, inp: ReportInputs, *, generated_at: str | None = None,
+                     code_id: str | None = None, ledger_heads: dict[str, int] | None = None) -> dict   # report.v1 (plan.md 4.5)
+        # ledger_heads None -> the current head of every given ledger (normal use); given -> every ledger is read only up
+        # to that seq (L10b passes the heads recorded in the embedded bundle, so later appends never change a rebuild)
+    def bundle_sha256(bundle: dict) -> str             # sha256 of canonical JSON (sort_keys, separators (",", ":"), ASCII)
+behavior: |
+  1. select_cards(store, key): entries = store.entries(repo, sha) with component == key.component and the current
+     params_digest (P4 find semantics). analysis = newest with has.sigma or has.anchors among the entries whose
+     schema_version != "card.v4"; only when there is none, the newest card.v4 with them (validation r2 minor: a card.v4
+     copies its parent's stats but carries the retrain client's fetch_log, so System 1 reads the P3 Card that the P3
+     SCAN entry cites; plan.md 2.1); attribution = newest with
+     has.attribution; retrain = newest whose schema_version == "card.v4". "Newest" = P4 find's rule (created_at, then
+     object id).
+  2. Sections: system1 = "run" iff analysis entry exists and model_path is given, else "not_run" with reason "the
+     subject Card has no sigma-sample or anchor evidence (scan with --sample --tokenizer --anchors)" or "no JEV model
+     given"; attribution = run iff an attribution entry exists, else reason "no block attribution Card for this subject
+     (run scout attribute)"; retrain = run iff a card.v4 entry exists, else reason "no retrain experiment for this
+     subject (run scout retrain)"; system2 = run iff s2_client is given and system1 ran, else reason "not requested"
+     or "System 1 was not run". Reason strings are digit-free (tested).
+  3. References (system1 only): library entries from yaml.safe_load(library_manifest)["entries"] (manifest order),
+     pinned through the pins file; each resolved with store.find(repo, sha, None); missing -> recorded in
+     inputs.skipped as {repo, reason: "not in the store"}; then the explicit references (store.find on their keys).
+     A reference with the subject's key is skipped. analysis = scout.analysis.analyze(LoadedCard(subject analysis card),
+     [LoadedCard(r) ...], scout.jev.load(model_path)). inputs.analysis = [{subject_object, reference_objects (in the
+     order passed to analyze), model_sha256}].
+  4. System 2 (optional): s2in = system2.build_input(report, subject, references); s2 = system2.run_system2(report,
+     subject, references, inp.s2_client, inp.s2_config); data.s2 = s2, data.s2in = s2in, sections.system2.s2in_sha256 =
+     sha256 of canonical s2in.
+  4b. Attribution reference Cards (validation r2 major 5; plan.md 3.6 "Attribution reference Cards"). When the
+     attribution section runs, for each (ref, entry) of attribution_reference_cards(store, attribution Card):
+     - entry present -> inputs.cards gains {role: "attribution-reference", card_key: ref.card_key, object:
+       entry.object, schema_version, citation: null, via: <the attribution Card's object id>} (deduplicated by
+       object; a Card already listed under another role keeps that role and gains no row), and data.cards[object]
+       the subset below. Such a Card contributes only its identity (title) and its claimed licence; every number
+       about it comes from the attribution Card, which carries the ledger citation. Its citation is therefore
+       inherited ("cited via" the attribution Card, which lists its card_key) and it needs no ledger entry of its own.
+     - entry None -> no inputs.cards row; inputs.skipped gains {repo: ref.card_key.repo, reason: "no Card for this
+       attribution reference in the store"}; the licence row (behavior 7) has license null and missing true. Building
+       never fails for this reason (product use); the exit makes it impossible by importing the Cards and FAILing C0
+       when one is missing (T417 behavior 3).
+     inputs.cards rows of every other role carry via: null.
+  5. data.cards[object] for every Card used (subject section Cards, System 1 references and attribution reference
+     Cards): the subset of plan.md 4.5 copied
+     from the Card JSON with the same key paths, so a JSON pointer into the subset resolves exactly as into the full
+     Card. Model mirror (system1 run only): sha = sha256 of the model file bytes (lowercase hex); doc = the parsed file;
+     data.models = {sha: {"params": {"calibration_note": doc["params"]["calibration_note"]}, "thresholds": {"hi":
+     doc["thresholds"]["hi"], "lo": doc["thresholds"]["lo"]}}} (the file's own key paths, so the pointers
+     /params/calibration_note, /thresholds/hi and /thresholds/lo resolve to equal values in the mirror and in the file);
+     inputs.model = {"name": model file basename, "sha256": sha, "citation": cite_model(sha, ...)}. System 1 not run ->
+     data.models = {} and inputs.model = None. Every model source the renderer emits is f"model:{sha}#<one of the three
+     pointers>".
+  6. Ledger citations (ledgers read with scripts-free code: the canonical line and hash chain rules of p3_ledger are
+     re-implemented read-only here as `read_entries(path, upto_seq=...)`; a broken chain in the read prefix -> the
+     ledger is recorded as {name, file_name, head_seq: null, head_line_sha256: null, error} and cites nothing).
+     **Ledger heads are pinned (validation r1 blocker).** heads = ledger_heads(inp.ledgers) when the argument is None,
+     else the argument (a name absent from it, or a file shorter than its head -> recorded error "ledger shorter than
+     the pinned head", cites nothing). Every ledger is read only up to its head, and every citation rule below
+     (including "latest") is evaluated on that prefix. Entries appended after the head therefore never change the
+     bundle: an exit report built at E5 stays byte-identical in an L10b rebuild after E5-E8 append P5_REPORTS,
+     P5_READER and P5_EXIT, and so does a product report citing a live ledger.
+     inputs.ledgers = one row per given ledger, in LEDGER_NAMES order: {name, file_name (basename), head_seq,
+     head_line_sha256 (line_sha256 of the entry at head_seq), error: null}. No entry count or "last" value of the live
+     file is recorded anywhere in the bundle.
+     - a Card: the latest P3 `SCAN` entry with payload.mode "confirm" whose card_files[repo] == {json: sha256 of the
+       object's JSON file, parquet: sha256 of its Parquet file}; else the latest P4 `P4_EXIT` whose payload.targets.*.object
+       == object id; else the latest P5 `P5_RETRAIN` whose payload.card_object == object id; else None.
+     - the model: the latest P3 `FREEZE_MODEL` with payload.sha256 == sha256(model file).
+     - citation = {ledger, seq, line_sha256}; data.ledger_entries[f"{ledger}:{seq}"] = the full entry.
+  7. Licences: {"subject": licence of the subject Card, "references": [{title, license, source, missing}] for every
+     reference Card of system1 and every attribution reference (deduplicated by card key, order of first use), "data":
+     retrain.recipe.data.license when the retrain section runs}. Licence = model_card.license, or license_name when
+     license is "other". source = the card:<object>#/model_card/license pointer of the Card it came from, or, for an
+     attribution reference whose Card is absent, null; title is then taken from the attribution Card
+     (card:<attribution object>#/stats/attribution/references/j/title) and missing = true (rendered by T410 as
+     LABELS["no_card"]); missing = false otherwise.
+  8. summary: list of {template, slots} in this order (templates are rendered by T410): "subject" {subject};
+     per system1 pair "s1_pair" {reference: analysis:0#/pairs/i/reference/title, verdict: .../system1/verdict,
+     p: .../system1/p_derived}; "s1_not_run" {reason}; per attribution reference "attrib_ref" {reference title, role,
+     n_attributed, n_tested} as card:<object>#/stats/attribution/references/j/... pointers; "attrib_not_run";
+     "retrain" {blocks, outcome, stop_step, ppl_ratio and top1 of the stop row} as card pointers; "retrain_not_run".
+  9. regenerate = shell-quoted `scout report <target> --store <store root> --model <model_path> --library-manifest
+     <manifest> --pins <pins> [--reference ...] [--ledger name=path ...] --out <file>` (paths as given; <file> literal).
+  10. generated_at default = UTC now "%Y-%m-%dT%H:%M:%SZ"; scout_version; code_id as given (the CLI passes
+      scout.jobs.runner.code_identity(repo_root)["code_id"]); params_digest = report_params_digest().
+  11. build_bundle performs no network request and reads no weight byte (only store objects, the model, the manifest,
+      the pins and the ledgers).
+acceptance:
+  tests:
+    - "fixtures: a tmp store holding (a) P3-style Cards of the T208 synthetic set (subject fa/ft with sigma+anchors; references from a synthetic manifest + pins), (b) a card.v3 attribution Card of the same subject (with_attribution + retrain_records.make_attribution), (c) a card.v4 of it (with_retrain + make_retrain); a JEV model trained on the synthetic set (P3 T210 train on the fixture); P3/P4/P5 ledgers written with scripts.p3_ledger.append citing those objects"
+    - "test_select_cards: the three entries are chosen; with (b) and (c) removed only analysis remains"
+    - "test_sections_not_run: subject without sigma/anchors -> system1 not_run with the reason; no attribution Card -> attribution not_run; no v4 -> retrain not_run; all reasons digit-free"
+    - "test_analysis_inputs: inputs.analysis lists the subject and reference objects in analyze order; data.analysis[0] equals analysis.analyze(...) recomputed in the test"
+    - "test_citations: each Card is cited by the matching ledger entry (P3 SCAN card_files, P4_EXIT object, P5_RETRAIN card_object); the model by FREEZE_MODEL; a tampered ledger -> recorded error and no citation"
+    - "test_pointer_equivalence: for every summary slot pointer card:<obj>#<ptr>, resolving ptr in data.cards[obj] equals resolving it in the full Card JSON from the store"
+    - "test_model_mirror: data.models has exactly one key, equal to sha256 of the model file and to inputs.model.sha256; for each of /params/calibration_note, /thresholds/hi, /thresholds/lo the pointer resolves to the same value in data.models[sha] and in the parsed model file; all-not-run bundle -> data.models == {} and inputs.model is None"
+    - "test_attribution_reference_cards (validation r2 major 5; te-style fixture: a card.v3 attribution Card of a component subject whose stats.attribution lists a base (role reference), an independent candidate (role reference) and a control, built with with_attribution and make_attribution, plus header-scan Cards of the three references in the store): inputs.cards has three rows with role 'attribution-reference', citation null and via == the attribution Card's object; data.cards holds the three; the licence rows carry each Card's model_card.license with missing False; removing the control's Card from the store -> build_bundle succeeds, no inputs.cards row for it, inputs.skipped names it, its licence row has license None, missing True and the title from the attribution Card"
+    - "test_analysis_prefers_non_v4: a store with the P3-style card.v2 subject Card and a newer card.v4 of the same key -> select_cards()['analysis'] is the card.v2 entry; with the card.v2 removed -> the card.v4"
+    - "test_s2_optional: with StubS2Client -> sections.system2 run, data.s2 validates as s2.v1, s2in_sha256 set; without -> not_run 'not requested'"
+    - "test_no_network_no_weights: build_bundle under an httpx transport that raises and a socket guard -> succeeds; scout.report.bundle does not import scout.hub/sources/scan/gate (AST walk, transitive over scout.*)"
+    - "test_deterministic: build_bundle twice with the same generated_at and code_id -> equal bundle_sha256"
+    - "test_heads_pinned (blocker): b1 = build_bundle(...); append two entries to the P5 ledger (a P5_RETRAIN whose card_object equals the already-cited card.v4 object, so an unpinned 'latest' rule would move the citation to it, and one P5_READER); build_bundle(..., ledger_heads={r['name']: r['head_seq'] for r in b1['inputs']['ledgers']}) == b1 (canonical JSON), while build_bundle without ledger_heads differs (head_seq moved); inputs.ledgers rows carry head_seq/head_line_sha256 and no n_entries/last_seq keys"
+    - "test_heads_shorter_ledger: ledger_heads naming seq 99 for a 3-entry ledger -> that ledger recorded with error 'ledger shorter than the pinned head' and no citation from it"
+    - "test_read_entries_prefix: a ledger whose entry 4 is corrupted -> read_entries(upto_seq=3) verifies and returns 3 entries; upto_seq=None -> error"
+  commands:
+    - pytest -q tests/test_report_bundle.py
+    - pytest -q
+out_of_scope:
+  - HTML rendering (T410); linting (T411); reader key (T412)
+invariants_touched: [1, 3, 5]
+decisions: [D85, D86, D94, D99]

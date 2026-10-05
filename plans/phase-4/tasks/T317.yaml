@@ -1,0 +1,93 @@
+id: T317
+title: "Attribution client - attribute(): store-cached header scans, attribution cache, full plan displayed, exact confirmation, job submission with live ingest, Card v3 with stats.attribution written to the store, text report with disclaimers and caveat"
+depends_on: [T309, T315, T316]
+files:
+  - scout/attribute.py
+  - tests/test_attribute.py
+route: opus
+spec_complete: true
+interface: |
+  scout/attribute.py:
+    @dataclass(frozen=True)
+    class AttributeResult:
+        subject_key: dict; entry: StoreEntry | None; card: dict | None; plan: dict | None; decision: dict | None
+        job: dict | None; cached: bool; text: str
+    def attribute(subject: str, references: list[str], *, controls: list[str], store: CardStore, backend: Backend | None,
+                  # controls: >= 1 independent model the human names (plan.md 3.8 step 6); empty -> ValueError
+                  confirm_plan: str | None = None, confirm_bytes: int | None = None, plan_only: bool = False,
+                  display: Callable[[str], None] = <print to stderr, flush>, client: httpx.Client | None = None,
+                  endpoint: str | None = None, token: str | None = None,
+                  gate_threshold_bytes: int = DEFAULT_GATE_THRESHOLD_BYTES, wire_audit: bool = False,
+                  hello: dict | None = None, out_dir: pathlib.Path | None = None,
+                  git_commit: str | None = None) -> AttributeResult
+    def format_attribution(card: dict) -> str
+    def confirm_line(plan: dict) -> str        # f"CONFIRM WITH: --confirm-plan {plan_id} --confirm-bytes {bytes_cap}"
+behavior: |
+  1. Header scans (0 weight bytes): for each target in [subject] + references + controls: (entries, hit) =
+     store.cached_scan(target, store, ByteLog(), tokenizer=True, client=client, endpoint=endpoint, token=token)
+     (a FRESH ByteLog per scan: each scan's log lives in its own Card). Each target must give exactly one entry, else
+     ScoutError(f"{target} has {n} units; add #<component>"). display(f"store {'hit' if hit else 'scanned'}: {title}").
+  2. Pinning: spec targets are built from the Cards: Hub -> f"{repo}@{revision_sha}" + ("#" + selector if any);
+     local -> the absolute folder path (+ selector). A Hub target given without a 40-hex rev is resolved by the scan
+     and pinned from its Card.
+  3. Attribution cache: hit = store.find_attribution(subject_key, [reference keys], [control keys]) (T309: role-aware;
+     the stored attribution lists controls among its references with role "control", and the key includes each role,
+     so swapping a reference and a control misses; validation r2 minor) -> return AttributeResult(cached=True,
+     entry=hit, card=loaded card, text=format_attribution(card)); no plan, no job, no network beyond step 1 (which is
+     itself 0 requests when the Cards are cached).
+  4. Plan: loaded = [fullplan.LoadedModel(*store.load(e), target) ...]; host info from `hello` (or backend hello when
+     backend is given and hello None: backend.worker_hello): plan = plan_attribution(subject, references,
+     controls=[...], threshold_bytes=gate_threshold_bytes, host=hello["hostname"], scratch_root=hello["scratch_root"],
+     disk_free_bytes=hello["disk_free_bytes"]).
+  5. Run log: log = ByteLog(); log.stage(FULL_DOWNLOAD). plan_only -> text = format_full_plan(plan) + "\n" +
+     confirm_line(plan.to_dict()); display(text); log.note("gate", text); return (no decision, no job).
+  6. d = run_full_gate(plan, log, flag_confirmer(confirm_plan, confirm_bytes), display=display) (the plan is displayed
+     before the decision on every path). Not approved -> display("NOT CONFIRMED. " + confirm_line(plan.to_dict())) and
+     raise GateDeclined(message, plan=plan.to_dict()) - no job is submitted.
+  7. spec = make_spec(plan=plan, decision=d, subject_target=<pinned subject target>, reference_targets=[pinned
+     reference targets, in plan order], control_targets=[pinned control targets, in plan order] (T315 requires it;
+     validation r2 minor), endpoint=endpoint or
+     DEFAULT_ENDPOINT, scratch_root=hello["scratch_root"], wire_audit=wire_audit, client_hostname=socket.gethostname(),
+     git_commit=git_commit). outcome = run_job_via(backend, spec, log, display=display).
+     Failed -> display the error, the sweep report, log.totals_by_origin() and the JobRecord (bytes by class, disk
+     peak; validation r1 minor: bytes a failed job fetched on the worker stay visible) and raise JobError(f"job {job_id}
+     failed on {host}: {message}; worker fetched meta {m} / header {h} / weight {w} B")
+     (exit code 7, or the worker's exit_code when it is 8 or 9, re-raised as PurgeError / DiskSpaceError).
+  8. Success: attribution = outcome.result["attribution"] with "job" = {"job_id", "host": outcome.hello["hostname"],
+     "plan_id"}. log.stage(REPORT). extra_log = {**log.to_card_dict(), "disk": {"peak_bytes": log.disk_peak,
+     "resident_bytes": log.disk_resident}, "jobs": log.job_records}. built = card.with_attribution(subject card,
+     subject table, attribution, extra_log, out_dir or <tmp>). write_card into a temp dir, store.put_files, optional
+     export to out_dir. log.stage(PURGE); log.note("purge", "PURGE check: client holds no weights; worker: " +
+     outcome.result["purge"] summary). Return AttributeResult(entry, card=built.card, plan, decision, job=outcome.record,
+     cached=False, text=format_attribution(built.card)).
+  9. format_attribution(card): header line f"BLOCK ATTRIBUTION: {title} ({prefix}, {depth} blocks; alpha {alpha},
+     {n_tests} tests, null control-calibrated, control_ok {control_ok})"; one line per reference f"  [{i}] {title}: {status}, {n_attributed}/{n_tested}
+     attributed, null: control mean {control_mean:.2f} sd {control_sd:.2f} (n {n_control}), shift mean
+     {shift_mean:.2f} max {shift_max:.2f}, crit {crit:.2f} (t, df {df})" with " [control]" after the title for controls
+     (or the reason); then f"  null: control-calibrated (plan.md 3.8); family-wise error <= {alpha} assumes an
+     independent reference behaves like the control(s) at equal depth" ; one line per block
+     f"  block {index:>3}: {status:<14} {primary title or '-'}  z_adj {z:.1f}  p {p:.1e}" (numbers of the primary, or of
+     the best test when not attributed; '-' when none); other_stacks lines; then the three DISCLAIMERS and
+     ATTRIBUTION_CAVEAT, each on its own line.
+  10. Nothing here reads weights: the client's wire traffic is Hub metadata/headers only (asserted in tests).
+acceptance:
+  tests:
+    - "fixtures: T313 local repos (subject GGUF of derive(BASE), BASE, CONTROL, TE pipeline); InProcessBackend and LocalBackend with tmp scratch roots; tmp store; every call passes references=[BASE] (or the TE reference) and controls=[CONTROL]"
+    - "test_controls_required: controls=[] -> ValueError before any scan or request"
+    - "test_plan_only: plan_only=True -> text has 'FULL DOWNLOAD GATE' and the CONFIRM WITH line; no job; client totals.weight 0; no scratch dir"
+    - "test_decline_no_job: wrong confirm bytes -> GateDeclined, the plan displayed first (spy order), backend.open never called"
+    - "test_attribute_end_to_end_local_backend: exact confirmation, gate_threshold_bytes=0 -> AttributeResult with card.v3 subject Card, stats.attribution BASE 16/16 and CONTROL 0/16, fetch_log.jobs has 1 record with status succeeded, fetch_log events include origin-tagged worker events, stored in the store (find_attribution hits), scratch audit 0 files"
+    - "test_second_call_cached: the same call again -> cached True, backend.open not called, 0 new FakeHub/Local reads"
+    - "test_cache_roles_swapped: after the end-to-end run, attribute(subject, references=[CONTROL], controls=[BASE], plan_only=True) -> cached False (the role-aware key misses), a plan is displayed whose plan_id differs from the first run's"
+    - "test_spec_has_controls: the spec passed to run_job_via (spy) has controls == [the pinned CONTROL target] and validate_spec(spec) == []"
+    - "test_te_selector: subject te_dir + '#text_encoder' vs the TE reference -> 12/12, other_stacks listed; format_attribution contains 'no probe basis'"
+    - "test_failed_job_reports_sweep: InProcessBackend with scout.jobs.download.download_plan monkeypatched to raise NetworkError after the first chunk -> JobError (exit 7) whose message has the worker's weight bytes (> 0); display shows the worker error, the sweep report and the totals by origin; no new store entry; scratch audit 0 files"
+    - "test_text_disclaimers: format_attribution output contains the 3 DISCLAIMERS and ATTRIBUTION_CAVEAT verbatim"
+    - "test_units_error: a pipeline subject without selector -> ScoutError naming the fix"
+  commands:
+    - pytest -q tests/test_attribute.py
+    - pytest -q
+out_of_scope:
+  - CLI flags (T319); UI (T318); exit checks (T320, T321)
+invariants_touched: [1, 2, 5]
+decisions: [D57, D61, D62]

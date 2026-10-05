@@ -36,3 +36,16 @@ Unscheduled
   cdn-lfs*.hf.co and cas-bridge.xethub.hf.co. Allowlisting them would let EXIT run here.
 - Local folder inside an HF cache `snapshots/<sha>/`: optionally use that SHA as the key after verifying blob hashes (validation round 1, rejected for P1).
 - Reuse the CDN/Xet Location from the 8-byte read for the [8, 8+N) read, re-resolving on 403/expiry, to save one hop per file (validation round 2, deferred: not needed for the 10 s budget).
+T006: >1 non-canonical index with exactly one single file returns the single file; decide whether that should be AmbiguousWeightsError.
+- LocalSource FIFO race (T004 review nit 4): a path swapped for a FIFO between resolve() and a read blocks in open() before the fstat check; fix with os.open(O_RDONLY|O_NONBLOCK) + S_ISREG check on the fd.
+- LocalSource alias limitation (T004 review): an extensionless weight blob linked under a non-weight name, with no weight-named sibling on the same inode, is classified as meta (ByteLog classifies by name; content sniffing deferred).
+- LocalSource symlink-after-resolve (T004 review r2): a new symlink (hidden or not) pointing at a listed file, created after resolve(), does not change the file's stat, so reads keep the resolve-time classification; re-resolve before reads if the tree may change.
+- T004 (r3 review): hardlink aliases that name checks cannot see still count weight bytes as meta: a weight file inside a hidden directory (e.g. `.cache/model.bin`) hardlinked to a visible non-weight name, and a weight file outside root hardlinked into root. Suggested fix: for non-weight files, refuse (or warn) when `st_nlink` > number of names found for that inode; costs false positives on hardlink-dedup trees.
+- T008 (review): nn.Sequential indices (e.g. visual.merger.mlp.{0,2}, VAE head.{0,2}) become depth-2 stacks with all-different signatures; the view/depth strip may want to suppress such stacks.
+- T007/T009: model_card and pipeline subkey order differs from plan 4.2 (claimed last; model_index_path after components). Key sets match; reorder in metadata.to_dict if strict order matters.
+- T005 (r3 review, PRIORITY): a caller-supplied client with a request event hook or a client-level `Authorization` header could still put the HF token on CDN requests. Fix: in HubSource.__init__, refuse request hooks and client-level Authorization too.
+- T005 (r3 review): if a caller drains `resp.stream` directly (not read()/iter_*), num_bytes_downloaded stays 0; HubSource still fails closed but logs 0 bytes. Undetectable externally; document in code.
+- Process: reviewer/implementer probe scripts in the shared scratchpad were overwritten by other agents; future evidence should be self-contained probes with task-specific names, or committed tests.
+- T009 (r3 review): concurrent first-writer window can leave a JSON pointing at a missing Parquet until the next rescan (load fails cleanly). Fix in P4 with a per-key lock or content-addressed store.
+- T010 (review): budget threshold can only trip mid-scan (HEADERS/META) at the HubSource level; the 16 MiB unknown-length reservation means small fixtures trip on the API preflight.
+- T016/C12 (review): older HF revisions may redirect LFS to cdn-lfs*.huggingface.co, which ALLOWED_HOSTS (*.hf.co) does not cover; if E4 hits this, it is a human decision to widen the allowed set.

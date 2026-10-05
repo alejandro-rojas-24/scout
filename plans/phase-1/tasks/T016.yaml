@@ -22,7 +22,11 @@ interface: |
         json_paths: list[pathlib.Path]; parquet_paths: list[pathlib.Path]
         wire: list[dict]            # CountingTransport records: {method,url,orig_path,range,status,location,body_bytes}
 
-    def common_checks(r: TargetResult, budget_s: float) -> list[Check]       # C1..C11
+    HF_ENDPOINT_URL = "https://huggingface.co"
+    ALLOWED_HOSTS: tuple[str, ...] = ("huggingface.co", "*.hf.co")    # "*.x" matches any subdomain of x (not x itself)
+    def host_allowed(host: str, allowed: Iterable[str]) -> bool
+    def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[str] = ALLOWED_HOSTS,
+                      expected_endpoint: str = HF_ENDPOINT_URL) -> list[Check]       # C1..C12
     def expect_qwen3_8b(r: TargetResult) -> list[Check]
     def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]
     def expect_qwen_image(r: TargetResult) -> list[Check]
@@ -46,6 +50,8 @@ behavior: |
          of that file (look up by path in the cards' weights.files); records without a Range fail.
          Also require >= 1 such record, so the check is not vacuous.
      C11 sum(w.body_bytes for w in wire) == final.totals.meta + final.totals.header + final.totals.weight.
+     C12 every wire record's URL host satisfies host_allowed(host, allowed_hosts) (one failing Check lists the offending
+         hosts), AND every card.source.endpoint == expected_endpoint. Requires len(wire) >= 1 (not vacuous).
   3. expect_* implement the E1/E2/E3 tables of plan.md section 2 literally:
      - "a stack whose prefix ends with X" means any stack in structure.stacks with prefix.endswith(X) (the "." boundary:
        prefix == X or prefix.endswith("." + X)) whose depth equals the expected value. Also emit a Check that at least one
@@ -57,6 +63,7 @@ acceptance:
     - "tests/test_exit_expectations.py builds minimal hand-written TargetResult objects (dict cards/views, small pyarrow tables)"
     - "for EACH of expect_qwen3_8b, expect_qwen3_30b_a3b, expect_qwen_image: a passing input -> all ok; and a failing input per checked field (parametrized: wrong depth, wrong n_experts, missing vision_config, missing component, wrong base_model, ...) -> at least that Check is not ok and nothing raises"
     - "common_checks: a passing input; C10 fails for a record with Range end beyond 8+N and for one with no Range; C10 fails when there are no safetensors records; C11 fails when a wire byte total exceeds the ByteLog total by 1; C8 fails at 101 non-tensor nodes"
+    - "C12: passes for hosts huggingface.co and cas-bridge.xethub.hf.co; fails for 'mirror.example.com', for 'evilhf.co', and when a card's source.endpoint is 'https://hub.test' with expected_endpoint default"
     - "test_stack_suffix_boundary: prefix 'model.xlayers' does not match suffix 'layers'"
   commands:
     - pytest -q tests/test_exit_expectations.py
@@ -64,3 +71,22 @@ acceptance:
 out_of_scope:
   - network, server, CountingTransport (T015)
 invariants_touched: [2]
+decisions:
+  # round 2 (opus, after review FAIL); every fix has a test that fails without it (checked by mutating each fix)
+  - "C10 Hub API exemption: T015 records the API revision call with orig_path None, so a literal 'fail every 2xx with orig_path None' would fail every real run. Exempt only a record whose URL host == host(expected_endpoint) AND unquote(path) == f'/api/models/{repo}/revision/{pin}' for a Card repo (the only non-resolve call scout.hub makes; it never carries file bytes). Any other 2xx without orig_path fails. Status that is not an int is treated as 2xx (fail closed); 3xx/4xx without orig_path are not offenders."
+  - "C10 normalisation: p = unquote(urlsplit(orig_path).path), so a query string, fragment, full URL or percent-encoding all reduce to the resolve path. A non-str orig_path is an offender."
+  - "C10 mapping: every record with an orig_path (any status) must start with f'/{repo}/resolve/{pin}/' for a repo in the cards' key.repo, else it is listed in one aggregate Check ('C10 every wire record maps ...'). The repo comes from card key.repo, not from TargetResult.target, whose format T015 does not fix."
+  - "C10 weight records: a record is a weight request if p.lower() ends with '.safetensors' or it maps to a Card file. Each gets its own Check: it must equal f'/{repo}/resolve/{pin}/{file.path}' exactly, except that the extension is compared case-insensitively (posixpath.splitext), and it must carry Range bytes=a-b (regex fullmatch, 'bytes' is case-insensitive) with a <= b and b+1 <= 8+header_len. Open-ended, multi-range and reversed ranges fail. The rule applies to 3xx records too (the original request carries the Range)."
+  - "C10 per-file evidence: one Check per Card weight file requires >= 1 mapped record with a 2xx status; a 3xx alone does not count. The '>= 1 weight-file wire record' Check is kept."
+  - "Never raise: up-front Checks named 'TYPE field <attr> has the right type' (not 'C0', which is the plan's target-set check) for final (dict), events/cards/views/wire (list of dict), tables (list of pa.Table), json_paths/parquet_paths (list of str|PathLike). After that a non-list field is coerced to [] and elements of the wrong type are dropped. expect_* use the same coercion for cards and views."
+  - "C1: ok iff status == 'done', elapsed_s is int|float but not bool, math.isfinite, and 0 < elapsed_s < budget_s."
+  - "C6: repo_slug (repo.replace('/', '__'); the exit targets are all Hub) and component_slug are re-derived here rather than imported from scout.card, so the evidence does not depend on the code under test. Checks: (a) every json name ends in .card.json, every parquet name in .tensors.parquet, parent.name == pin, and the (parent dir, stem) sets of json and parquet are equal (each pair shares a stem and a dir); (b) per card, a json and a parquet exist in the same dir at <repo_slug>/<pin>/<component_slug>.*. The counts and existence Checks are kept."
+  - "C7/C9: each card's table is the single table whose Parquet schema metadata has component == (key.component or '') and revision_sha == key.revision_sha; 0 or >1 matches fail. Repo is not matched (not required by the review; revision_sha + component identifies the table within one target)."
+  - "E2: a new Check 'E2 exactly one model.layers depth strip' (== 1); strip() also raises unless there is exactly one, so the cell Checks never silently use the first of several."
+  - "E3: the pipeline dict is read once from the first card; a separate Check 'E3 all cards carry an identical pipeline' requires exactly one distinct pipeline dict (by ==) over all cards. pipeline_class is now compared as a str, not a set."
+  - "E3 transformer: exact prefix 'transformer_blocks' via _exact_prefix_checks (existence Check + depth Check, depth also type-equal); text_encoder 'layers'/'blocks' stay suffix matches as the plan says."
+  - "E3 architectures: must be a list and contain 'Qwen2_5_VLForConditionalGeneration' (a str with that substring fails)."
+  - "Removed the dead _set helper (it was in tests/test_exit_expectations.py, not the script). Test fixture now follows the plan layout (<tmp>/o__n/<sha>/_model.*), sets Parquet metadata, and records the API call as T015 does (orig_path None)."
+  # follow-ups after re-review PASS
+  - "E1/E2/E3: new Check '<E> every card key.repo == <target repo>' (Qwen/Qwen3-8B, Qwen/Qwen3-30B-A3B, Qwen/Qwen-Image); it needs >= 1 card and every card's key.repo to equal the repo exactly, so a fork or mirror at the same sha fails. The repo is hard-coded per expectation function, matching its DEFAULT_EXPECTATIONS key."
+  - "C10: WEIGHT_EXTENSIONS is copied from scout.bytelog.WEIGHT_EXTENSIONS rather than imported, to keep the evidence independent; test_weight_extensions_match_bytelog guards against drift. Any record (any status) whose normalised orig_path ends, case-insensitively, in a weight extension other than .safetensors is an offender in the aggregate 'C10 every wire record maps ...' Check."

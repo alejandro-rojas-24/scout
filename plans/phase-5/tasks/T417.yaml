@@ -1,0 +1,203 @@
+id: T417
+title: "P5 exit runner - scripts/exit_check_p5.py (freeze, plan, run, reports, reader-form, read, exit) with the script-written P5 ledger, store population from the P3/P4 artifacts, exit/pins_p5.json, pin_exit --phase 5 (dataset pins), .gitignore"
+depends_on: [T321, T408, T414, T416]
+files:
+  - scripts/exit_check_p5.py
+  - exit/pins_p5.json
+  - scripts/pin_exit.py
+  - .gitignore
+  - tests/test_exit_check_p5_units.py
+  - tests/test_pin_exit_p5.py
+  - tests/test_exit_p5_network.py
+route: opus
+spec_complete: true
+interface: |
+  exit/pins_p5.json (committed as, keys sorted): {"HuggingFaceTB/SmolLM2-360M": "UNPINNED", "Qwen/Qwen2.5-0.5B": "UNPINNED",
+    "Qwen/Qwen2.5-0.5B-Instruct": "UNPINNED", "Salesforce/wikitext": "UNPINNED"}
+  .gitignore: += "cards/p5-store/", "reports/"
+  scripts/pin_exit.py: --phase {1,2,3,4,5}; phase 5 targets = sorted(exit_expectations_p5.P5_REPOS), default pins
+    exit/pins_p5.json; the data repo (P5_RETRAIN_TARGET["data"]["repo"]) is resolved with `scout resolve <repo>
+    --repo-type dataset` and cross-checked with `git ls-remote https://huggingface.co/datasets/<repo> refs/heads/main`;
+    HF_TOKEN optional for phase 5 (passed through GIT_CONFIG_* env when set, P2 D29); phases 1-4 unchanged.
+  scripts/exit_check_p5.py:
+    P5_KINDS = ("P5_FREEZE", "P5_PREFLIGHT", "P5_PLAN", "P5_ATTEMPT", "P5_RETRAIN", "P5_REPORTS", "P5_READ_ATTEMPT",
+                "P5_READER", "P5_EXIT")
+    DEFAULTS = {"pins": "exit/pins_p5.json", "pins_p3": "exit/pins_p3.json", "pins_p4": "exit/pins_p4.json",
+                "ledger": "exit/ledger_p5.jsonl", "ledger_p3": "exit/ledger_p3.jsonl", "ledger_p4": "exit/ledger_p4.jsonl",
+                "store": "cards/p5-store", "cards_p3": "cards/p3", "store_p4": "cards/p4-store", "out": "reports/p5",
+                "model": "models/jev_v1.json", "manifest": "library/manifest.yaml", "form": "exit/reader_human.yaml",
+                "ack": "exit/p5_ack.json"}
+    def worker_retrain_env(backend: Backend, timeout_s: float = 120.0) -> dict   # args ["retrain-env"], one JSON line
+    def populate_store(store: CardStore, cards_p3: Path, store_p4: Path, keys_p4: list[dict]) -> dict
+        # import_tree(cards_p3); for each key in keys_p4: every entry of store_p4 with that key -> export to a tmp dir ->
+        # import_tree (byte-identical); then (validation r2 major 5) for every such entry with has.attribution, every
+        # stats.attribution.references[].card_key (base, independent candidate, control): every store_p4 entry of that
+        # key, exported and imported the same way; returns {"imported_p3": n, "imported_p4": m,
+        # "imported_p4_references": k, "missing_references": [card_key, ...]}
+    def main(argv: list[str] | None = None, *, backend_factory: Callable[[str], Backend] | None = None,
+             retrain_target: dict | None = None, report_targets: tuple[dict, ...] | None = None,
+             pins: dict[str, dict] | None = None,               # {"p5": {...}, "p3": {...}, "p4": {...}} (rehearsal)
+             env: Env5 | None = None, client_factory: Callable[[], httpx.Client] | None = None,
+             endpoint: str | None = None, code_state: Callable[[Path], dict] | None = None,
+             s2_client_factory: Callable[[], S2Client] | None = None, expected_reader_host: str = "api.anthropic.com",
+             allow_local_targets: bool = False, now: Callable[[], str] | None = None) -> int
+      # subcommands: freeze | plan | run | reports | reader-form | read | exit
+      # flags: every DEFAULTS key as --<key with '_' -> '-'>; --backend (plan, run; required); --confirm-plans ID:CAP
+      # (run; required; P2 parse_confirm_plans); --reader llm|human (read; required); --answers FILE (read human);
+      # --waive-human REASON (read human, instead of --answers); --refreeze-reason TEXT (freeze). There is no model
+      # flag: the LLM reader always requests READER_PARAMS["llm_model"] (validation r2 minor; the r1 --s2-model flag
+      # is removed and argparse rejects it)
+      # There is deliberately NO flag that re-runs a gate: a second run, reports or read is possible only after a
+      # recorded refreeze (validation r1 major 3), except a crash rerun of `run` (behavior 5b).
+      # keyword arguments exist for the offline rehearsal only; no CLI flag overrides a target or a threshold
+behavior: |
+  1. Common start: foreign HF_ENDPOINT -> exit 1 (P1 message); pins = the three files (or the keyword); C0 =
+     check_target_set(...) -> FAIL: print the table and exit 1 before any request, appending nothing; ledger problems
+     (p3_ledger.verify(ledger, kinds=P5_KINDS)) -> "LEDGER BROKEN", exit 1. code = (code_state or
+     scout.jobs.runner.code_identity)(repo_root).
+  2. freeze: payload = {params: {retrain, report, lint, reader literals as imported}, params_sha256, retrain_target,
+     report_targets, pins_sha256 (sha256 of the pins_p5 file bytes, or of canonical JSON of the keyword dict),
+     model_sha256, cited_ledgers {p3, p4: {head_seq, head_line_sha256} or null when the file is absent},
+     refreeze_reason, git_commit, code_id, code_dirty}. Rows C0 and C2 (step "freeze": literals and targets only).
+     The last P5_FREEZE with an identical payload apart from refreeze_reason and with no P5_ATTEMPT, P5_REPORTS,
+     P5_READ_ATTEMPT or P5_READER after it -> "already frozen", exit 0, nothing appended. A P5_ATTEMPT, P5_REPORTS,
+     P5_READ_ATTEMPT or P5_READER after the last P5_FREEZE and no --refreeze-reason -> exit 5 "refreeze needs --refreeze-reason" (with the reason the refreeze
+     is appended even when the payload is otherwise identical: it is how a FAILed gate is retried, and P5_EXIT will
+     report "PASS after refreeze: <reason>", never a plain PASS). Else append P5_FREEZE and print {"step": "FREEZE",
+     "phase": 5, "hostname", "ledger_seq", ...}.
+  3. plan and run start with populate_store (keys_p4 = the report targets whose "pins" is "p4", keyed by their pins);
+     missing Cards for any report target or the retrain subject, or a non-empty missing_references (an attribution
+     reference of a P4 report target without a Card in store_p4; validation r2 major 5) -> a C0 row "missing Card:
+     run the P3/P4 exit first" naming the key, exit 1. `reports` runs populate_store again (idempotent) and applies
+     the same row.
+  4. plan: backend; hello = worker_hello; renv = worker_retrain_env; C1 (disk_needed 0); C2 (step "plan"); result =
+     scout.retrain.client.retrain(subject@pin, base=base@pin, controls=[control@pin], blocks, data=DataSpec(repo, pin,
+     train, eval), budget_name=env.budget, store, backend, plan_only=True, hello=hello, client=client_factory() if given
+     wrapped in scripts.exit_check.CountingTransport, gate_threshold_bytes (keyword override only in the rehearsal via
+     retrain_target["gate_threshold_bytes"])); rows C3 (models loaded from the store), C4a (plan-time client
+     totals.weight == 0 and no ranged request on the client wire), C1 again with disk_needed = plan disk_bytes. Print
+     "CONFIRM WITH: --confirm-plans <id>:<cap>" and "TOTAL CAP: <cap> B". Append P5_PLAN; exit 0 iff all rows ok.
+     P5_PREFLIGHT {hello, retrain_env, checks, git_commit, code_id} is appended before P5_PLAN in the same step.
+  5. run: one-shot gate first (validation r1 major 3; P3 pattern: refused runs append nothing and exit 5):
+     a. the P5_RETRAIN entries after the last P5_FREEZE: one with passed true -> exit 5 "retrain already passed under
+        this freeze" (also when it carries a finding, D100); one with passed false and crash false (the job returned a
+        result and a gating row FAILed) -> exit 5 "a completed retrain FAILed: a new run needs a recorded refreeze
+        (freeze --refreeze-reason)".
+     b. crash reruns: T416 crash_attempts(entries) - P5_RETRAIN entries with crash true (no result message: backend
+        or transport error, worker exit before `result`, PlanMismatch, DiskSpaceError, client interrupted) and
+        P5_ATTEMPT entries that no P5_RETRAIN names (the client was killed before it could record anything;
+        validation r2 minor: a killed client is a crash) - do not block, up to MAX_CRASH_RERUNS (2) per freeze; a third
+        -> exit 5 "too many crash reruns: refreeze". Every crash rerun qualifies the exit status as "after rerun"
+        (T416 exit_status), never a plain PASS.
+     Then the steps of plan, without appending P5_PREFLIGHT or P5_PLAN (the plan id must equal the last P5_PLAN's,
+     else "plan changed since P5_PLAN", exit 1, nothing appended); C2 (step "run"); audit_before = worker_audit; prior_attempts = earlier P5_ATTEMPT entries with
+     the same plan id; append P5_ATTEMPT BEFORE the job; KeyboardInterrupt or SIGTERM in the client while the job
+     runs -> append P5_RETRAIN {crash: true, error: "client interrupted", attempt_seq} when the ledger is writable,
+     then re-raise (exit 130 / 143); a hard kill leaves the P5_ATTEMPT unanswered, which counts the same way; retrain(..., confirm_plan/confirm_bytes from --confirm-plans only
+     when that exact pair is listed, wire_audit True); audit_after; rows C3-C14 with T416 (C4-C8 via the P4 functions,
+     C6 plus the "data files only" row, C7 plus "no checkpoint written", C14 with scout.view.build_view of the stored
+     Card v4). Any exception -> the job's rows FAIL with the error text. Append P5_RETRAIN (always; payload plan.md 4.9
+     with the evidence of plan.md 2.3 and crash = (no result message was received)) and print the table and
+     {"step": "RETRAIN", ...} with each row's T416 row_verdict (PASS / FAIL / FINDING). passed = T416
+     gating_ok(rows); finding = the retrain.v1 outcome when an outcome row (C11b, C12) is not ok, else None (D100).
+     Exit 0 iff passed (a FINDING alone exits 0 and prints "FINDING: <outcome>"). A FAIL therefore always means a
+     gating row (the loop, the gate, the job), never a negative experimental result.
+  6. reports: requires a P5_RETRAIN with passed true after the last P5_FREEZE (else exit 1 "no passing P5_RETRAIN");
+     a P5_REPORTS after the last P5_FREEZE -> exit 5 "reports already built under this freeze" (one-shot).
+     D99 precondition (validation r1 minor): exit/p5_ack.json must exist and parse as {"decision": "D99", "by": str
+     non-empty, "date": "YYYY-MM-DD"} (written by the human, not by any script); otherwise exit 5 "D99 acknowledgement
+     missing: record exit/p5_ack.json" and nothing is written or appended. Its sha256 is recorded in P5_REPORTS
+     (field ack_sha256). DEFAULTS gains "ack": "exit/p5_ack.json" (flag --ack).
+     For each report target (order of P5_REPORT_TARGETS): target string repo@pin[#component]; inputs = ReportInputs(
+     store, model, manifest, pins_p3 file (or a temp file of the keyword dict), ledgers {p3, p4, p5}); bundle =
+     build_bundle(target, inputs, generated_at=now(), code_id=code.code_id) (ledger heads = the current heads, so the
+     p5 head is the entry just before this P5_REPORTS; later appends never change an L10b rebuild, T409/T411); html =
+     render(bundle); write out/<label>.html; lint with require_ledger env.require_ledger; key sha =
+     reader.key_sha256(reader.answer_key(bundle)); rows C15 (reports_entry None). The negative control: canary, defects
+     = scripts.p5_canary.make_canary(html of READER_PARAMS["canary"]["source_label"] ("retrain")) (exit-only code,
+     T412; validation r2 minor); write out/canary.html (never linted; its key is the source report's; deleted by
+     `exit`, behavior 9). neutral = reader.neutral_names(labels + ["canary"], key shas). Append
+     P5_REPORTS {reports: {label: {file_name, sha256, bytes, lint_ok, lint_rows, answer_key_sha256, bundle_sha256}},
+     canary: {file_name, sha256, source_label, defects: [{id, question, text_sha256}]}, neutral, passed, git_commit,
+     code_id}. Exit 0 iff all ok.
+  7. reader-form: requires P5_REPORTS; copies the four files to <out>/reader/<neutral name> (byte-identical) and writes
+     reader.reader_form(neutral, bundles) to --form; appends nothing; prints the directory and the form path only (no
+     label-to-name mapping is printed: the reader must not know which file is the canary).
+  8. read: requires the last P5_REPORTS after the last P5_FREEZE and every file's sha256 (the canary included) equal to
+     it (else exit 1 "reports changed since P5_REPORTS"). One-shot (validation r1 major 3): a P5_READER with the same
+     reports_seq and reader already exists -> exit 5 "reader <r> already recorded for P5_REPORTS <seq>: a new reading
+     needs a recorded refreeze" (no flag overrides it; a waiver counts as the human's reading).
+     A P5_READ_ATTEMPT for the same reports_seq and reader with no P5_READER naming it (an earlier invocation was
+     killed or raised after it started) is a consumed reading too -> exit 5 "a reading started at seq <s> was not
+     recorded: a new reading needs a recorded refreeze" (validation r2 major 4).
+     llm: client = RecordingS2Client(s2_client_factory() if given else AnthropicS2Client()); config =
+     S2Config.from_env(READER_PARAMS["llm_model"]) (no override); credentials checked (exit 3 before anything is
+     appended when missing). Then, BEFORE the first call, append P5_READ_ATTEMPT {reports_seq, reader: "llm",
+     requested_model, n_calls: 4 * READER_PARAMS["llm_samples"], git_commit, code_id} (validation r2 major 4: a draw
+     that is killed, interrupted or raises after this point is visible to C18 and consumes the reading). For each of
+     the four files, READER_PARAMS["llm_samples"] (3) calls of llm_read (fresh context each; the pre-registered
+     k-of-n); nothing is printed per call except "reader call <i> of <n>" progress lines (no answer, score or
+     detection). If EVERY call failed before any response arrived (no served_model on any RecordingS2Client call:
+     network or credential failure), append P5_READER {attempt_seq, unreachable: true, files: the per-call errors,
+     passed: false} and exit 3 "reader unreachable" (no answer was seen, so this does not consume the reading; C18
+     checks the served_model nulls). Otherwise append P5_READER {attempt_seq, unreachable: false, every sample,
+     unavailable samples included (they count as failed)} FIRST, and only then compute and print scores /
+     canary_detection per sample and the C16 rows (expected_host = expected_reader_host), as on the human path.
+     human: parse_human(--answers, neutral) -> P5_READER is appended FIRST with the full answers and answers_sha256,
+     and only then are scores computed and C17 rows printed (validation r1 major 3: no per-question correctness is
+     shown before the answers are locked in the ledger); or --waive-human REASON -> one WAIVED row.
+     P5_READER payload: plan.md 4.9 (attempt_seq: the P5_READ_ATTEMPT seq for llm, null for human; unreachable;
+     answers_sha256 = sha256 of canonical JSON of all answers; reports_seq = the
+     P5_REPORTS seq; samples: per file a list of {answers, required_edits, score or detection, s2 meta}). Exit 0 iff all
+     rows ok.
+  9. exit: C0; C2 (step "exit", with inputs_now read from the pins file, the model file and the P3/P4 ledgers); the
+     passing P5_RETRAIN after the last P5_FREEZE (there is at most one: one-shot): its recorded rows C3-C9 must all be
+     ok and C10-C14 are re-evaluated from the stored Card (store.load by card_object); C15 re-lints every file (the
+     pinned heads make the lint independent of the entries E5-E7 appended) and compares its sha256 with the P5_REPORTS
+     under the last freeze; C16 and C17 from THE consuming P5_READER of each reader for that P5_REPORTS seq (one-shot:
+     there is at most one; its samples are re-scored from the recorded answers; an unrecorded P5_READ_ATTEMPT is
+     passed to check_reader as `discarded` and FAILs C16); C18 check_one_shot over the whole ledger.
+     (status, notes, line) = exit_status(entries, rows, outcome of that P5_RETRAIN) (T416, D100). Print the table with
+     row verdicts (PASS / FAIL / FINDING), then every refreeze with its reason and the entries it superseded, every
+     crash rerun, every waiver, the finding, and `line` as the LAST line (e.g. "EXIT CHECK (P5): PASS after refreeze
+     (<reason>)"); append P5_EXIT {passed, status, finding, notes, ...} (also after an exception) and print {"step":
+     "EXIT", "phase": 5, "status", ...} before the last line. Exit 0 iff status != "FAIL".
+     Canary purge (validation r2 minor; in a finally, whatever the status): when <out>/canary.html exists, its sha256
+     is compared with the P5_REPORTS canary sha256 (recorded in P5_EXIT as canary_verified true/false), then
+     <out>/canary.html and the directory <out>/reader/ are deleted; P5_EXIT records canary_purged: [paths]. When they
+     are already absent (an earlier `exit` purged them), the note "canary already purged" is recorded. No exit row
+     reads the canary file (C16/C17 come from the ledger), so a repeated `exit` gives the same rows.
+  10. Stdin is never read; every confirmation comes from --confirm-plans.
+acceptance:
+  tests:
+    - "test_pins_file: exit/pins_p5.json has exactly the 4 repos with 'UNPINNED'"
+    - "test_pin_exit_p5: fake run_cmd where scout resolve (with --repo-type dataset for the data repo) and git ls-remote (datasets/ URL for the data repo) agree -> 4 pins written; disagreement -> non-zero, nothing written; HF_TOKEN unset -> still runs (exit 0)"
+    - "test_c0_before_request: pins_p5 with a model pin different from pins_p3 -> every subcommand exits 1 with C0 FAIL, no backend or client call, nothing appended"
+    - "test_freeze_idempotent_and_refreeze: freeze twice -> one P5_FREEZE; after a fake P5_ATTEMPT entry, freeze with changed code_id -> exit 5; with --refreeze-reason -> appended with the reason"
+    - "test_ledger_broken: one flipped byte -> LEDGER BROKEN exit 1"
+    - "test_populate_store_byte_identical: P3-layout cards and a P4-style store fixture -> imported objects have the same object ids as their sources"
+    - "test_read_requires_reports_unchanged: a report file edited after P5_REPORTS -> read exits 1 'reports changed since P5_REPORTS'"
+    - "test_run_one_shot (validation r1 major 3): fake ledger with a non-crash failed P5_RETRAIN after the last freeze -> run exits 5, nothing appended, no backend call; with a passed one -> exit 5; with two crash P5_RETRAIN -> allowed (third -> exit 5); after freeze --refreeze-reason 'x' -> allowed"
+    - "test_reports_one_shot: a second reports under the same freeze -> exit 5, nothing appended"
+    - "test_read_one_shot: a second read --reader llm for the same reports_seq -> exit 5, no S2 call; a second human submission -> exit 5 and the first answers stay in the ledger"
+    - "test_human_locked_before_scores: read --reader human -> the P5_READER line is in the ledger file before the first score line is written to stdout (stdout spy reads the ledger at the first write)"
+    - "test_canary_written: reports writes out/canary.html with the three defects (scripts.p5_canary.make_canary of retrain.html) and P5_REPORTS lists it with neutral names; reader-form copies 4 files under neutral names and prints no label mapping"
+    - "test_exit_purges_canary (validation r2 minor): after exit, out/canary.html and out/reader/ no longer exist, P5_EXIT.canary_purged lists them and canary_verified is True; a second exit -> same status and rows, note 'canary already purged'"
+    - "test_read_killed_after_k_responses (validation r2 major 4): a stub S2 client that returns 5 responses and then raises KeyboardInterrupt -> the ledger holds P5_READ_ATTEMPT and no P5_READER (no score line was printed); a second read --reader llm -> exit 5 'a reading started at seq <s> was not recorded', no S2 call, nothing appended; exit -> C16 FAIL naming the attempt; after freeze --refreeze-reason 'reader killed' -> a new read is allowed"
+    - "test_read_raises_after_responses: a stub that raises RuntimeError on call 7 -> same as the kill case (attempt recorded, reading consumed)"
+    - "test_read_unreachable_then_retry: all 12 stub calls raise a connection error before any response -> exit 3; the ledger gains P5_READ_ATTEMPT and P5_READER {unreachable: true}; a second read with a working stub -> allowed and C18 PASS"
+    - "test_llm_reader_locked_before_scores: read --reader llm -> the P5_READER line is in the ledger before the first score or C16 line is written to stdout (stdout spy)"
+    - "test_no_model_flag (validation r2 minor): read --reader llm --s2-model x -> argparse error (exit 2), nothing appended"
+    - "test_client_killed_is_crash (validation r2 minor): a backend whose job raises KeyboardInterrupt -> P5_RETRAIN crash true with error 'client interrupted'; a fake ledger with a P5_ATTEMPT not named by any P5_RETRAIN -> run allowed as a crash rerun; the exit line after a passing rerun starts 'EXIT CHECK (P5): PASS after rerun ('"
+    - "test_missing_reference_card (validation r2 major 5): a store_p4 fixture whose te attribution Card names a control without a Card in store_p4 -> plan exits 1 with C0 'missing Card' naming the control key, nothing appended; with the Card present -> populate_store reports imported_p4_references 2 and the imported objects equal their source ids"
+    - "test_exit_status_printed: a ledger with a refreeze after a P5_RETRAIN and otherwise passing rows (fake) -> 'EXIT CHECK (P5): PASS after refreeze' and the reason; P5_EXIT.status records it"
+    - "test_run_finding (D100): a fake backend whose retrain.v1 outcome is signal_persists with every gating row ok -> run exit 0, prints 'FINDING: signal_persists', P5_RETRAIN passed True and finding 'signal_persists'; a second run -> exit 5; reports proceeds"
+    - "test_reports_needs_ack (D99): no exit/p5_ack.json -> reports exit 5, nothing written or appended; with a valid ack -> P5_REPORTS.ack_sha256 equals its sha256"
+    - "test_exit_p5_network (tests/test_exit_p5_network.py): @pytest.mark.network; skipped unless SCOUT_P5_CONFIRM_PLANS and SCOUT_SPARK_HOST are set; runs main(['run', '--backend', 'ssh:' + host, '--confirm-plans', value]) == 0"
+  commands:
+    - pytest -q tests/test_exit_check_p5_units.py tests/test_pin_exit_p5.py
+    - pytest -q
+out_of_scope:
+  - the end-to-end offline rehearsal (T418 world, T419 tests); running E1-E8 on real hosts (environment; plan.md 2.5)
+invariants_touched: [1, 2, 5]
+decisions: [D93, D94, D95, D97]

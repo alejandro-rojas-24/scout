@@ -1,0 +1,114 @@
+id: T411
+title: "Report linter - lint.v1 with the ten numeric checks L1-L10 (caveats, traceability against the store/model/ledgers, no raw cosine, calibrated verdicts only, abstentions shown, provenance, self-contained, licence left open, precision, unedited and reproducible)"
+depends_on: [T410]
+files:
+  - scout/report/lint.py
+  - tests/test_report_lint.py
+route: opus
+spec_complete: true
+interface: |
+  scout/report/lint.py (imports scout.report.bundle, scout.report.render, scout.store, scout.card, scout.analysis,
+  scout.jev, scout.caveats; stdlib html.parser, re; never the network):
+    LINT_PARAMS: dict                          # EXACTLY the plan.md 4.8 literal
+    @dataclass(frozen=True)
+    class LintContext:
+        store: CardStore; model_path: pathlib.Path | None; ledgers: dict[str, pathlib.Path]
+        library_manifest: pathlib.Path | None; pins: pathlib.Path | None; references: tuple[str, ...] = ()
+        require_ledger: bool = False
+    def lint(html: bytes, ctx: LintContext) -> dict          # lint.v1 (plan.md 4.6)
+    def resolve_source(source: str, ctx: LintContext, bundle: dict) -> Any
+        # card -> the store object's JSON (loaded by object id); model:<sha> -> the parsed JSON of ctx.model_path, only
+        # when sha256(file bytes) == <sha> (else LookupError "model file sha differs"); never data.models of the bundle
+        # (that mirror is what render used; L2b compares the two); ledger -> the entry read from ctx.ledgers[name] (chain verified); analysis:<i> -> analysis.analyze
+        # recomputed from inputs.analysis[i] objects loaded from the store and the model file; s2in/s2 -> bundle.data
+        # (only inside #system2); bundle -> the embedded bundle (allowed pointers only); unresolvable -> LookupError
+    def format_table(result: dict) -> str     # one line per row: f"{id:<4} {name:<28} count {count:>4}  {'PASS' if ok else 'FAIL'}"
+behavior: |
+  1. Parse: bundle = render.extract_bundle(html) (missing or invalid -> every row FAIL with detail "no bundle"). A DOM-lite
+     walk (html.parser) records, for every text node, its ancestor chain (tag, id, classes) so container rules can be
+     applied; <script> and <style> contents are excluded from "visible text".
+  2. L1 caveats: count = sum over the expected texts of |occurrences - 1|, where expected = the three DISCLAIMERS in
+     #caveats; ATTRIBUTION_CAVEAT in #attribution if bundle.sections.attribution.status == "run"; RETRAIN_CAVEAT in
+     #retrain if run; LICENSE_QUESTION in #license .license-question. Occurrences are exact substring matches of the
+     whitespace-collapsed text of that container.
+  3. L2a: digits (LINT_PARAMS number_regex matches) in visible text outside <data> elements and outside #system2.
+     L2b: for every <data>: parse data-src (render.parse_source; malformed -> count); kind must be in REPORT_PARAMS
+     ["sources"]; "bundle" only with pointers under /generated_at, /scout_version, /code_id, /params_digest,
+     /regenerate, /inputs; "model" only with pointers /params/calibration_note, /thresholds/hi, /thresholds/lo;
+     "s2"/"s2in" only inside #system2; resolve_source (LookupError -> count); count when
+     json.loads(value) != resolved or render.format_value(resolved, data-fmt) != element text.
+     L2c: numbers in #system2 prose (outside <data>) that equal no numeric leaf of bundle.data.s2in when both are
+     rounded to the number of decimals printed (integers exact).
+  4. L3: matches of LINT_PARAMS["cosine_regex"] in visible text plus in every key of the bundle JSON (recursive).
+  5. L4a: elements with class "verdict" whose data-src is not ^analysis:(\d+)#/pairs/(\d+)/system1/verdict$, or whose
+     analysis model sha (bundle.inputs.analysis[i].model_sha256) differs from sha256(ctx.model_path file), or (with
+     require_ledger) that sha is not the payload.sha256 of the last P3 FREEZE_MODEL entry. L4b: matches of verdict_regex
+     in visible text outside every container in LINT_PARAMS["verdict_containers"].
+  6. L5 (one row; count = |a| + |b| + |c| + |d|): (a) number of abstain verdicts in the recomputed analysis minus the
+     number of .verdict elements whose ancestor chain contains section#system1, with data-verdict "abstain", whose
+     enclosing <tr> contains a non-empty .reason. Verdict elements in #summary (or anywhere outside #system1) are NOT
+     counted: the summary repeats every verdict, so counting it would double-count (they are still checked by L4a);
+     (b) attribution references with status abstain or
+     untestable minus rendered reference rows with a .reason; (c) untestable blocks minus rendered block rows with a
+     .reason; (d) sections with status not_run without a p.not-run .reason. Each difference counted in absolute value.
+  7. L6: for every inputs.cards entry: card_key repo and 40-hex revision present; object exists in the store and
+     card.object_id(json bytes, parquet bytes) == object; with require_ledger, for every role except
+     "attribution-reference", a citation with seq <= that ledger's pinned
+     head_seq whose ledger entry exists (read with bundle.read_entries(path, upto_seq=head_seq)),
+     whose line sha256 matches and whose payload names this Card (same rule as T409 behavior 6). Role
+     "attribution-reference" (validation r2 major 5; plan.md 3.6): citation null and cited VIA the attribution Card:
+     via names an inputs.cards row with role "subject-attribution" that itself passes the citation rule (with
+     require_ledger), and this row's card_key equals one stats.attribution.references[].card_key of that Card
+     (loaded from the store); each failed condition counts 1. A missing reference Card (inputs.skipped) is not an L6
+     failure: the licence row says so (T410); model sha256 equals the
+     file and (require_ledger) a FREEZE_MODEL citation; code_id is 64 hex; scout_version and regenerate non-empty. Count
+     = number of failed conditions.
+  8. L7: matches of external_regex in the raw HTML, plus <script> elements other than the one bundle script.
+  9. L8: #license missing counts 1; plus case-insensitive occurrences of each license_deny phrase in visible text
+     outside license_containers.
+  10. L9: <data> elements whose source pointer ends in /p_derived, /thresholds/hi or /thresholds/lo with fmt != "f2";
+      ending in /z_adj or /z_pair with
+      fmt != "f1"; ending in /p with fmt != "e1".
+  11. L10a: render.render(bundle) != html (count 1). L10b: bundle.build_bundle(bundle.subject.target, ReportInputs(
+      ctx.store, ctx.model_path, ctx.library_manifest, ctx.pins, ctx.ledgers, ctx.references), generated_at=
+      bundle.generated_at, code_id=bundle.code_id, ledger_heads={r["name"]: r["head_seq"] for r in
+      bundle.inputs.ledgers if r["head_seq"] is not None}) differs from the embedded bundle (validation r1 blocker: each
+      ledger is re-read only up to the head the report pinned, its chain verified up to that seq, and the line sha256
+      at the head must equal head_line_sha256 (else count 1, detail "ledger <name> changed below the pinned head");
+      entries appended after the head are ignored, so E5-E8 appends never invalidate a report) (canonical JSON compare; the system2
+      section is compared by its s2in_sha256 only and data.s2/data.s2in are taken from the embedded bundle, since an LLM
+      answer cannot be rebuilt) (count 1).
+  12. Rows: L1, L2a, L2b, L2c, L3, L4a, L4b, L5, L6, L7, L8, L9, L10a, L10b in that order; threshold 0 for all; ok =
+      count == 0; result ok = all rows ok; details: up to 20 human-readable lines per row naming the offending
+      element/text (quoted, truncated to 80 characters).
+acceptance:
+  tests:
+    - "fixtures: the T409/T410 fixture store, model and ledgers; clean renders of the full bundle, the all-not-run bundle and the S2 bundle"
+    - "test_clean_reports_pass: lint of each clean render -> every row count 0, ok True (require_ledger True for the full bundle)"
+    - "test_tamper_number: replace the text of one z_adj <data> element with a different value -> L2b 1 and L10a 1"
+    - "test_tamper_untraced_digit: insert '<p>blocks 12</p>' into #summary -> L2a 1, L10a 1"
+    - "test_tamper_caveat: delete one disclaimer -> L1 1; duplicate ATTRIBUTION_CAVEAT -> L1 1"
+    - "test_tamper_verdict_word: insert '<p>the subject is derived</p>' into #subject -> L4b 1"
+    - "test_verdict_wrong_source: a .verdict whose data-src points at /pairs/0/features/values/r_med -> L4a 1"
+    - "test_model_not_frozen: a model file whose sha differs from the FREEZE_MODEL entry, require_ledger True -> L4a and L6 count it"
+    - "test_cosine: a bundle key 'cosine_sim' or visible 'Cosine' -> L3 1"
+    - "test_l5_abstain_hidden: remove the .reason of one abstain row -> L5 1; remove a not-run reason -> L5 1"
+    - "test_l5_summary_not_counted: a clean full render with 2 S1 abstentions (each shown in #summary and #system1) -> L5 0; removing the #summary copies of the abstain verdicts -> L5 still 0; removing one #system1 abstain row -> L5 1"
+    - "test_model_source: a data-src model:<other 64 hex>#/thresholds/hi -> L2b 1; model:<sha>#/weights/0 -> L2b 1 (pointer not allowed); ctx.model_path replaced by a file with another sha -> every model data_el counted in L2b and L4a counts the verdicts"
+    - "test_l2c_s2_number: S2 explanation containing '0.73' when no s2in leaf rounds to 0.73 -> L2c 1; '0.97' equal to a p_derived shown to S2 -> 0"
+    - "test_l7_external: add '<img src=\"https://x/y.png\">' -> L7 1; a second <script> -> L7 1"
+    - "test_l8_license_answered: add 'use is permitted' outside the question -> L8 1; the LICENSE_QUESTION itself does not count"
+    - "test_l9_precision: re-render with p_derived fmt 'f3' -> L9 1"
+    - "test_l10b_store_changed: put a newer attribution Card of the subject into the store after rendering -> L10b 1"
+    - "test_l10b_ledger_append_ignored (validation r1 blocker): render the full bundle with require_ledger; then append to the P5 ledger a P5_REPORTS, a P5_READER and a P5_RETRAIN whose card_object equals the cited card.v4 object (scripts.p3_ledger.append) -> every row count 0 (L6 and L10b included)"
+    - "test_l10b_ledger_rewritten_below_head: rewrite the P5 ledger so the entry at the pinned head differs (a valid new chain) -> L10b 1 with detail 'changed below the pinned head'"
+    - "test_l5b_reference_reason (validation r1 minor): a bundle whose attribution reference has status 'abstain' (retrain_records.make_attribution(base_status='abstain', base_reason='independent control ... attributed at block ...: the in-run null is not homogeneous')) -> clean render L5 0 (the reference row carries its .reason, T410 behavior 9); removing that row's .reason span -> L5 1"
+    - "test_l6_attribution_reference (validation r2 major 5): te-style fixture of T409 test_attribution_reference_cards, require_ledger True, the attribution Card cited by a P4_EXIT entry -> L6 0 although the three reference Cards have no ledger entry; a bundle edited so that one attribution-reference row's via names an object not in inputs.cards -> L6 1; one whose card_key is not among the attribution Card's references -> L6 1; the control's Card removed from the store before rendering -> L6 0 and the clean render lints clean"
+    - "test_bundle_source_restricted: a <data data-src='bundle:#/data/cards/...'> -> L2b 1"
+  commands:
+    - pytest -q tests/test_report_lint.py
+    - pytest -q
+out_of_scope:
+  - the reader checklist (T412); CLI (T414); exit rows (T416)
+invariants_touched: [3, 4, 5]
+decisions: [D86, D87]

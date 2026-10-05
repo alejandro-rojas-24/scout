@@ -1,0 +1,138 @@
+id: T315
+title: Job spec (job.v1), protocol (jobproto.v1), backends (in-process, local subprocess, ssh) and client-side run with live ingest into the ByteLog, idle timeout and sweep on failure
+depends_on: [T301, T310, T311]
+files:
+  - scout/jobs/spec.py
+  - scout/jobs/protocol.py
+  - scout/jobs/backend.py
+  - tests/test_jobs_transport.py
+  - tests/helpers/fake_worker.py
+route: opus
+spec_complete: true
+interface: |
+  scout/jobs/spec.py:
+    JOB_SCHEMA = "job.v1"
+    JOB_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{6}$")
+    def params_digest() -> str       # sha256 of canonical JSON {"attrib": ATTRIB_PARAMS, "job": JOB_PARAMS,
+                                     # "quant": QUANT_PARAMS, "gguf": GGUF_PARAMS} (imports inside the function)
+    def new_job_id(plan_id: str, *, now: datetime | None = None, rand_hex: Callable[[int], str] = secrets.token_hex) -> str
+    def make_spec(*, plan: FullPlan, decision: GateDecision, subject_target: str, reference_targets: list[str],
+                  control_targets: list[str],
+                  endpoint: str, scratch_root: str | None, wire_audit: bool, client_hostname: str,
+                  git_commit: str | None, now: datetime | None = None) -> dict          # plan.md 4.4
+    def validate_spec(spec: dict) -> list[str]                                         # [] when valid
+  scout/jobs/protocol.py:
+    PROTO = "jobproto.v1"
+    TYPES = ("hello", "event", "gate", "heartbeat", "result", "error", "bye")
+    def encode(msg: dict) -> bytes      # json.dumps({"proto": PROTO, **msg}, separators=(",", ":"), sort_keys=True) + b"\n"
+    def decode(line: bytes) -> dict     # BackendError on non-JSON, wrong proto, unknown type, missing required keys
+    REQUIRED = {"hello": {"hostname", "params_digest"}, "event": {"event"}, "gate": {"decision"}, "heartbeat": {"ts"},
+                "result": {"result"}, "error": {"error"}, "bye": {"exit_code"}}
+  scout/jobs/backend.py:
+    class Backend(Protocol):
+        kind: str                       # "inproc" | "local" | "ssh"
+        host: str                       # display host ("local" for inproc/local, the ssh host otherwise)
+        def open(self, args: list[str], stdin: bytes | None) -> "Channel"     # start the worker with args
+    class Channel(Protocol):
+        def lines(self) -> Iterator[bytes]; def stderr_lines(self) -> Iterator[bytes]
+        def wait(self, timeout: float | None = None) -> int; def kill(self) -> None
+    class LocalBackend:
+        def __init__(self, scratch_root: pathlib.Path | None = None, *, argv_prefix: list[str] | None = None,
+                     env: dict[str, str] | None = None) -> None
+        # argv = (argv_prefix or [sys.executable, "-m", "scout.jobs.worker"]) + args + (["--scratch-root", str(root)] if root)
+    class SshBackend:
+        DEFAULT_REMOTE_CMD = "python3 -m scout.jobs.worker"
+        def __init__(self, host: str, *, remote_cmd: str | None = None, ssh: str = "ssh",
+                     popen: Callable[..., subprocess.Popen] = subprocess.Popen) -> None
+        # prefix = remote_cmd if remote_cmd is not None else os.environ.get("SCOUT_SPARK_CMD") or DEFAULT_REMOTE_CMD
+        #   (a SHELL FRAGMENT used verbatim, e.g. "cd /srv/scout && /srv/venv/bin/python -m scout.jobs.worker";
+        #    validation r2 minor: the remote entry is the worker module, the same one LocalBackend and the offline
+        #    rehearsal run, so no CLI argument forwarding is involved)
+        # argv = [ssh, "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4", host,
+        #         prefix + ("" if not args else " " + shlex.join(args))]
+    class InProcessBackend:
+        def __init__(self, scratch_root: pathlib.Path, *, client_factory: Callable[[], httpx.Client] | None = None,
+                     endpoint: str | None = None, token: str | None = None) -> None
+        # open() runs scout.jobs.worker.main(args, stdin=..., stdout=<pipe>) in a thread (import inside open(); T316)
+    def parse_backend(text: str, *, scratch_root: pathlib.Path | None = None) -> Backend    # "local" | "ssh:HOST"
+    def worker_hello(backend: Backend, timeout_s: float = 60.0) -> dict                     # args ["hello"]
+    def worker_sweep(backend: Backend, *, dry_run: bool = False, timeout_s: float = 600.0) -> dict   # ["sweep", "--json"(+ "--dry-run")]
+    def worker_audit(backend: Backend, timeout_s: float = 600.0) -> dict                    # ["audit", "--json"]
+
+    @dataclass(frozen=True)
+    class JobOutcome:
+        status: str; exit_code: int; hello: dict | None; result: dict | None; error: dict | None
+        n_ingested: int; worker_seqs: list[int]; record: dict; sweep_after_failure: dict | None
+        def to_dict(self) -> dict
+    def run_job_via(backend: Backend, spec: dict, log: ByteLog, *, display: Callable[[str], None],
+                    idle_timeout_s: float = JOB_PARAMS["client_idle_timeout_s"],
+                    clock: Callable[[], float] = time.monotonic) -> JobOutcome
+  tests/helpers/fake_worker.py: a scriptable fake worker (python -m tests.helpers.fake_worker SCENARIO) that prints
+    jobproto lines for scenarios "ok", "no_bye", "malformed", "silent", "error", "crash_mid", "none_first", "bad_event",
+    "swapped" (used by these tests only)
+behavior: |
+  1. make_spec builds plan.md 4.4 exactly: job_id = new_job_id(plan.plan_id) ("%Y%m%dT%H%M%SZ" UTC + "-" + plan_id[:8]
+     + "-" + rand_hex(3)); subject/references/controls from plan.models by role (target, repo, revision_sha, component); plan =
+     {plan_id, bytes_planned, bytes_cap, disk_bytes, threshold_bytes}; confirmation = {plan_id, approved, via,
+     bytes_confirmed, decided_at} from the decision (declined decision -> ValueError: never submit a declined plan);
+     params_digest(); endpoint; scratch_root; wire_audit. No token anywhere (validate_spec rejects any key containing
+     "token" or "authorization", case-insensitive, at any depth).
+  2. validate_spec: schema, job_id format, kind "attribute", subject/references/controls shape (references and controls
+     each non-empty: an attribution job without a control is invalid, D76), targets pinned (Hub:
+     repo@<40-hex>[#sel]; local: absolute path), plan/confirmation keys and types, confirmation.plan_id == plan.plan_id,
+     approved True, endpoint str, wire_audit bool.
+  3. Channels: LocalBackend/SshBackend use subprocess.Popen(argv, stdin=PIPE, stdout=PIPE, stderr=PIPE); stdin is
+     written (spec bytes) and closed; a reader thread per stream feeds a queue.Queue so lines() can time out.
+  4. run_job_via(backend, spec, log, display):
+     a. validate_spec (problems -> ValueError); log.note("job", f"submit {job_id} to {backend.kind}:{backend.host}").
+     b. ch = backend.open([], stdin=json.dumps(spec).encode()). Every stderr line ->
+        display(f"[{backend.host}] {line}").
+     c. Read messages with an idle timeout: no stdout line for idle_timeout_s -> ch.kill(), outcome failed with
+        error {"type": "BackendError", "message": "idle timeout"}.
+     d. First message must be hello with params_digest == spec.params_digest (else kill, failed "worker code differs").
+        origin = hello["hostname"].
+     e. event -> worker_seqs.append(msg["event"]["seq"]); log.ingest(msg["event"], origin=origin); n_ingested += 1; stage_start events -> display(f"[{origin}]
+        {stage} ..."). gate -> log.add_gate_decision({**decision, "origin": origin}). heartbeat -> nothing displayed.
+        result -> keep. error -> keep. bye -> stop reading; exit_code = msg["exit_code"].
+        Events with stage "NONE" (worker notes logged before its first stage, e.g. the sweep note) are ingested
+        normally (T301 accepts "NONE").
+     e2. Ingest and message errors (validation r1 major 3). Any exception raised while handling one message
+        (protocol.decode -> BackendError; log.ingest / add_gate_decision -> ValueError; a missing key -> KeyError) is
+        caught at the message loop: ch.kill() (the remote worker then fails its next write with BrokenPipeError and
+        purges in its finally, T316), status "failed", error = {"type": type(e).__name__, "message": f"message
+        {n_read} ({msg_type}): {e}", "exit_code": 7}; no further message is read or ingested; then steps f-h run as
+        for any failure (sweep_after_failure, JobRecord, the job note). run_job_via never lets such an exception
+        escape; T317 turns the failed outcome into JobError.
+     f. ch.wait(); a process exit code different from bye.exit_code, a missing bye, or a malformed line -> failed
+        (BackendError text in error). status "succeeded" iff result present, error absent, exit_code 0,
+        result["n_events"] == n_ingested and worker_seqs == list(range(1, n_ingested + 1)) (the worker ByteLog numbers
+        its events from 1 and emits them in seq order, T301 behavior 10; an out-of-order or missing seq is therefore a
+        real defect and fails the job).
+     g. On failure: sweep_after_failure = worker_sweep(backend) (exceptions caught and reported as {"error": str}).
+     h. record = plan.md 4.1 JobRecord built from spec, hello, result/error, timings (started/finished UTC ISO, wall_s),
+        backend kind and host; log.add_job_record(record); log.note("job", f"{job_id} {status} (exit {exit_code})").
+  5. worker_hello/sweep/audit open the channel with the given args and no stdin, read exactly one JSON object line (the
+     hello message, or the report), wait for exit 0, else BackendError.
+  6. Nothing in this module reads weights or writes files.
+acceptance:
+  tests:
+    - "test_spec_roundtrip: make_spec from a T310 plan (fixture) + an approved cli-flag decision validates; a declined decision -> ValueError; unpinned target, missing confirmation, a nested 'hf_token' key -> problems"
+    - "test_job_id: new_job_id('0123456789abcdef', now=2026-09-29T10:00:00Z, rand_hex=lambda n: 'abcdef') == '20260929T100000Z-01234567-abcdef'"
+    - "test_protocol: encode/decode round trip for every type; unknown type, wrong proto, missing required key -> BackendError"
+    - "test_run_ok_fake_worker: LocalBackend(argv_prefix=[sys.executable, '-m', 'tests.helpers.fake_worker', 'ok']) -> succeeded; the fake's 5 events ingested with origin 'fakehost', client totals include their bytes, gate decision recorded with origin, job record appended, display saw the stage lines"
+    - "test_ingest_complete: fake result with n_events 4 while 5 events were sent -> failed"
+    - "test_none_stage_first_event: scenario 'none_first' (first event is a 'job' note with stage 'NONE', as the real worker's sweep note) -> succeeded, that event ingested with origin"
+    - "test_ingest_error_kills_and_sweeps: scenario 'bad_event' (3rd event has bytes -1) -> status failed, error type ValueError with 'message 4 (event)' in its text, the fake process was killed (wait returns a signal code), events after it not ingested (n_ingested == 2), worker_sweep called, JobRecord appended; run_job_via does not raise"
+    - "test_out_of_order_seq_fails: scenario 'swapped' (seqs 1, 3, 2, 4, 5) -> failed (seq check)"
+    - "test_idle_timeout: scenario 'silent' with idle_timeout_s=0.5 -> failed 'idle timeout', process killed, worker_sweep called (fake records the call)"
+    - "test_no_bye_and_malformed: scenarios -> failed with BackendError text; sweep_after_failure present"
+    - "test_digest_mismatch: fake hello with another params_digest -> failed 'worker code differs', no event ingested"
+    - "test_ssh_argv: SCOUT_SPARK_CMD unset: SshBackend('spark', popen=spy).open(['hello'], None) -> argv == ['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4', 'spark', 'python3 -m scout.jobs.worker hello']; open([], stdin) -> last element 'python3 -m scout.jobs.worker'; open(['sweep', '--json']) -> '... sweep --json'; SCOUT_SPARK_CMD='cd /srv/my scout && /srv/venv/bin/python -m scout.jobs.worker' with open(['audit', '--json']) -> last element == 'cd /srv/my scout && /srv/venv/bin/python -m scout.jobs.worker audit --json' (prefix verbatim); an arg with a space, open(['--scratch-root', '/a b']) -> suffix \"--scratch-root '/a b'\" (shlex.join)"
+    - "test_parse_backend: 'local' -> LocalBackend; 'ssh:spark' -> SshBackend host spark; 'ftp:x' -> ValueError"
+  commands:
+    - pytest -q tests/test_jobs_transport.py
+    - pytest -q
+out_of_scope:
+  - the worker itself (T316); the attribution client (T317)
+invariants_touched: [2]
+decisions: [D56, D57, D61]

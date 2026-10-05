@@ -1,0 +1,74 @@
+id: T110
+title: Structural block cost, stack pairing, Viterbi segment alignment (upscaled/pruned), relative-depth mapping
+depends_on: [T009, T101, T102]   # T102: test_block_sets_from_parquet builds its table via build_fixture_card -> scout/card.py (validation r1 minor 7)
+files:
+  - scout/align.py
+  - tests/test_align.py
+route: opus
+spec_complete: true
+interface: |
+  scout/align.py:
+    ALIGN_PARAMS: dict     # EXACTLY the literal of plan.md 4.6
+    Block = frozenset[tuple[str, str, tuple[int, ...]]]       # {(rel, dtype, shape)}
+
+    def block_sets(table: pyarrow.Table, prefix: str) -> dict[int, Block]
+    def structural_cost(subj: list[Block], ref: list[Block]) -> numpy.ndarray        # (nB, nA), values in {0, 0.5, 1}
+    def pair_stacks(ref_stacks: list[dict], subj_stacks: list[dict]) -> tuple[list[tuple[str, str]], list[str], list[str]]
+        # (pairs [(ref_prefix, subj_prefix)], unpaired_ref, unpaired_subj); stacks are card.structure.stacks dicts
+    def combine_cost(S: numpy.ndarray, R: numpy.ndarray | None) -> numpy.ndarray
+    def viterbi(C: numpy.ndarray) -> list[int]                # mapping a: subject position -> reference position
+    def reldepth(n_subj: int, n_ref: int) -> list[int]
+    def summarize(a: list[int], n_ref: int, S: numpy.ndarray, used_weights: bool, mode: str,
+                  ref_indices: list[int], subj_indices: list[int]) -> dict
+        # {"kind","width_changed","mode","location_resolved","jumps","duplicated_reference","pruned_reference","ops"}
+behavior: |
+  1. block_sets: over the table rows with stack_prefix == prefix: rel = collapsed_name with the leading f"{prefix}.#."
+     removed; key = block_index; add (rel, dtype, tuple(shape)). Return {block_index: frozenset}.
+  2. structural_cost: S[i,j] = 0.0 if subj[i] == ref[j]; 0.5 if {rel for rel,_,_ in subj[i]} == {rel for ... ref[j]};
+     else 1.0 (values from ALIGN_PARAMS["struct_cost"]).
+  3. pair_stacks: first pair equal prefixes, in ref stack order. Then, if both sides still have unpaired stacks, pair
+     the first unpaired ref stack with the first unpaired subj stack (card stacks are already sorted by params desc).
+     Only one such cross-prefix pair is made. The rest are returned unpaired.
+  4. combine_cost: R None -> S.copy(); else (S + (1 - R)/2) / 2.
+  5. viterbi(C) (nB x nA, nB, nA >= 1): lam = ALIGN_PARAMS["lambda_jump"], e = ALIGN_PARAMS["end_cost"].
+     D[0, j] = C[0, j] + (e if j != 0 else 0).
+     For i >= 1 and each j: cont = D[i-1, j-1] if j >= 1 else inf; best_other = min over k != j-1 of D[i-1, k] (use the
+     global min and second-best trick, or O(nA^2); nA <= 512). D[i, j] = C[i, j] + min(cont, best_other + lam).
+     The backpointer prefers cont on ties (cont <= best_other + lam); among the others it prefers the smallest k.
+     Final: j* = argmin_j D[nB-1, j] + (e if j != nA-1 else 0); ties go to the largest j (so identity wins over
+     early-ending paths). Backtrack. Deterministic.
+  6. reldepth(nB, nA): [int(floor(i*(nA-1)/(nB-1) + 0.5)) for i in range(nB)] if nB > 1 else [0].
+  7. summarize:
+     - ops[i] = "reldepth" if mode == "reldepth"; else "match" if (i == 0 and a[0] == 0) or (i > 0 and a[i] == a[i-1] + 1),
+       else "jump".
+     - jumps = [{"subject_pos": i, "from_reference_pos": a[i-1], "to_reference_pos": a[i]} for i >= 1 with a[i] != a[i-1]+1]
+       ([] in reldepth mode).
+     - duplicated_reference = sorted literal ref_indices[p] for positions p used more than once;
+       pruned_reference = sorted literal ref_indices[p] for positions never used. Both are [] in reldepth mode.
+     - kind: "incompatible" if mode == "reldepth"; elif nB == nA and a == list(range(nA)): "same"; elif nB > nA: "upscaled";
+       elif nB < nA: "pruned"; else "rearranged".
+     - width_changed = any(S[i, a[i]] == 0.5).
+     - location_resolved = mode == "reldepth" or used_weights or (jumps == [] and a[0] == 0 and a[-1] == nA-1).
+  8. Pure; numpy only.
+acceptance:
+  tests:
+    - "test_params_literal: ALIGN_PARAMS == the plan.md 4.6 literal"
+    - "test_identity: S zeros 16x16, R None -> viterbi == range(16); kind same; location_resolved True"
+    - "test_upscale_struct_only: S zeros 24x16 -> exactly 1 backward jump; kind upscaled; location_resolved False"
+    - "test_upscale_with_weights: R = 0.9 where a*(i) = i for i<12 else i-8 (SOLAR-like), 0.0 elsewhere -> viterbi == [0..11, 4..15]; duplicated_reference == [4..11]; one jump {12, 11 -> 4}"
+    - "test_prune_with_weights: nA=16, subject = ref minus [5,6,7]; R = 0.9 on the true mapping -> [0..4, 8..15]; pruned_reference == [5,6,7]; kind pruned"
+    - "test_prune_tail: subject = ref[:13], R true mapping -> identity prefix, pruned_reference == [13,14,15], no jumps"
+    - "test_no_jump_on_noise: R = uniform(-0.3, 0.3) noise (seeded), 16x16, S zeros -> identity, 0 jumps (the lambda penalty dominates the noise)"
+    - "test_incompatible: S all 1 -> the caller uses reldepth; reldepth(32, 28)[0] == 0, [-1] == 27, monotone non-decreasing; summarize(mode='reldepth') gives kind incompatible, jumps []"
+    - "test_structural_cost_levels: equal sets 0; same rel names but a different shape 0.5; an extra bias tensor 1"
+    - "test_block_sets_from_parquet: a P1 dense fixture card table -> 2 blocks with 11 entries each; rel names have no prefix"
+    - "test_pair_stacks: equal prefixes pair; 'model.layers' vs 'model.language_model.layers' pair as a cross-prefix pair; extra stacks are unpaired"
+    - "test_deterministic_ties: repeated runs give an identical mapping"
+  commands:
+    - pytest -q tests/test_align.py
+    - pytest -q
+out_of_scope:
+  - the weight statistic itself (T109)
+  - inner stacks, experts alignment (later.md)
+invariants_touched: [4, 6]
+decisions: []

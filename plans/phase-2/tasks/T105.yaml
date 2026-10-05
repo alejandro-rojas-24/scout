@@ -1,0 +1,69 @@
+id: T105
+title: Config match + reference suggestion over the out-dir Card pool
+depends_on: [T011, T102, T104]
+files:
+  - scout/suggest.py
+  - tests/test_suggest.py
+route: opus
+spec_complete: true
+interface: |
+  scout/suggest.py:
+    CONFIG_MATCH_KEYS: tuple[str, ...] = ("model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
+        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size", "rope_theta", "tie_word_embeddings",
+        "max_position_embeddings", "hidden_act", "rms_norm_eps")
+    MIN_COMPARED = 3
+    TOP_N = 5
+
+    def config_value(raw: dict | None, key: str) -> tuple[bool, object]     # (present, value)
+    def config_match(raw_a: dict | None, raw_b: dict | None, arch_a: list[str], arch_b: list[str]) -> dict
+        # {"score": float|None, "compared": int, "architectures_equal": bool,
+        #  "rows": [{"key","reference","subject","equal"}]}   (reference = a, subject = b; one row per key present in either)
+    def card_key(card: dict) -> dict                                        # {"repo","revision_sha","component"}
+    def list_cards(out_dir: pathlib.Path) -> list[tuple[pathlib.Path, dict]]
+    def tokenizer_jaccard(card_a: dict, card_b: dict) -> float | None
+    def suggest(subject: dict, pool: list[dict], top_n: int = TOP_N) -> dict
+        # {"subject": card_key, "suggestions": [Suggestion], "disclaimers": list(scout.view.DISCLAIMERS)}
+        # Suggestion = {"card_key", "title", "score", "tokenizer_jaccard": float|None, "config_score": float|None,
+        #               "config_mismatches": [str], "architectures_equal": bool, "claimed_base_match": bool}
+behavior: |
+  1. config_value(raw, key): if raw is a dict and key is in raw -> (True, raw[key]); elif raw.get("text_config") is a dict
+     containing key -> (True, that value); else (False, None).
+  2. config_match: for each key in CONFIG_MATCH_KEYS, if it is present in at least one side, emit a row with values
+     (None if absent) and equal = both present and value_a == value_b (Python ==; 1e-6 == 1e-06 is True).
+     compared = number of keys present in BOTH; score = (#equal among compared)/compared if compared >= MIN_COMPARED
+     else None. architectures_equal = arch_a == arch_b (list equality).
+  3. card_key(card) = dict(card["key"]). list_cards: sorted(out_dir.glob("*/*/*.card.json")); json.load each; skip
+     (no exception) any file that fails to parse or whose schema_version is not in card.SUPPORTED_SCHEMA_VERSIONS.
+     Parquet is never read.
+  4. tokenizer_jaccard: if both (card.get("stats") or {}).get("tokenizer_minhash") exist and have equal "version" and
+     num_perm -> tokenizer.jaccard(sig_a, sig_b); else None.
+  5. suggest(subject, pool):
+     - exclude pool cards whose card_key == the subject's card_key;
+     - per candidate: J = tokenizer_jaccard(subject, cand); cm = config_match(cand.config.raw, subject.config.raw,
+       cand.config.architectures, subject.config.architectures) (reference = candidate, subject = subject);
+       score = 0.5*(J or 0.0) + 0.5*(cm.score or 0.0);
+       config_mismatches = [row.key for row in cm.rows if not row.equal];
+       claimed_base_match = cand.key.repo in subject.model_card.base_model (exact string; a missing model_card -> False).
+       The claim never enters score.
+     - sort by (-score, repo, revision_sha, component or ""); keep top_n. score and J are rounded to 6 decimals in the output.
+     - disclaimers = list(scout.view.DISCLAIMERS) (invariant 5: a ranked candidate list reads like a report).
+       (unscanned_claims was cut in revision r1: not needed by the exit or the roadmap line.)
+     - title = f"{repo}@{sha[:12]}" + (f" / {component}" if component).
+  6. Pure except list_cards, which reads only *.card.json.
+acceptance:
+  tests:
+    - "test_config_match: two Qwen-like raws differing only in max_position_embeddings -> compared 12 (head_dim absent in both), score 11/12; text_config lookup works; fewer than 3 compared -> None"
+    - "test_rank: subject = the fine-tune Card, pool = {base, independent} (cards built from weights_fixtures repos via tests/helpers/cards.build_fixture_card, with tokenizer_minhash added by tokenizer.tokenizer_stat) -> top-1 is base, J == 1.0"
+    - "test_claim_does_not_score: subject claims base_model ['org/independent']; ranking unchanged; the independent card has claimed_base_match True but is still ranked 2nd"
+    - "test_disclaimers: suggest(...)['disclaimers'] == list(DISCLAIMERS), also for an empty pool"
+    - "test_missing_tokenizer: a v0 card / no tokenizer_minhash -> J None; the score uses config only"
+    - "test_list_cards: a corrupt JSON and a card.v9 file are skipped; order is sorted by path"
+    - "test_excludes_self"
+  commands:
+    - pytest -q tests/test_suggest.py
+    - pytest -q
+out_of_scope:
+  - Hub search for candidates (later.md)
+  - any verdict or probability (Phase 3)
+invariants_touched: [5]
+decisions: []

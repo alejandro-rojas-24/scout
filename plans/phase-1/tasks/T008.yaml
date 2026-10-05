@@ -64,9 +64,24 @@ behavior: |
      if not, add a warning f"{template}: heterogeneous experts".
      params_per_expert = total group params // (sum over instances of n_i); if that is not an exact division,
      homogeneous=False and add a warning. Groups are sorted by template.
+  6b. Fused-expert detection (warning only, no collapsing): if any tensor has a segment in EXPERT_CONTAINERS that is NOT
+     followed by an integer segment, and len(shape) >= 3, add ONE warning per distinct collapsed parent path:
+     f"{parent}: fused expert tensors detected (leading expert dim {shape[0]}); not collapsed in v0". No expert group is created.
   7. params_total = sum numel; n_tensors = count; params_by_dtype = {dtype: sum numel}, sorted keys.
   8. The module is pure: no IO, no logging.
-decisions: []
+decisions:
+  - "Card-level collapse stays FIRST-integer-only (behavior 2b, test_nested_indices). The 'every integer segment -> name[#], up_blocks[#].resnets[#] count = distinct indices' rule from plan 4.4 / r1 is the VIEW rule (T011 test_wan_vae_bound); plan 4.4 says the Card keeps literal inner indices, so T008 does not implement it."
+  - "Index segments are recognised with 0 < len(seg) <= 9 and seg.isascii() and seg.isdigit() (spec says isdigit). Unicode or fullwidth digits cannot crash int(), Python's int-string limit is never hit, and every block/expert index fits int32 for Parquet. Any other segment (e.g. 10+ digits) stays literal. Applies to both expert and stack detection (review fix 2)."
+  - "Stack grouping (prefix_indices and the single-index restore check) uses the COLLAPSED stack_prefix from _place_from, i.e. with the expert index already '*'. This fixes the KeyError when experts.N precedes the first stack integer: 'moe.experts.{0,1}.net.{0,2}.weight' becomes stack 'moe.experts.*.net' (review fix 1)."
+  - "Leading-zero aliases ('l.0' and 'l.00') map to the same int block index and are merged into one block. A single-index restore keeps the literal text ('00')."
+  - "Index alias warning (coordinator-approved addition): for each real Stack (prefix, int) reached from more than one literal segment, add f'{prefix}: index alias {sorted(literals)} -> {n}'. Non-stack (single-index) prefixes do not warn, because their literal text is restored and nothing merges. Alias warnings are sorted by (prefix, n) and appended after the expert-group and fused warnings, keeping the warning order of the earlier decision."
+  - "The stack scan skips the expert position, which equals 'the expert position is already *'. Positions are tracked by segment number, not by string stripping. So an empty stack prefix (name starts with an integer) works, and rel = segments after the '#' ('' if '#' is last)."
+  - "Single-index restore (behavior 4) puts back the ORIGINAL segment text (e.g. '0'), not str(int)."
+  - "Signature expert line: template_rel = segments after '#' up to and including '*'. If the expert container sits ABOVE the stack (e.g. experts.0.layers.1.w), there is no relative template, so the absolute template is used. n = distinct expert indices for that template in that block. block_n_experts counts distinct expert indices across all templates in the block."
+  - "Expert groups are keyed on the FINAL collapsed name (after the single-index restore), so a non-stack container gives a literal template such as 'moe.0.experts.*' with instance key (None, None)."
+  - "homogeneous compares the frozenset of (suffix, dtype, shape) per (instance, expert). Non-exact params division sets homogeneous=False and adds its own warning: '{template}: params {total} not divisible by expert count {sum n_i}'. That warning is distinct from the 'heterogeneous experts' one, so both can appear; params_per_expert is still the floor quotient."
+  - "Fused-expert 'parent' = the collapsed name up to and including the first EXPERT_CONTAINERS segment that is not followed by an integer (e.g. 'model.layers.#.mlp.experts'). This gives one warning per collapsed container across all layers, and the leading dim comes from the first such tensor in input order. A fused tensor does not set block_moe."
+  - "Warning order: expert-group warnings in template order (count-varies, heterogeneous, not-divisible), then fused warnings sorted by parent."
 acceptance:
   tests:
     - "test_place: 'model.layers.3.mlp.experts.17.up_proj.weight' -> ('model.layers.#.mlp.experts.*.up_proj.weight','model.layers',3,17); 'lm_head.weight' -> no stack"
@@ -79,6 +94,7 @@ acceptance:
     - "test_varying_expert_count: layer0 has 4 experts, layer1 has 2 -> warning, n_experts 4"
     - "test_signature_differs: a layer with an extra bias tensor gets a different signature"
     - "test_duplicate: DuplicateTensorError"
+    - "test_fused_experts_warning: 'model.layers.0.mlp.experts.gate_up_proj' shape (4,8,16) -> exactly one warning containing 'fused expert'; expert_groups == []; a 2-D 'experts.foo' tensor gives no warning"
     - "test_scale: moe_tensors(n_layers=48, n_experts=128, hidden=8, moe_inter=4) (18867 tensors) analyzes in < 2 s"
   commands:
     - pytest -q tests/test_structure.py

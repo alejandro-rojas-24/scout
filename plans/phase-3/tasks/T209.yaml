@@ -1,0 +1,79 @@
+id: T209
+title: Pair features (JEV input, feat.v1) - structure-only alignment, P2 in-run statistics, spectral/norm distances, anchor CKA, missingness
+depends_on: [T111, T202, T204, T205, T207]
+files:
+  - scout/features.py
+  - tests/test_features.py
+route: opus
+spec_complete: true
+interface: |
+  scout/features.py:
+    FEATURE_PARAMS: dict      # EXACTLY the plan.md 4.8 literal
+    JEV_FEATURES: tuple[str, ...] = ("r_med", "r_gap", "r_top1", "z_shift", "cka", "log_topk_dist", "log_fro_dlog")
+
+    @dataclass(frozen=True)
+    class PairFeatures:
+        values: dict[str, float | None]      # keys == JEV_FEATURES
+        missing: list[str]                   # JEV_FEATURES order
+        reasons: dict[str, str]              # feature -> why missing
+        alignment: dict                      # {"mode": "structure-only"|"reldepth"|None, "kind": str|None, "n_scored": int,
+                                             #  "structure_informative": bool|None}
+        cka_common: int | None
+        def to_dict(self) -> dict            # plan.md 4.5 feat.v1
+
+    def structure_alignment(ref_card, ref_table, subj_card, subj_table, ref_prefix: str, subj_prefix: str
+                            ) -> tuple[list[int], str, dict]    # (a, mode, align.summarize(...) dict)
+    def pair_features(ref_card: dict, ref_table: pyarrow.Table, subj_card: dict, subj_table: pyarrow.Table) -> PairFeatures
+behavior: |
+  1. Sigma group (r_med, r_gap, r_top1, z_shift, log_topk_dist, log_fro_dlog):
+     a. sr = layercorr.sigma_set(ref), ss = layercorr.sigma_set(subj). Either None -> all 6 missing, reason
+        "no sigma curves on reference"/"... on subject".
+     b. (pairs, _, _) = align.pair_stacks(ref stacks, subj stacks); require (sr.stack_prefix, ss.stack_prefix) in pairs, else
+        missing "sampled stacks are not paired". Let ref_idx / subj_idx be the literal indices of those stacks
+        (card.structure.stacks[*].indices). Require sr.indices == ref_idx and ss.indices == subj_idx, else missing
+        "sampled blocks differ from stack blocks".
+     c. cmp = layercorr.compare(sr, ss); cmp.R None -> missing with cmp.reason.
+     d. structure_alignment: S = align.structural_cost(subj blocks, ref blocks) (align.block_sets on each table, in index
+        order). constant = (S.min() == S.max()). If constant and S.max() > 0 (all 1 = incompatible, or any other flat
+        non-zero cost such as all 0.5 = partially matching role sets): a = align.reldepth(nB, nA), mode "reldepth";
+        else a = align.viterbi(align.combine_cost(S, None)), mode "structure-only" (an all-0 S = identical structure keeps
+        Viterbi, as in P2). The returned summary dict gains "structure_informative": not constant. R is NEVER passed to combine_cost (removes the P2 dp-structure+weights selection bias,
+        plan.md D41). summary = align.summarize(a, nA, S, False, mode_for_summarize, ref_idx, subj_idx) where
+        mode_for_summarize = "reldepth" or "dp-structure".
+     e. nul = layercorr.in_run_null(cmp.R, a) (default edge). n_scored < 3 raises ValueError in P2 -> catch -> missing
+        "fewer than 3 scored layers".
+        r_med = nul.median_r; r_gap = nul.median_r - nul.offdiag_median_r; r_top1 = nul.diag_top1_frac;
+        z_shift = clip(nul.z_shift, *FEATURE_PARAMS["z_clip"]) if not None else 0.0.
+     f. Spectral/norm: rows by name from each table (stat_spectral_topk, stat_fro_norm). For each i in nul.scored and each
+        role in cmp.roles: tensor names = the sigma_curves entry with that role and block_index subj_idx[i] (subject) /
+        ref_idx[a[i]] (reference). If any needed stat is null or the column is absent (v1 Card) -> log_topk_dist and
+        log_fro_dlog missing ("no tensor stats"), the other sigma features stay.
+        d_topk = sqrt(mean((log(ts[:k]) - log(tr[:k]))**2)) with k = min(len(ts), len(tr)); d_fro = |log(fs) - log(fr)|.
+        log_topk_dist = log10(median(all d_topk) + log_eps); log_fro_dlog = log10(median(all d_fro) + log_eps)
+        (log_eps = FEATURE_PARAMS["log_eps"]).
+  2. cka: (v, n, why) = cka.cka_cards(ref, ref_table, subj, subj_table); v None -> missing with why; cka_common = n.
+  3. Values are python floats rounded to 6 decimals (None when missing). No tokenizer, config or model-card field is read
+     for any feature value (invariant 5; plan.md D40): this is asserted by a test that mutates those fields.
+  4. Pure; no IO; no network; no raw cosine.
+acceptance:
+  tests:
+    - "Cards come from scan(sample=True, tokenizer=True, anchors=True, gate_threshold_bytes=0, confirmer=approve_exact) on LocalSource repos written in the test with weights_fixtures + a ByteLevel tokenizer.json over anchor words (as in T207 tests); module-scoped cache"
+    - "test_related: base FamilySpec(seed=1, vocab=512) vs finetune(base, 0.02, 7) -> r_med >= 0.95, r_gap >= 0.40, r_top1 == 1.0, cka >= 0.99, missing == []; log_topk_dist and log_fro_dlog are each smaller than for the unrelated pair of test_unrelated_same_arch"
+    - "test_unrelated_same_arch: seed 1 vs seed 2 (same shapes, shared trend) -> r_med <= 0.40, r_top1 <= 0.40, missing == []"
+    - "test_structure_only_alignment: monkeypatch align.combine_cost with a spy -> every call has R None; the upscaled pair base vs upscale(base,16,12,4) gives alignment mode structure-only and n_scored >= 10"
+    - "test_incompatible_reldepth: qwen2-style 16 layers vs llama-style hidden 160 -> mode reldepth"
+    - "test_constant_cost_reldepth: monkeypatch align.structural_cost to return numpy.full((nB, nA), 0.5) -> mode reldepth, structure_informative False, and viterbi is never called (spy); returning numpy.zeros -> mode structure-only (Viterbi), structure_informative False"
+    - "test_claim_not_a_feature: rewrite the subject card's model_card.base_model, tokenizer_minhash.signature and config.raw.model_type -> identical values"
+    - "test_missing_sigma: subject card with stats.sigma_curves None -> the 6 sigma features missing with a reason, cka present"
+    - "test_missing_stats_v1: drop stat_spectral_topk/stat_fro_norm values from the subject table -> only log_topk_dist and log_fro_dlog missing"
+    - "test_missing_cka: subject without anchor_embedding -> cka missing, reason mentions anchors"
+    - "test_invariance_end_to_end: base vs permute_hidden(base) (embedding columns permuted too) -> r_med >= 0.99 and cka >= 0.999999"
+    - "test_params_literal: FEATURE_PARAMS and JEV_FEATURES equal the plan.md 4.8 literals"
+  commands:
+    - pytest -q tests/test_features.py
+    - pytest -q
+out_of_scope:
+  - classification (T210)
+  - changing the P2 DiffView (unchanged)
+invariants_touched: [4, 5]
+decisions: [D40, D41]

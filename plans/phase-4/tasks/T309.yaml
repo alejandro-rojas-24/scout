@@ -1,0 +1,120 @@
+id: T309
+title: Content-addressed Card store (store.v1) - objects by content hash, refs by (repo, sha), weights-digest index, params_digest invalidation, flock writers, byte-identical import/export, cached_scan
+depends_on: [T304, T306, T307, T314]
+files:
+  - scout/store.py
+  - tests/test_store.py
+route: opus
+spec_complete: true
+interface: |
+  scout/store.py:
+    STORE_PARAMS: dict               # EXACTLY the plan.md 4.9 literal
+    STORE_SCHEMA = "store.v1"; REF_SCHEMA = "storeref.v1"
+    HAS_KEYS = ("sigma", "tokenizer", "anchors", "attribution")
+
+    @dataclass(frozen=True)
+    class StoreEntry:
+        repo: str; revision_sha: str; component: str | None; object: str; schema_version: str; options: dict
+        has: dict[str, bool]; attribution_refs: list[str]; params_digest: str; content_digest: str | None
+        created_at: str; scout_version: str
+        @property card_key -> dict
+        def to_dict(self) -> dict        # plan.md 4.6 (plus repo, revision_sha)
+
+    def params_digest() -> str
+        # sha256(json.dumps({"card": card.SCHEMA_VERSION, "sigma": SIGMA_PARAMS, "align": ALIGN_PARAMS, "cka": CKA_PARAMS,
+        #   "tstats": TSTATS_PARAMS, "attrib": ATTRIB_PARAMS, "quant": QUANT_PARAMS, "gguf": GGUF_PARAMS},
+        #   sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    def key_string(card_key: dict) -> str                  # f"{repo}@{revision_sha}/{component or '-'}"
+
+    class CardStore:
+        def __init__(self, root: pathlib.Path) -> None
+        root: pathlib.Path
+        def put_files(self, json_path: pathlib.Path, parquet_path: pathlib.Path) -> StoreEntry
+        def put(self, built: BuiltCard) -> StoreEntry
+        def entries(self, repo: str, revision_sha: str) -> list[StoreEntry]
+        def units(self, repo: str, revision_sha: str) -> list[str | None] | None
+        def set_units(self, repo: str, revision_sha: str, units: list[str | None]) -> None
+        def find(self, repo: str, revision_sha: str, component: str | None, *, require: Collection[str] = ()) -> StoreEntry | None
+        def find_attribution(self, subject_key: dict, reference_keys: list[dict], control_keys: list[dict]) -> StoreEntry | None
+            # role-aware (validation r2 minor): swapping a reference and a control misses
+        def object_paths(self, entry: StoreEntry) -> CardPaths
+        def load(self, entry: StoreEntry) -> tuple[dict, pyarrow.Table]
+        def export(self, entry: StoreEntry, out_dir: pathlib.Path) -> CardPaths
+        def import_tree(self, cards_dir: pathlib.Path) -> list[StoreEntry]
+        def same_weights(self, content_digest: str) -> list[str]           # key strings
+        def list_all(self, *, stale: bool = False) -> list[StoreEntry]
+        def reindex(self) -> int
+            # rebuild refs/ and by-weights/ from objects/ alone; returns the number of entries (plan.md 3.5: the
+            # indexes are derived data, the Card objects are the only persisted artifact, invariant 1)
+
+    def cached_scan(target: str, store: CardStore, log: ByteLog | None = None, *, tokenizer: bool = False,
+                    sample: bool = False, anchors: bool = False, **scan_kwargs) -> tuple[list[StoreEntry], bool]
+        # (entries, hit); scan_kwargs are passed to scan.scan (client, endpoint, token, confirmer, gate_*, ...)
+behavior: |
+  1. __init__: root.mkdir(parents=True, exist_ok=True); STORE file absent -> write {"schema": STORE_SCHEMA} atomically;
+     present with another schema -> StoreError.
+  2. Writers (put_files, set_units) hold fcntl.flock(LOCK_EX) on root/.lock for the whole read-modify-write; every file
+     write is tmp (mkstemp in the same dir) + os.replace. Readers never lock.
+  3. put_files(j, p): jb, pb = bytes; card = json.loads(jb) (schema in SUPPORTED_SCHEMA_VERSIONS else StoreError);
+     h = card.object_id(jb, pb); dest = objects/h[:2]/h/ with the ORIGINAL file names (j.name, p.name); if dest exists
+     and both files' bytes equal -> reuse, else write both. Ref file refs/<repo_slug>/<revision_sha>.json (created if
+     missing: {"schema": REF_SCHEMA, "repo", "revision_sha", "units": None, "entries": []}); append the entry unless an
+     entry with the same object exists (dedup; return the existing one). Entry fields: component = key.component;
+     object = h; schema_version; options = card.scan.options (missing keys False); has = {sigma: stats.sigma_curves is
+     not None, tokenizer: stats.tokenizer_minhash is not None, anchors: stats.anchor_embedding is not None, attribution:
+     stats.attribution is not None}; attribution_refs = sorted(f"{r['role']}:{key_string(r['card_key'])}" for r in attribution.references)
+     or [] (role "reference" or "control", plan.md 4.6); params_digest = params_digest(); content_digest = weights.content_digest (v3) or None; created_at = UTC now;
+     scout_version. If content_digest: by-weights/<hex>.json gains key_string(card_key) (set semantics).
+  4. find(repo, sha, component, require): entries with that component, params_digest == params_digest(), and
+     has[k] for every k in require; newest created_at wins (ties: larger object id). require keys outside HAS_KEYS ->
+     ValueError.
+  5. find_attribution(subject_key, reference_keys, control_keys): entries of the subject key with has.attribution,
+     current params_digest, attribution_refs == sorted([f"reference:{key_string(k)}" for k in reference_keys] +
+     [f"control:{key_string(k)}" for k in control_keys]); newest wins.
+  6. load(entry) = card.load_card(object json path). export(entry, out_dir): copy both files byte-identically to
+     card.card_paths(out_dir, repo, sha, component) (atomic), return the paths.
+  7. import_tree(cards_dir): every "*/*/*.card.json" with its sibling parquet (from the JSON's tensors_parquet) ->
+     put_files; returns the entries (files are byte-identical, so object ids equal the P3 ledger card_files hashes
+     combined by object_id).
+  8. list_all(stale): all entries of all refs; stale=True returns only entries whose params_digest differs from current.
+  9. cached_scan(target, store, log, tokenizer, sample, anchors, **kw):
+     a. require = {"tokenizer"} if tokenizer | {"sigma"} if sample | {"anchors"} if anchors.
+     b. base, sel = scan.split_selector(target); kind, ident, rev = scan.parse_target(base).
+        Hub with rev matching ^[0-9a-f]{40}$, or local (key computed with LocalSource(ident, ByteLog()).resolve() on a
+        THROWAWAY ByteLog: stat only, 0 bytes, keeps the caller's stage order intact): units = [component for sel]
+        (component selector -> sel; file selector -> "gguf:" + first part of select_gguf over the local listing or,
+        for Hub, "gguf:" + sel after split normalisation to part 00001) or store.units(repo, sha). If units is known and
+        find(...) hits for every unit -> return (entries, True) with NO network request and no log event.
+     c. Otherwise: with tempfile.TemporaryDirectory() as tmp: res = scan.scan(target, Path(tmp), log or ByteLog(),
+        tokenizer=..., sample=..., anchors=..., **kw); entries = [store.put_files(p.json_path, p.parquet_path) for p in
+        res.cards]; if sel is None: store.set_units(repo, res.revision_sha, [e.component for e in entries]).
+        Return (entries, False).
+  10a. reindex(): under the writer lock, build every entry exactly as put_files would (behavior 3) from each
+      objects/<h[:2]>/<h>/ pair (created_at = the Card's `scan.scanned_at` (P1 Card field) if present, else the
+      JSON file's mtime as ISO Z; scout_version from the Card), write fresh refs (units None: a whole-repo hit needs one
+      rescan after a reindex) and by-weights files to a temp tree, then replace refs/ and by-weights/ atomically
+      (rename the old trees aside, rename the new ones in, delete the old). Objects are never modified.
+  10. No weights are ever stored: put_files rejects any file whose name does not end with ".card.json" /
+      ".tensors.parquet" (StoreError).
+acceptance:
+  tests:
+    - "fixtures: P1 st_fixtures repo, T313 write_st_repo(BASE), write_gguf_repo(derive(BASE)), write_te_pipeline(TE_BASE); FakeHub for pinned hub targets"
+    - "test_params_literal: STORE_PARAMS == plan.md 4.9 literal"
+    - "test_put_find_load: scan into tmp, put_files -> object id == card.object_id(bytes); find with require {} hits, require {'sigma'} misses on a plain Card; load equals load_card of the original; put twice -> 1 entry (dedup)"
+    - "test_export_import_bytes: export writes files byte-identical to the originals at the P1 path; import_tree of a P1-layout dir with 3 Cards (incl. a P3-style card.v2) -> 3 entries whose objects are object_id(files); re-export is byte-identical"
+    - "test_cached_scan_zero_requests: pinned FakeHub target: first cached_scan -> hit False, requests > 0; second -> hit True and FakeHub records 0 new requests; with sample=True the second call misses (require sigma) and scans"
+    - "test_cached_scan_local: local folder -> second call hits with 0 reads (spy on LocalSource.read_range/read_file), the caller's ByteLog unchanged by the key computation"
+    - "test_cached_scan_pipeline_units: pipeline repo without selector -> set_units records all components; second call hits; with '#text_encoder' hits the single unit"
+    - "test_params_digest_invalidates: monkeypatch ATTRIB_PARAMS['alpha'] -> find misses; list_all(stale=True) lists the old entry"
+    - "test_find_attribution: a Card built by card.with_attribution with references [A (role reference), B (role reference), K (role control)] -> find_attribution(subject, [B, A], [K]) hits (order-independent); a different reference set misses; find_attribution(subject, [A, K], [B]) (roles swapped, same key set) misses; entry.attribution_refs == sorted(['control:' + key_string(K), 'reference:' + key_string(A), 'reference:' + key_string(B)])"
+    - "test_same_weights: two FakeHub repos with identical safetensors bytes (lfs on) -> same content_digest -> same_weights lists both keys"
+    - "test_concurrent_put: 8 processes (multiprocessing spawn) each put a distinct Card for the same (repo, sha) with different components -> 8 entries, the ref JSON valid, no temp files left"
+    - "test_reindex: put 3 Cards (2 with content_digest), delete refs/ and by-weights/ -> reindex() == 3; find/find_attribution/same_weights give the same answers as before (units None); objects untouched (bytes equal)"
+    - "test_rejects_non_card: put_files of a .safetensors path -> StoreError"
+  commands:
+    - pytest -q tests/test_store.py
+    - pytest -q
+out_of_scope:
+  - gc/deletion (later.md); server/UI listing (T318); CLI (T319)
+invariants_touched: [1, 2]
+decisions: [D62, D63]

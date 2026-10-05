@@ -1,0 +1,175 @@
+id: T412
+title: "Blind-reader checklist - READER_PARAMS (ten content-specific questions, critical set without fixed-answer keys), answer_key(bundle), deterministic scoring, the frozen negative-control canary (three planted defects) and its detection rule, the LLM reader over the P3 S2Client seam (visible text only, structured answers, pre-registered 2-of-3 samples), the blind human form with neutral file names and the answer-file parser"
+depends_on: [T410]
+files:
+  - scout/report/reader.py
+  - scripts/p5_canary.py
+  - tests/test_report_reader.py
+route: opus
+spec_complete: true
+interface: |
+  scout/report/reader.py (imports scout.report.render (visible_text, extract_bundle), scout.system2 (S2Client, S2Config,
+  S2Raw), scout.caveats, yaml, json, re, hashlib, html):
+    READER_PARAMS: dict                        # EXACTLY the plan.md 4.8 literal; "questions" = the plan.md 3.8 table
+      # {"Q1": {"text": ..., "format": "repo@sha", "critical": True, "canary_defect": None}, ..., "Q10": {...}}
+      # every report gets the same ten questions (no variants); Q10 is answered "not run" when the retrain section is
+    READER_SCHEMA: dict                        # JSON schema of plan.md 4.7 READER_SCHEMA (additionalProperties false)
+    READER_SYSTEM_PROMPT: str                  # exact text below
+    REASON_CODES: tuple[str, ...] = ("no weight evidence", "out of training range", "low confidence")  # P3 jev abstain reasons
+    def questions_for(bundle: dict) -> list[dict]          # [{id: "Q1".."Q10", text, format, critical}] (always 10)
+    def answer_key(bundle: dict) -> dict                   # {"Q1": expected, ...} (normalised)
+    def printed_titles(bundle: dict) -> dict[str, str]
+        # repo -> the title string the report prints for it (P1 T011 / P3 T211: f"{repo}@{sha[:12]}" + " / component"
+        # when the Card has a component): the subject and every Card in bundle.data.cards; used by the rehearsal stubs
+        # (T418) so that stub answers use the printed form (validation r2 major 2)
+    def normalise_repo(item: str) -> str | None             # the repo of a printed reference/subject item (behavior 3)
+    def key_sha256(key: dict) -> str                        # sha256 of canonical JSON (sets as sorted lists)
+    def normalise(answer: str, fmt: str) -> Any
+    def score(answers: dict[str, str], key: dict, questions: list[dict], required_edits: list[dict], reader: str,
+              label: str) -> dict                           # plan.md 4.7 score
+    @dataclass(frozen=True)
+    class Defect:
+        id: str                                  # "D1" | "D2" | "D3"
+        question: str                            # linked question id ("Q4" | "Q8" | "Q9")
+        text: str                                # the planted or changed visible text (for quote matching)
+  scripts/p5_canary.py (exit-only; validation r2 minor: product code never produces a defective report; imported only
+  by scripts/exit_check_p5.py (T417), tests/test_report_reader.py and tests/helpers/p5_rehearsal.py (T418); nothing
+  under scout/ imports it, asserted by an AST walk):
+    def make_canary(html: bytes) -> tuple[bytes, list[Defect]]
+        # the frozen negative control (plan.md 3.8): three planted defects on a copy of a clean report; ValueError when
+        # the source lacks a #attribution reference row of the base with an n_attributed cell, a #license section, the
+        # first disclaimer in #caveats or the VERDICT_SEMANTICS distillation clause in #system1
+    def canary_detection(answers: dict[str, str], required_edits: list[dict], key: dict, questions: list[dict],
+                         defects: list[Defect]) -> dict
+        # {"score": score(...), "detected": [defect ids], "failed_as_required": bool}
+    def llm_read(html: bytes, client: S2Client, config: S2Config) -> tuple[dict, S2Raw]
+        # (parsed READER_SCHEMA answer, raw); the user message is JSON {"questions": [...], "report_text": visible_text};
+        # config.model must equal READER_PARAMS["llm_model"] (ValueError otherwise: the instrument is frozen, r2 minor)
+    def llm_verdict(sample_scores: list[dict], *, canary: bool) -> dict
+        # {"n": len, "n_pass": int, "n_failed_as_required": int, "ok": bool} with the READER_PARAMS k-of-n rule
+    def neutral_names(labels: list[str], key_sha256s: dict[str, str]) -> dict[str, str]
+        # label -> "report-A.html".. in the frozen order: labels sorted by sha256(label + key_sha256s[label]); the canary
+        # has label "canary"; the order is not guessable from the label names
+    def reader_form(neutral: dict[str, str], bundles: dict[str, dict]) -> str   # YAML, questions only, keyed by neutral name
+    def parse_human(yaml_text: str, neutral: dict[str, str]) -> dict             # validated plan.md 4.7 human answers file
+behavior: |
+  1. Questions (plan.md 3.8, verbatim texts in READER_PARAMS; validation r1 major 4). Every critical question (Q1, Q2,
+     Q4, Q6) has a key that depends on the report's content and cannot be given from general knowledge; the two
+     fixed-answer questions (Q8, Q9) are NOT critical and exist to be linked to canary defects D2 and D3.
+  2. answer_key(bundle): Q1 = (subject repo, subject revision_sha); Q2 = set of reference repos whose System 1 verdict is
+     "derived" in data.analysis[0] (empty -> "none"), or "not run"; Q3 = {repo: abstain_reason} over System 1
+     abstentions, the reason being one of REASON_CODES exactly as rendered in the report's .reason span (empty ->
+     "none"), or "not run"; Q4 = {repo: (n_attributed, n_tested)} over the references with role "reference" in the
+     attribution section (the published subject; never the retrain trace), or "not run"; Q5 = set of control repos
+     of that attribution, or "not run"; Q6 = set of section names with status not_run among {"system 1", "system 2",
+     "block attribution", "retrain"} (empty -> "none"); Q7 = the subject licence string as listed in #license, or
+     "unknown"; Q8 = "no"; Q9 = "no"; Q10 = (set of recipe blocks, yes/no = signal_dropped of the stop row, or of the
+     last trace row when stop_step is null) when the retrain section runs and has a trace, "not run" otherwise
+     (refused outcomes with an empty trace -> (blocks, "no")). (Q10's yes/no is keyed on the row's signal_dropped, not
+     on outcome == success: validation r1 minor, quality_not_recovered has a dropped signal.)
+  3. normalise(answer, fmt) works on what the report PRINTS (validation r2 major 2: every reference and the subject are
+     printed only as titles "repo@sha12", plus " / component" for a component Card). Common steps: strip; delete every
+     parenthetical "(...)" (non-nested, anywhere); collapse whitespace.
+     normalise_repo(item): strip; cut at the first " / " (a component suffix) and at the first "#" (a selector); if the
+     item contains "@", the part after "@" must start with a run of >= 7 hex characters (else None) and only the part
+     before "@" is kept; the result is the repo, compared case-sensitively after trimming. So "org/x", "org/x@0123456",
+     "org/x@0123456789ab", "org/x@0123456789ab / text_encoder", "org/x#text_encoder" and "org/x (the base)" all
+     normalise to "org/x".
+     Formats:
+     - "repo@sha" (Q1): repo = normalise_repo(answer); sha = the FIRST run of >= 7 hex characters after the first "@",
+       lowercased, which must be a prefix of the key sha; trailing text (component, parenthetical, words) is ignored.
+       Missing "@" or fewer than 7 hex characters -> wrong.
+     - lists (Q2, Q5, Q6, Q10 blocks): split on commas, semicolons and newlines AFTER the parenthetical removal; each
+       item stripped; compared as sets; repo items through normalise_repo; section names case-insensitive with
+       "s1"/"system1" -> "system 1", "s2"/"system2" -> "system 2", "attribution" -> "block attribution", "retrain
+       experiment" -> "retrain"; integers parsed.
+     - "repo: reason" (Q3) and "repo: n of N" (Q4): each item is split at its LAST ":" (titles contain no ":"); the left
+       part through normalise_repo; Q3 reason compared case-insensitively after whitespace collapse against
+       REASON_CODES (codes are shown verbatim, so no paraphrase matching); Q4 both integers must match.
+     - licence: exact string compare after lowercasing and whitespace collapse; yes/no: first word lowercased (trailing
+       punctuation removed) in {"yes", "no"} ("not stated" is wrong); "none" and "not run" literal (case-insensitive).
+       Q10: block integers, then yes/no after a ";". A blank answer is wrong.
+  4. score: per question correct/incorrect; correct = count; critical_ok = all critical questions correct; required
+     edits = len(required_edits) (each must have a quote and a reason in READER_PARAMS["edit_reasons"], else it counts
+     and also marks the answer file invalid in the detail); passed = correct >= min_correct and critical_ok and
+     required_edits <= max_required_edits.
+  5. scripts/p5_canary.make_canary(html) applies exactly three edits to the visible HTML (the embedded bundle is left
+     untouched; the canary is never linted: it exists only for readers). Design rule (validation r2 major 3): EACH
+     defect changes the keyed answer of its linked question for a reader who reads the report, so one careful reading
+     detects every defect through answers alone, without having to file an edit:
+     D1 contradicted count (linked Q4, critical): in #attribution, the reference-table row of the BASE (the first
+        reference with role "reference" in the attribution Card, j = its index; pinned to the base, validation r2
+        minor) has its <data> element whose data-src ends with f"/references/{j}/n_attributed" changed: text
+        str(int(text) - 1) (str(int(text) + 1) when the text is "0"); the value attribute is left as is. The #summary
+        sentence and the per-block table keep the true values, so the report contradicts itself, and a reader who
+        answers Q4 from the attribution table gives a count that differs from the clean key. Defect text = the
+        whitespace-collapsed visible text of the edited <tr>.
+     D2 licence answered (linked Q8): the paragraph READER_PARAMS["canary"]["licence_sentence"] ("Using, modifying and
+        redistributing this model is permitted under the licences listed above.") inserted as <p> immediately before
+        <p class="license-question">. Q8's clean key is "no"; this report says "yes".
+     D3 distillation statement removed (linked Q9): (a) the <li> in #caveats whose text equals caveats.DISCLAIMERS[0]
+        is deleted, AND (b) in the <p class="semantics"> of #system1, the clause " (distillation and shared tokenizers
+        remain possible)" of VERDICT_SEMANTICS (P3 T211, verbatim) is deleted. After (a) and (b) no visible text of the
+        canary mentions distillation (make_canary raises ValueError when a case-insensitive "distill" remains in
+        visible_text of its output, e.g. from a model-card claim), so a careful reader
+        answers Q9 "not stated", which differs from the clean key "no". Defect text = DISCLAIMERS[0].
+     The result is deterministic (byte-identical for identical input).
+  6. canary_detection: s = score(answers, key (the CLEAN report's key), ...); detected = defects d for which the
+     reader's answer to d.question is wrong under the clean key, OR a required edit's quote (whitespace-collapsed,
+     lowercased) shares a common substring of >= 20 characters with d.text (lowercased). failed_as_required =
+     len(detected) >= READER_PARAMS["canary"]["min_detected"] (1) (validation r2 major 3: the r1 "not passed AND"
+     clause is dropped; a careful reader who detects one defect fails the canary as required even if its score would
+     pass, and a reader answering from priors detects nothing and FAILs the canary row).
+  7. READER_SYSTEM_PROMPT (exact): "You are a careful reader who received a model-lineage report from a colleague. Answer
+     each question using only the report text you are given; do not use outside knowledge about any model, company or
+     licence. Give short answers in the requested format. Then list required edits: statements in the report that are
+     factually wrong, contradict another part of the report, would mislead a reader, or are unreadable; quote each one
+     exactly. Put stylistic suggestions in optional_edits. If the report does not answer a question, answer
+     'not stated'."
+  8. llm_read: text = render.visible_text(html) (the bundle script is excluded); user = json.dumps({"questions":
+     [{"id", "text", "format"} ...], "report_text": text}); raw = client.complete(READER_SYSTEM_PROMPT, user,
+     READER_SCHEMA, config) with config.model = READER_PARAMS["llm_model"] (no override exists: no CLI flag or keyword
+     changes it after the freeze; validation r2 minor), effort
+     READER_PARAMS["llm_effort"], max_tokens READER_PARAMS["llm_max_tokens"]; the answer is parsed and validated against
+     READER_SCHEMA; unavailable (P3 T212 outcomes) -> returns ({}, raw) and the caller scores it as all wrong with
+     detail raw's unavailable_reason (an unavailable sample is a failed sample; it is never re-drawn).
+  9. llm_verdict (pre-registered k-of-n; validation r1 majors 3 and 4): n = READER_PARAMS["llm_samples"] (3) independent
+     calls per file, all made by one `read --reader llm` invocation; a real report is ok iff n_pass >=
+     READER_PARAMS["llm_min_passing"] (2); the canary is ok iff n_failed_as_required >= READER_PARAMS["llm_min_passing"]
+     (2). len(sample_scores) != n -> ok False.
+  10. neutral_names / reader_form / parse_human (blind human, one submission): the form lists the four files (three
+      reports and the canary) under their neutral names only, with the instructions paragraph: open each HTML file in a
+      browser, answer from the report alone, list required edits, set blind true only if you have not seen the plan, the
+      code or other scout output. YAML {"reader": {"id": "", "blind": false, "date": ""}, "instructions": ...,
+      "reports": {neutral name: {"questions": [{id, text, format}], "answers": {Q1: "", ...}, "required_edits": []}}}.
+      No key, no label, no hint. parse_human: yaml.safe_load; reader.id non-empty, reader.blind bool, reader.date
+      YYYY-MM-DD, every neutral name present with 10 answers; problems -> ValueError listing them; returns answers keyed
+      by label (inverting `neutral`).
+acceptance:
+  tests:
+    - "fixtures: T409/T410 bundles (full with retrain; all-not-run; negative-style bundle with abstentions); clean renders"
+    - "test_params_literal: READER_PARAMS equals the plan literal; every question text equals the plan.md 3.8 table text; critical == ['Q1', 'Q2', 'Q4', 'Q6']; no critical question has a key that is equal across the three fixture bundles (asserted: for each critical id, the keys of the full, all-not-run and negative bundles are not all equal)"
+    - "test_answer_key: full bundle -> Q2 == the derived reference set; Q4 counts equal the attribution section's (not the trace's unflagged counts); Q6 == {'system 2'}; Q10 == (blocks, 'yes') for a success record and (blocks, 'yes') for a quality_not_recovered record (dropped signal), (blocks, 'no') for signal_persists; all-not-run bundle -> Q2 'not run', Q4 'not run', Q6 == {'system 1', 'system 2', 'block attribution', 'retrain'}, Q10 'not run'"
+    - "test_q3_codes: abstention keys use REASON_CODES; answer 'org/a: Low confidence' -> correct; 'org/a: not enough confidence' -> wrong"
+    - "test_key_sha_stable: key_sha256 of the same key twice is equal; a changed bundle outcome changes it"
+    - "test_score_all_correct: answers built from the key in natural language forms ('Qwen/X@abcdef1', 'Yes.', 'org/a, org/b', 'org/a: 21 of 24', 'System 2') -> correct 10, passed"
+    - "test_score_printed_forms (validation r2 major 2): with key subject ('Qwen/Qwen-Image', sha '0123456789abcdef...'), Q2 {'Qwen/Qwen2.5-0.5B'}, Q4 {'Qwen/Qwen2.5-0.5B': (24, 24)}: Q1 'Qwen/Qwen-Image@0123456789ab / text_encoder' -> correct; Q1 'Qwen/Qwen-Image@0123456 (text encoder)' -> correct; Q1 'Qwen/Qwen-Image@012345' (6 hex) -> wrong; Q1 'Qwen/Qwen-Image@0123457' (wrong prefix) -> wrong; Q2 'Qwen/Qwen2.5-0.5B@0123456789ab' -> correct; Q2 'Qwen/Qwen2.5-0.5B (the base model)' -> correct; Q2 'Qwen/Qwen2.5-0.5B#text_encoder' -> correct; Q2 'qwen/qwen2.5-0.5b' -> wrong (case-sensitive); Q4 'Qwen/Qwen2.5-0.5B@0123456789ab: 24 of 24' -> correct; Q4 'Qwen/Qwen2.5-0.5B@0123456789ab / text_encoder: 24 of 24' -> correct; Q3 'org/a@0123456789ab: Low confidence' -> correct"
+    - "test_printed_titles: printed_titles(full bundle) maps every repo of data.cards and the subject to the title string that occurs verbatim in visible_text(render(bundle)); a component subject's title ends with ' / <component>'; answers built from those titles score 10 of 10 on the full, all-not-run and negative fixture bundles"
+    - "test_score_critical_miss: only Q6 wrong -> correct 9, critical_ok False, passed False; only Q8 wrong -> correct 9, passed True"
+    - "test_score_edits: one required edit -> passed False; an edit with reason 'style' -> counted and flagged invalid"
+    - "test_critical_keys_vary (validation r1 major 4): over the three T409 fixture bundles (all sections run; attribution only; System 1 only), for each critical question Q1, Q2, Q4 and Q6 the keys are not all equal; and answering every question with the most common key across the three bundles (a reader answering from priors) fails at least one critical question on every bundle"
+    - "test_canary_edits: scripts.p5_canary.make_canary(full render) changes exactly the planted places (D1: the base's n_attributed cell in #attribution differs from the clean count while the #summary attrib_ref sentence keeps the clean count; D2 sentence present before .license-question; DISCLAIMERS[0] absent; DISCLAIMERS[1] and [2] present; the #system1 semantics paragraph lacks the distillation clause; no case-insensitive 'distill' anywhere in visible_text(canary)); the embedded bundle is unchanged; deterministic"
+    - "test_canary_each_defect_changes_a_key (validation r2 major 3): answers read from the canary's visible text (the D1 table count for Q4, 'yes' for Q8 because of the D2 sentence, 'not stated' for Q9 because no distillation statement remains) are each wrong under the clean key: Q4, Q8 and Q9 are all marked wrong, detected == ['D1', 'D2', 'D3']"
+    - "test_canary_detection: (a) answers equal to the clean key and no edits (a reader that answers from priors) -> detected [], failed_as_required False; (b) Q8 'Yes, the report says it is permitted' -> detected ['D2'], failed_as_required True; (c) an edit quoting the D1 table row -> detected ['D1'], failed_as_required True; (d) Q9 'not stated' only -> passed True (9 of 10) and failed_as_required True (r2: one detected defect suffices); (e) careful reader: Q8 'yes', Q9 'no', every other answer equal to the clean key, no edits -> passed True, detected ['D2'], failed_as_required True"
+    - "test_canary_not_in_product (validation r2 minor): no module under scout/ imports scripts.p5_canary or defines make_canary (AST walk over scout/**/*.py)"
+    - "test_llm_verdict: real report 2 of 3 passing -> ok; 1 of 3 -> not ok; canary 2 of 3 failed_as_required -> ok; a list of 2 samples -> not ok"
+    - "test_llm_read_stub: StubS2Client answering from the key -> passed; the user message contains no '<script' and no bundle JSON; the request body passes system2.assert_request_no_weights; a config whose model differs from READER_PARAMS['llm_model'] -> ValueError before any call"
+    - "test_llm_unavailable: stub refusal -> ({}, raw with unavailable_reason 'refusal'); score of {} -> correct 0"
+    - "test_reader_form_and_parse: neutral_names gives 4 distinct 'report-?.html' names, deterministic; reader_form has no label, no expected answer string (e.g. the subject sha is absent) and no 'canary'; a filled form parses back to labels; missing Q7 -> ValueError"
+  commands:
+    - pytest -q tests/test_report_reader.py
+    - pytest -q
+out_of_scope:
+  - ledger entries, one-shot rules and exit rows (T416, T417)
+invariants_touched: [3, 5]
+decisions: [D88, D89]

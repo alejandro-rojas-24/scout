@@ -1,0 +1,157 @@
+id: T216
+title: P3 exit expectations - C0..C12 as pure functions (pre-flight subset C0-C5 + C10 static), ledger audit rows, same-shape coverage, frozen parameter literals and thresholds
+depends_on: [T115, T210, T211, T212, T218]
+files:
+  - scripts/exit_expectations_p3.py
+  - tests/test_exit_expectations_p3.py
+  # scripts/exit_expectations_p2.py and tests/test_exit_expectations_p2.py are owned by T202 (P2 C8 amendment, wave 1)
+route: opus
+spec_complete: true
+interface: |
+  scripts/exit_expectations_p3.py:
+    from scripts.exit_expectations import Check                       # P1 T016
+    from scripts import p3_ledger                                      # T218
+    HELDOUT_MIN_PAIRS = 16; HELDOUT_MIN_DERIVED = 6; HELDOUT_MIN_NOT_DERIVED = 8; HELDOUT_MIN_HARD = 4
+    TRAIN_MIN_SAME_SHAPE = 2; CAL_MIN_SAME_SHAPE = 1                   # plan.md D53 (data coverage, not performance)
+    FALSE_DERIVED_MAX = 0; ACC_NONABSTAIN_MIN = 0.90; ABSTAIN_MAX = 0.30
+    SWEEP_MIN_PAIRS = 100; SWEEP_FALSE_DERIVED_MAX = 0
+    S2_UNAVAILABLE_MAX = 0
+    CODE_PATHS = ("scout", "scripts", "pyproject.toml")
+    FORBIDDEN_IMPORTS = ("scout.hub", "scout.sources", "scout.scan", "scout.gate")
+    OFFLINE_ROOTS = ("scout.analysis", "scout.features", "scout.jev", "scout.system2")
+    ANCHOR_SHA256 = "466fcb0770645851483e61a7c7a72041d80c7155a2f0e24530c2a1099c421516"
+    FROZEN_CKA_PARAMS, FROZEN_TSTATS_PARAMS, FROZEN_FEATURE_PARAMS, FROZEN_JEV_PARAMS: dict   # literal copies of plan.md 4.8
+    FROZEN_JEV_FEATURES: tuple[str, ...]
+    ALLOWED_S2 = {"derived": {"derived", "abstain"}, "not_derived": {"not_derived", "abstain"}, "abstain": {"abstain"}}
+    S2_HOSTS = frozenset({"api.anthropic.com"})
+
+    @dataclass(frozen=True)
+    class Sizes:                     # the only knobs the offline rehearsal may override (plan.md 8); thresholds are not knobs
+        min_pairs: int = HELDOUT_MIN_PAIRS; min_derived: int = HELDOUT_MIN_DERIVED
+        min_not_derived: int = HELDOUT_MIN_NOT_DERIVED; min_hard: int = HELDOUT_MIN_HARD; sweep_min: int = SWEEP_MIN_PAIRS
+
+    @dataclass
+    class P3Inputs:
+        pins: dict[str, str]; targets: list[str]                   # targets = labeled repos ∪ library repos
+        labeled_path: Path; labeled: LabeledSet | None; labeled_error: str | None; synthetic_allowed: bool
+        pins_path: Path
+        ledger_path: Path; ledger: list[dict]; ledger_problems: list[str]   # p3_ledger.verify + parsed entries (entries [] if problems)
+        ledger_bytes: bytes                                        # raw file bytes (b"" if missing), for the HEAD-prefix row
+        cards: dict[str, LoadedCard | None]                        # repo -> Card at its pin (None if missing/unloadable)
+        card_hashes: dict[str, dict | None]                        # repo -> {"json","parquet"} sha256 of the files on disk (None if missing)
+        model_path: Path; model: JevModel | None; model_error: str | None
+        import_violations: list[str]         # from the static AST walk
+        git_exit: dict | None = None         # git_code_state(repo_root, since=<FREEZE_MODEL git_commit>, track=<ledger rel path>) at EXIT
+        heldout: list[dict] | None = None    # per held-out pair: {"id","label","hard","verdict","p_derived","features","missing","abstain_reason"}; None in pre-flight
+        sweep: list[dict] | None = None      # per sweep pair: {"reference","subject","verdict","p_derived"}
+        reports: list[dict] | None = None    # analysis.v1 per held-out pair (one reference each)
+        report_texts: list[str] | None = None
+        s1_requests: int | None = None       # network requests counted during S1 evaluation
+        s2: list[dict] | None = None         # s2.v1 per held-out pair (E7), in heldout order
+        s2_inputs: list[dict] | None = None  # s2in.v1 per pair (build_input)
+        s2_requests: list[dict | None] | None = None   # request_body actually sent, per recorded call (RecordingS2Client)
+        s2_hosts: list[str | None] | None = None       # request_host per recorded call
+
+    def kv_signature(card: dict, table: pyarrow.Table) -> tuple[int, tuple[int, ...], tuple[int, ...]] | None
+        # st = card["structure"]["stacks"][0]; i0 = st["indices"][0]; k = row named f"{st['prefix']}.{i0}.self_attn.k_proj.weight",
+        # v likewise with v_proj (P1 parquet columns name/shape); returns (st["depth"], tuple(k shape), tuple(v shape));
+        # None if there is no stack or either row is missing
+    def static_import_violations(repo_root: Path) -> list[str]
+    def metrics(rows: list[dict]) -> dict
+        # {"n","n_derived","n_not_derived","n_hard","fd","n_nonabstained","correct","acc_nonabstain","abstain_rate","derived_recall","acc_by_family"}
+    def preflight_checks(inp: P3Inputs, sizes: Sizes = Sizes()) -> list[Check]   # C0..C5 + "C10 imports"; uses no held-out verdict
+    def s1_checks(inp: P3Inputs, sizes: Sizes = Sizes()) -> list[Check]         # preflight_checks + C6..C9, "C10 network", C11
+    def s2_checks(inp: P3Inputs, expected_hosts: frozenset[str] = S2_HOSTS) -> list[Check]   # C12 (several rows)
+        # expected_hosts is overridden only by the offline rehearsal ({"stub.invalid"}); never a CLI flag
+behavior: |
+  1. Checks never raise (P1 convention: exception -> ok False, actual "error: ..."). One Check per assertion; names "C<n> <short>".
+     target "*" for global checks, the repo for per-repo checks, the pair id for per-pair rows.
+  2. C0: set(pins) == set(targets).
+  3. C1: labeled loaded without error; synthetic is False unless synthetic_allowed; unresolved(labeled) == [];
+     L = p3_ledger.last(ledger, "FREEZE_LABELED") (missing -> FAIL); L.payload.sha256 == file_sha256(labeled_path) and
+     L.payload.pins_sha256 == file_sha256(pins_path); L.ts <= min(card.scan.scanned_at over cards with a non-empty
+     fetch_log.gate) (ISO strings parsed to datetimes; <= because both can fall in the same second in the offline rehearsal).
+  4. C2: families disjoint across splits (by construction of the loader; re-checked); for every pair both repos' families are
+     in the pair's split; derived pairs within one family. Held-out rows: n >= min_pairs, derived >= min_derived,
+     not_derived >= min_not_derived, hard >= min_hard where hard is COMPUTED: label not_derived and the two Cards'
+     hidden_size equal (config.raw["hidden_size"], falling back to text_config); computed hard must equal the YAML flag for
+     every pair (else FAIL naming the pair). Same-shape rows (plan.md D53): computed same_shape = label not_derived and
+     kv_signature(ref) is not None and == kv_signature(subj); it must equal the YAML same_shape flag for every pair of
+     every split (FAIL naming the pair); row "C2 same-shape train": #computed in train >= TRAIN_MIN_SAME_SHAPE; row
+     "C2 same-shape calibration": #computed in calibration >= CAL_MIN_SAME_SHAPE; the held-out count is in actual only.
+     A pair whose Card is missing -> its computed flags are None -> FAIL (C3 names the Card).
+  5. C3 (per repo in targets): card present; schema card.v2; key.revision_sha == pins[repo]; scan.options == {"sample": True,
+     "tokenizer": True, "anchors": True}; fetch_log.gate has exactly 1 decision, approved, via in {"cli-flag",
+     "below-threshold"}, and for cli-flag bytes_confirmed == bytes_cap and (plan_id, bytes_cap) in the union of
+     payload.confirm_plans over ledger entries of kind SCAN with payload.mode "confirm"; bytes_planned <= fetch_log.totals.weight
+     <= bytes_cap; a fetch_log event with event "purge", stage "COMPUTE" and "resident=0" in the note. Row "C3 card files":
+     S = the last SCAN (confirm) entry whose payload.card_files has the repo (missing -> FAIL "card not recorded in the
+     ledger"); card_hashes[repo] == S.payload.card_files[repo] (FAIL names which file differs). A Card whose
+     fetch_log.gate is empty and whose notes contain "sigma: nothing sampleable" gets actual "zero-read plan: replace the
+     repo (plan revision)" (still FAIL).
+  6. C4 (the full ledger, never only the last line):
+     - "C4 ledger chain": ledger_problems == [] (actual lists them).
+     - "C4 ledger append-only": git_exit is not None, git_exit["tracked_head"] is not None and
+       ledger_bytes.startswith(git_exit["tracked_head"].encode()) (None -> FAIL "ledger not committed").
+     - one row per p3_ledger.audit(ledger, labeled_sha256=file_sha256(labeled_path), model_sha256=model.sha256 or None,
+       heldout_repos=<held-out repos>) tuple, named "C4 " + row name.
+     - "C4 model file": model loaded; model.sha256 == the last FREEZE_MODEL after L (payload.sha256);
+       model.doc.labeled_sha256 == L.payload.sha256; set(model.doc.train_pairs) ⊆ train pair ids; pool ids ⊆ train ∪
+       calibration ids; json.dumps(model.doc) contains no held-out pair id (as a quoted string, e.g. '"L27"') and no
+       held-out repo string; model.doc.features == list(FROZEN_JEV_FEATURES).
+     - "C4 code frozen": M = last FREEZE_MODEL after L; M.payload.git_commit is a non-null string and M.payload.code_dirty
+       is False; git_exit is not None, git_exit.code_dirty is False and git_exit.code_changed_since == [] (None counts as
+       FAIL; actual lists the changed paths).
+  7. C5: scout.cka.CKA_PARAMS == FROZEN_CKA_PARAMS; scout.tstats.TSTATS_PARAMS == FROZEN_TSTATS_PARAMS;
+     scout.features.FEATURE_PARAMS == FROZEN_FEATURE_PARAMS; scout.jev.JEV_PARAMS == FROZEN_JEV_PARAMS;
+     scout.features.JEV_FEATURES == FROZEN_JEV_FEATURES; scout.anchors.ANCHOR_SHA256 == ANCHOR_SHA256 and the packaged file
+     hashes to it; and the P2 frozen checks: scripts.exit_expectations_p2.params_check() all ok.
+  8. preflight_checks = C0, C1, C2, C3, C4, C5 rows + row "C10 imports" (import_violations == []). It never reads
+     inp.heldout, inp.sweep, inp.reports or inp.s2*.
+  9. m = metrics(heldout). C6: m.fd <= FALSE_DERIVED_MAX (fd = #label not_derived with verdict derived; one extra row per
+     offending pair id). C7: m.n_nonabstained >= 1 and m.acc_nonabstain >= ACC_NONABSTAIN_MIN. C8: m.abstain_rate <= ABSTAIN_MAX.
+  10. C9: len(sweep) >= sizes.sweep_min and #derived in sweep <= SWEEP_FALSE_DERIVED_MAX (rows name each offender).
+  11. "C10 network": s1_requests == 0 (None -> FAIL).
+  12. C11: every report has disclaimers == list(DISCLAIMERS); every report text contains all three disclaimer strings.
+  13. C12 (s2_checks; if inp.s2 is None -> one FAIL row "C12 system2 not run"): len(s2) == len(heldout);
+      row "C12 available": #(out with available False or served_model None) <= S2_UNAVAILABLE_MAX, plus one FAIL row per
+      such pair naming its unavailable_reason (an unavailable pair is never a pass-through); each out has schema "s2.v1",
+      caveats == DISCLAIMERS, and for each pair final_verdict in ALLOWED_S2[system1_verdict]; for each s2 input
+      system2.assert_no_weights passes; row "C12 request no weights": len(s2_requests) == len(heldout) and
+      system2.assert_request_no_weights passes on every body (None counts as FAIL); row "C12 hosts": len(s2_hosts) ==
+      len(heldout) and every host in expected_hosts; metrics over rows with verdict = S2 final: fd <= 0,
+      acc_nonabstain >= 0.90, abstain_rate <= 0.30.
+  14. metrics: correct = verdict == label among non-abstained; acc = correct / n_nonabstained (None if 0 -> C7 FAIL);
+      abstain_rate = #abstain / n; derived_recall = #(label derived and verdict derived) / #derived (reported only);
+      acc_by_family = {family of the pair (reference family for derived; "a|b" sorted for not_derived): acc_nonabstain or
+      None} (reported only, no check uses it).
+  15. static_import_violations(repo_root) (C10, transitive; validation r2 minor 9): module -> file map: "scout" ->
+      scout/__init__.py, "scout.x" -> scout/x.py or scout/x/__init__.py. Start a worklist with OFFLINE_ROOTS, and add
+      "scout" (the package __init__ runs on every import). For each module, ast-parse its file and collect imported module
+      names: `import a.b` -> "a.b"; `from a.b import c` -> "a.b" and "a.b.c"; relative `from . import c` / `from .x import
+      c` resolved against the module's package (scout). Every collected name in FORBIDDEN_IMPORTS (or starting with one
+      of them + ".") -> violation "<chain>: <name>", where chain is the import path from the root, e.g.
+      "scout/analysis.py -> scout/suggest.py: scout.hub". Every collected name that starts with "scout" and has an existing
+      file, and is not forbidden, is added to the worklist (visited set; forbidden modules are never walked). Missing files
+      are skipped. Output sorted, deduplicated.
+acceptance:
+  tests:
+    - "tests/test_exit_expectations_p3.py builds hand-written P3Inputs (tiny labeled.v1 dicts via scout.groundtruth.validate with train >= 2 and calibration >= 1 same_shape pairs, fake LoadedCards with minimal dicts + small pyarrow tables carrying name/shape rows for stacks[0] k_proj/v_proj, ledger entries built with p3_ledger.append on a tmp file, a JevModel from T210 helpers)"
+    - "a passing input -> every s1_checks and s2_checks row ok; preflight_checks rows are exactly the C0-C5 and 'C10 imports' rows of s1_checks, and preflight_checks(inp) with heldout/sweep/reports/s2 all None does not raise and passes"
+    - "failing inputs (parametrized; each makes at least the named check fail and nothing raises): pins missing a repo (C0); labeled sha differs from FREEZE_LABELED (C1); FREEZE_LABELED later than a Card's scanned_at (C1); a verify:true entry (C1); synthetic without allowance (C1); a pair crossing splits (C2); 15 held-out pairs (C2); YAML hard flag disagreeing with hidden sizes (C2); YAML same_shape true where the k_proj shapes differ (C2); only 1 computed same-shape pair in train (C2 same-shape train); 0 in calibration (C2 same-shape calibration); Card v1 (C3); options anchors False (C3); gate via api-confirm (C3); cli-flag pair not in any SCAN confirm entry (C3); totals.weight > cap (C3); no COMPUTE purge (C3); Card parquet hash differs from card_files (C3 card files); repo absent from every SCAN card_files (C3 card files); ledger chain broken (C4 ledger chain); tracked_head not a prefix (C4 ledger append-only); tracked_head None (C4 ledger append-only); model sha differs from FREEZE_MODEL (C4 model file / ledger model); second FREEZE_MODEL without refreeze_reason (C4 ledger model); FREEZE_MODEL with code_changed_since_labeled ['scout/jev.py'] and no reason (C4 ledger code change); an EVAL_ATTEMPT naming another model sha (C4 ledger attempts); a held-out repo in an EVAL_ATTEMPT before FREEZE_LABELED (C4 ledger fresh held-out); a SCAN confirm after FREEZE_MODEL (C4 ledger no rescan); model doc containing '\"L27\"' (C4 model file); CKA_PARAMS min_common changed (C5); JEV_PARAMS l2_lambda changed (C5); one held-out not_derived with verdict derived (C6); acc 0.857 (C7); all abstain (C7 and C8); abstain 6/19 (C8); sweep of 99 (C9); 1 derived in sweep (C9); s1_requests 1 (C10 network); a report without disclaimers (C11); s2 None (C12); an S2 final derived where S1 abstained (C12); S2 caveats missing (C12); an s2 input with a 65-float list (C12); s2 host 'evil.example' (C12); S2 abstaining on 7/19 (C12); one out with available False and unavailable_reason 'max_tokens' while its final verdicts equal S1 and all S2 metrics pass (C12 available FAIL); every out unavailable (C12 FAIL, not a pass); a sent request body with a 'stat_' key inside the user JSON (C12); s2_requests shorter than heldout (C12); a hosts list with one entry for 19 pairs (C12); a Card with empty gate and note 'sigma: nothing sampleable' (C3, actual mentions zero-read); FREEZE_MODEL with code_dirty True (C4 code frozen); git_exit.code_changed_since == ['scout/jev.py'] (C4 code frozen); git_exit None (C4 code frozen and ledger append-only)"
+    - "test_import_walk (tmp tree): scout/__init__.py empty; scout/features.py imports scout.align; scout/align.py imports scout.hub -> one violation 'scout/features.py -> scout/align.py: scout.hub'; scout/jev.py with 'from . import gate' -> violation for scout.gate; scout/__init__.py importing scout.cli which imports scout.scan -> violation through scout/__init__.py; a direct 'from scout import hub' in scout/system2.py -> violation; an import cycle (align <-> layercorr) terminates"
+    - "test_import_walk_repo: static_import_violations(<the real repo root>) == [] (if not, the implementer stops and reports the chain as a finding; the check is never weakened)"
+    - "test_kv_signature: a card with stacks[0] prefix 'model.layers', indices [0..3], depth 4 and rows for model.layers.0.self_attn.k_proj.weight [64,128] / v_proj [64,128] -> (4, (64,128), (64,128)); a missing v row -> None"
+    - "test_boundaries: acc exactly 0.90 passes; abstain exactly 0.30 passes (e.g. 3/10); fd 0 passes"
+    - "test_frozen_literals: every FROZEN_* equals the live module value today"
+    - "test_threshold_constants: the constants have exactly the values of this task"
+  commands:
+    - pytest -q tests/test_exit_expectations_p3.py
+    - pytest -q
+out_of_scope:
+  - loading files, running S1/S2, appending to the ledger, network (T217)
+  - the ledger format and gate/audit rules themselves (T218)
+  - the P2 C8 amendment (T202)
+  - changing any threshold after a real run (human decision + plan revision)
+invariants_touched: [1, 2, 3, 4, 5]
+decisions: [D45, D51, D52, D53, D54]

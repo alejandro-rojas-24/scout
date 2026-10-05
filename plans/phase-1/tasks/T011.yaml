@@ -58,3 +58,20 @@ out_of_scope:
   - layout/coordinates (frontend's job)
   - attribution coloring (Phase 4)
 invariants_touched: [1]
+
+amendments:
+  - "2026-10-03 orchestrator (from T011 review r1): consecutive integer markers keep one origin per marker. A node's `count` is the FIRST marker's count, which is the Card stack depth when that marker is the Card '#' stack, never overridden by a literal. The label shows each marker's own count in order, e.g. `input_blocks ×12 ×2`."
+  - "2026-10-03 orchestrator: a leading integer segment (root-level Card stack, prefix '') uses the root as predecessor: id '[#]', parent '', kind 'stack', count = Card depth, label '×N'."
+  - "2026-10-03 orchestrator: a tensor node's dtype is 'varies' whenever the dtypes of its rows differ, independent of shape. shape is None only when shapes differ."
+  - "2026-10-05 orchestrator (T011 follow-up): rule 1's 'all-digit segment' means structure.py's index rule (scout.structure._is_index), not str.isdigit."
+  - "2026-10-03 orchestrator: if a Parquet stack_prefix or expert template has no matching Card structure entry, raise ScoutError (no silent count=1)."
+
+decisions:
+  - "Each merged segment carries an ordered list of marker origins (card/lit/exp), one per marker. Per node and marker position, view.py records a fixed count (Card stack depth or n_experts) and/or a set of distinct literal indices. A marker's count is the fixed count if one exists, else the number of distinct literals. Literals never override a Card count."
+  - "Node count = the FIRST marker's count. Node kind also comes from the FIRST marker ('#' or literal -> stack, '*' -> expert_group), so kind and count stay consistent. This differs from rule 3 ('last segment ends with') only for the theoretical '[*][#]' case (experts.N.M); '[#][*]' cannot occur because '*' always follows a literal 'experts' segment."
+  - "Label = the segment without its markers, then ' ×N' for each marker in order (e.g. 'input_blocks ×12 ×2'). With an empty base (root-level stack), the label is '×N' with no leading space."
+  - "Leading marker: any leading '#', literal digit or '*' merges into an empty predecessor, so the ids are '[#]' / '[*]' with parent ''. Amendment 2 is applied to literal leading digits too, not only to the Card stack with prefix ''."
+  - "Rule 6 as amended: shape = None iff the shapes differ; dtype = 'varies' iff the dtypes differ. A shape mismatch with equal dtypes now keeps the common dtype (previously it forced 'varies')."
+  - "Mismatch (amendment 4): a '#' row whose stack_prefix (including None) has no Card stack, or a '*' template with no Card expert group, raises ScoutError naming the row's collapsed_name and the missing key. No count=1 fallback for Card markers. A literal-only marker with no literals cannot occur, but falls back to 1."
+  - "Index rule: view.py imports scout.structure._is_index (read-only use), so a segment is a stack/literal index exactly when structure.py treats it as one (ASCII digits, 1..9 chars). Longer digit runs (e.g. '1234567890') stay plain segments. If two rows ever give one node marker different Card counts, build_view raises ScoutError; there is no max() merge (replaces the earlier max decision, which was only reachable through the >9-digit mismatch now removed)."
+  - "New tests build custom repos via write_sharded(n_shards=1) + config.json + DEFAULT_README through build_fixture_card. The round-trip test uses the MoE fixture (stacks + expert group) and compares the full view dicts with ==."

@@ -1,0 +1,118 @@
+id: T410
+title: "Report renderer - render(bundle) -> deterministic self-contained HTML (inline CSS with print sheet, inline SVG depth strip, no JavaScript, one JSON bundle script), every value a <data> element with its SOURCE and format, digit-free templates, verdicts only from jev.v1, visible-text extraction"
+depends_on: [T409]
+files:
+  - scout/report/render.py
+  - scout/report/templates.py
+  - tests/test_report_render.py
+route: opus
+spec_complete: true
+interface: |
+  scout/report/templates.py (pure data; no scout imports except scout.caveats and scout.analysis.VERDICT_SEMANTICS):
+    CSS: str                               # inline stylesheet incl. "@media print {...}"; no url(), no @import
+    SUMMARY_TEMPLATES: dict[str, str]      # template id -> text with {slot} placeholders; digit-free
+    SECTION_TITLES: dict[str, str]         # section id -> heading text; digit-free
+    LABELS: dict[str, str]                 # fixed UI strings (table headers, "not run", ...); digit-free
+  scout/report/render.py:
+    FORMATTERS: dict[str, Callable[[Any], str]]
+        # "f1": f"{x:.1f}", "f2": f"{x:.2f}", "f3": f"{x:.3f}", "f4": f"{x:.4f}", "e1": f"{x:.1e}", "int": str(int(x)),
+        # "id": str(x), "str": str(x); None -> "-" for every format
+    def format_value(value, fmt: str) -> str
+    def parse_source(source: str) -> tuple[str, str | None, str]    # (kind, id-or-None, json_pointer); ValueError if malformed
+    def resolve_in_bundle(bundle: dict, source: str) -> Any         # card -> data.cards[id]; analysis -> data.analysis[i];
+                                                                    # model -> data.models[id] (id = the 64-hex model sha256;
+                                                                    #   KeyError when absent or != inputs.model.sha256);
+                                                                    # ledger -> data.ledger_entries["<name>:<seq>"] (whole entry);
+                                                                    # s2in -> data.s2in; s2 -> data.s2; bundle -> the bundle itself;
+                                                                    # RFC 6901 pointer; KeyError if absent
+    def data_el(bundle: dict, source: str, fmt: str, *, cls: str | None = None, extra: dict | None = None) -> str
+        # '<data value="{json.dumps(raw)} escaped" data-src="{source}" data-fmt="{fmt}"[ class=..][ attrs]>{escaped text}</data>'
+    def render(bundle: dict) -> bytes      # UTF-8 HTML; a pure function of the bundle
+    def visible_text(html: bytes) -> str   # text content outside <script>/<style>, whitespace-collapsed, block elements on new lines
+    def extract_bundle(html: bytes) -> dict # the JSON in <script type="application/json" id="scout-report-bundle">
+behavior: |
+  1. Document: "<!doctype html>", <html lang="en">, <head> with <meta charset="utf-8">, the static <title>scout lineage
+     report</title> (no data in the title), <style> CSS, then
+     <body> with the sections in REPORT_PARAMS["sections"] order, each <section id="{id}"> with <h2>SECTION_TITLES[id]
+     </h2>. A section with status not_run renders <p class="not-run">LABELS["not_run"]: <span class="reason">{reason}
+     </span></p> and nothing else. Last child of <body>: <script type="application/json" id="scout-report-bundle">
+     {canonical JSON of the bundle with "</" escaped as "<\/"}</script>.
+  2. Every value from data goes through data_el; the bundle JSON is canonical (sort_keys, separators (",", ":"),
+     ensure_ascii). Output bytes are identical for identical bundles (no dict-order, time or locale dependence).
+  3. header: static title; subject repo@sha (fmt id), component; generated_at (fmt str, class "time"); scout version.
+  4. summary: one <li> per bundle.summary item: SUMMARY_TEMPLATES[template] with each {slot} replaced by
+     data_el(slot source, fmt from REPORT_PARAMS["formats"] by slot kind: p -> p_derived "f2", verdicts "str" inside
+     class "verdict" with data-verdict attribute, counts "int", ratios "f3").
+  5. caveats: <ul class="caveat"> with the three DISCLAIMERS (caveats.DISCLAIMERS) as static text, one <li> each.
+  6. subject: key fields; model-card claims labelled "claimed by the model card" (base_model list, relation, licence);
+     architecture: one row per stack (prefix, depth), params_total, params_by_dtype, format.
+  7. system1: <p class="semantics">VERDICT_SEMANTICS</p>; then <p class="thresholds"> with LABELS["thresholds"] and the
+     two decision thresholds as data_el(f"model:{sha}#/thresholds/hi", "f2") and (.../thresholds/lo, "f2"), and the
+     calibration note as data_el(f"model:{sha}#/params/calibration_note", "str") (sha = bundle.inputs.model.sha256; no
+     other model pointer is ever emitted); table rows per analysis pair: reference title (id),
+     verdict <td> containing data_el(analysis:0#/pairs/i/system1/verdict, "str", cls "verdict", data-verdict=value),
+     p_derived (f2), abstain reason (<span class="reason"> via data_el, only when verdict abstain), structure kind and
+     mode; claims table (claimed_base, status); unclaimed detections. No verdict word is ever produced by any other
+     code path; sigma-curve r values are never labelled with a verdict.
+  8. system2: heading note LABELS["s2_note"]; per pair: the S2 final verdict as data_el(s2 pointer) with class
+     "s2-verdict" (never "verdict": L4a counts only System 1 verdicts, and S2 can only keep or soften them), the reason
+     code, and the explanation as escaped prose (LLM text; its digits are checked by L2c).
+  9. attribution: SECTION_TITLES["attribution"] == "Block attribution of the published subject (unmodified)" and
+     LABELS["attrib_scope"] (one sentence under the heading) == "These counts are for the subject as published; the
+     retrain section reports its own counts for the retrained copy." (validation r1 major 4: reader Q4 asks for this
+     section's counts, never the trace's); an inline SVG depth strip with one <rect> per block, filled by status with the P4 T318 palette; the
+     SVG contains no text and no digit (block indices appear only in the table); a table per reference (title id, role,
+     status as data_el(..., "str", cls "attrib-status"), n_attributed/n_tested int, control mean f2, control sd f2, crit f2, df int, and for a
+     reference with status abstain or untestable its reason as data_el(.../references/j/reason, "str") inside
+     <span class="reason"> in the same row (validation r1 minor: L5b requires it)), each cell a data_el into
+     card:<obj>#/stats/attribution/references/j/...; a table per block (index int, status, primary title, z_adj f1,
+     p e1, z_pair f1; the reason of an untestable block in <span class="reason">); <p class="caveat">ATTRIBUTION_CAVEAT</p>.
+  10. retrain: recipe (blocks int list items, stack prefix id, budget str, seed int, lr str, max_steps int, eval_every
+      int, data repo@sha id, train/eval file id, data licence str), baseline (ppl f2; per flagged block: index int,
+      z_adj f1, attributed str), right after re-initialisation (ppl_ratio f3, top1_agreement f3), trace table (one row
+      per trace row: step int, ppl_ratio f3, top1_agreement f3, then per flagged block one cell with its z_adj f1 and
+      its attributed boolean str; unflagged_attributed int of unflagged_tested int under the header LABELS["trace_unflagged"] == "unflagged blocks
+      still attributed (retrained copy)"; control_hits int; base_status str (cls "attrib-status": the value can be "abstain",
+      which L4b would otherwise count outside every verdict container; validation r2 minor), null_ok str, control_ok
+      str and signal_dropped str, each its own cell (validation r1 minor: an abstention row must not read as a drop);
+      quality_ok str), outcome str, stop step int and confirm step int (or LABELS["none"] == "none" when null), post_stop_max_z_adj f1,
+      reinit digest id, retrained digest id, "weights kept: no" (static), <p class="caveat">RETRAIN_CAVEAT</p>. Only
+      stored fields are rendered: no count, maximum or ratio is computed by the renderer (every data_el must satisfy
+      format_value(resolved) == text, so a derived number would be untraceable).
+  11. license: table (model title, licence str or LABELS["unknown"]) for subject, references and data; then
+      <p class="license-question">LICENSE_QUESTION</p>. A reference row with missing true (an attribution reference
+      whose Card is not in the store, T409 behavior 7) renders its title from the attribution Card pointer and
+      LABELS["no_card"] == "unknown (no Card for this model in the store)" in place of a licence (validation r2 major 5).
+  12. provenance: table of Cards (role, repo@sha id, component, object id, schema, citation ledger/seq/line_sha256
+      as data_els into card or ledger sources, or LABELS["no_ledger"]); model sha and its citation; the ledgers table;
+      and the report metadata (generated_at, scout_version, code_id, params_digest, regenerate command) as data_els with
+      source kind "bundle" (bundle:#/generated_at, #/scout_version, #/code_id, #/params_digest, #/regenerate,
+      #/inputs/...). "bundle" sources are allowed only for pointers under /generated_at, /scout_version, /code_id,
+      /params_digest, /regenerate and /inputs (T411 L2b enforces it); they are verified by L10b, which rebuilds the
+      bundle from the store, the model and the ledgers.
+  13. visible_text: html.parser-based; drops <script> and <style> contents; returns text with "\n" between block
+      elements (p, li, tr, h1-h3, section, pre, div); used by the linter and the LLM reader.
+  14. The file never references an external resource: no <link>, no src attribute, no url() in CSS.
+acceptance:
+  tests:
+    - "fixtures: bundles from the T409 test fixtures (full bundle; a bundle with every section not_run except subject; a bundle with S2 via StubS2Client)"
+    - "test_deterministic: render(b) == render(copy.deepcopy(b)) byte for byte; changing generated_at changes only the header time and the bundle script"
+    - "test_digit_free_templates: every string in SUMMARY_TEMPLATES, SECTION_TITLES, LABELS and CSS-free visible text of a render of a bundle whose data values are all non-numeric contains no digit (templates.py constants checked directly; CSS may contain digits but is inside <style>)"
+    - "test_no_stray_verdict_words: SUMMARY_TEMPLATES, SECTION_TITLES and LABELS have no match of the plan.md 4.8 verdict_regex; in a full render, every verdict_regex match in visible text lies inside one of the plan.md 4.8 verdict_containers (both as literals in the test: scout.report.lint is T411) (a bundle whose attribution reference has status 'abstain' included, and a retrain bundle whose trace contains a row with base_status 'abstain' (validation r2 minor))"
+    - "test_trace_flags_rendered (validation r1 minor): a trace row with base_status abstain renders base_status, null_ok, control_ok and signal_dropped cells for that row, each a data element resolving to the stored value; the base_status data element has class 'attrib-status'"
+    - "test_license_missing_reference (validation r2 major 5): a bundle whose licence reference row has missing True -> that row shows LABELS['no_card'] and a title data element resolving into the attribution Card; LABELS['no_card'] is digit-free and has no verdict_regex or license_deny match"
+    - "test_every_value_traced: every digit of a full render's visible text lies inside a <data> element or inside #system2 prose (parsed with html.parser)"
+    - "test_data_elements_resolve: for every <data> element: format_value(resolve_in_bundle(bundle, src), fmt) == element text and json.loads(value) == the resolved value"
+    - "test_model_sources: every data-src starting with 'model:' is one of model:<inputs.model.sha256>#/params/calibration_note, #/thresholds/hi, #/thresholds/lo; resolve_in_bundle with another sha -> KeyError"
+    - "test_verdicts_only_from_jev: every element with class 'verdict' has data-src matching ^analysis:0#/pairs/\\d+/system1/verdict$; a bundle whose analysis pairs are removed renders no 'verdict' class"
+    - "test_reference_reason_rendered: a bundle whose attribution reference has status 'abstain' (make_attribution(base_status='abstain', base_reason=...)) -> that reference row contains a span.reason whose data element resolves to the reason"
+    - "test_sections_and_caveats: the three DISCLAIMERS appear once in #caveats; ATTRIBUTION_CAVEAT once in #attribution; RETRAIN_CAVEAT once in #retrain; LICENSE_QUESTION once in #license inside .license-question; not_run sections carry their reason"
+    - "test_self_contained: no 'src=', '<link', '@import' or 'url(' in the output; exactly one <script>, of type application/json"
+    - "test_extract_bundle_roundtrip: extract_bundle(render(b)) == b"
+  commands:
+    - pytest -q tests/test_report_render.py
+    - pytest -q
+out_of_scope:
+  - linting (T411); reader (T412); CLI (T414)
+invariants_touched: [3, 4, 5]
+decisions: [D85, D86]
