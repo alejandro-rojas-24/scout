@@ -95,6 +95,14 @@ def cfg(card: dict, *keys: str) -> Any:
     return cur
 
 
+def _peek(fn: Callable[[], Any]) -> Any:
+    """Value of fn(), or an "<unavailable: ...>" marker (never matches a real expected value)."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        return f"<unavailable: {type(e).__name__}: {e}>"
+
+
 def _comp(card: Any) -> str:
     try:
         return card["key"]["component"] or "_model"
@@ -194,7 +202,7 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
             continue
         if has_index:
             add(_eq(t, f"C5 card[{i}] {_comp(card)} tensor_bytes_total == index_total_size",
-                    card["weights"]["index_total_size"], lambda card=card: card["weights"]["tensor_bytes_total"]))
+                    _peek(lambda card=card: card["weights"]["index_total_size"]), lambda card=card: card["weights"]["tensor_bytes_total"]))
 
     # C6 (sanity)
     def c6_counts() -> tuple[Any, bool]:
@@ -214,7 +222,7 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
     # C7
     for i, card in enumerate(r.cards):
         lab = f"card[{i}] {_comp(card)}"
-        add(_eq(t, f"C7 {lab} parquet rows == n_tensors", card.get("weights", {}).get("n_tensors"),
+        add(_eq(t, f"C7 {lab} parquet rows == n_tensors", _peek(lambda card=card: card["weights"]["n_tensors"]),
                 lambda i=i: r.tables[i].num_rows))
 
         def c7_stats(i=i) -> tuple[Any, bool]:
@@ -241,7 +249,7 @@ def common_checks(r: TargetResult, budget_s: float, *, allowed_hosts: Iterable[s
 
     # C9 (sanity)
     for i, card in enumerate(r.cards):
-        add(_eq(t, f"C9 card[{i}] {_comp(card)} params_total == sum(numel)", card.get("weights", {}).get("params_total"),
+        add(_eq(t, f"C9 card[{i}] {_comp(card)} params_total == sum(numel)", _peek(lambda card=card: card["weights"]["params_total"]),
                 lambda i=i: sum(r.tables[i].column("numel").to_pylist())))
 
     # C10
@@ -335,10 +343,7 @@ def expect_qwen3_8b(r: TargetResult) -> list[Check]:
 
 def cfg_value(r: TargetResult, component: str | None, *keys: str) -> Any:
     """config.raw lookup that returns an error marker instead of raising (used as an `expected`)."""
-    try:
-        return cfg(_card(r, component), *keys)
-    except Exception as e:  # noqa: BLE001
-        return f"<unavailable: {type(e).__name__}: {e}>"
+    return _peek(lambda: cfg(_card(r, component), *keys))
 
 
 def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]:
