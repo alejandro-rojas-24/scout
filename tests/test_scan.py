@@ -5,8 +5,11 @@ import json
 import os
 import re
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import scout.scan
@@ -66,6 +69,18 @@ def _stage_order(log):
     return [e.stage for e in log.events if e.event == "stage_start"]
 
 
+def _assert_zero_weight(totals, events, card_paths=()):
+    """Zero weight bytes in the run totals, in every logged event, and in every Card's fetch_log."""
+    assert totals["weight"] == 0
+    for e in events:
+        assert e.bytes_by_class["weight"] == 0, e
+    for cp in card_paths:
+        card, _ = load_card(cp.json_path)
+        assert card["fetch_log"]["totals"]["weight"] == 0
+        for ev in card["fetch_log"]["events"]:
+            assert ev["bytes_by_class"]["weight"] == 0, ev
+
+
 # ---------------------------------------------------------------- acceptance
 
 
@@ -82,7 +97,7 @@ def test_scan_dense_sharded_hub(tmp_path):
     assert card["weights"]["index_path"] == "model.safetensors.index.json"
     assert card["weights"]["index_total_size"] == env.info["total_size"]
     assert table.num_rows == env.info["n_tensors"]
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
     hl = env.info["header_lens"]
     assert len(hl) == 3
     assert res.totals["header"] == sum(8 + n for n in hl.values())
@@ -113,23 +128,50 @@ def test_scan_local_folder(tmp_path):
     assert card["key"]["repo"].startswith("local:")
     assert res.repo.startswith("local:")
     assert card["weights"]["n_tensors"] == info["n_tensors"]
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
     assert _stage_order(log) == ["RESOLVE", "HEADERS", "META", "REPORT"]
 
 
-def test_scan_moe(tmp_path):
+@pytest.mark.parametrize("kind", ["hub", "local"])
+def test_scan_moe(tmp_path, kind):
     env = _hub_with(tmp_path, write_moe_repo)
-    res, _ = _hub_scan(env.hub, env.out)
+    if kind == "hub":
+        res, log = _hub_scan(env.hub, env.out)
+    else:
+        log = ByteLog()
+        res = scan(str(env.root), env.out, log)
+    assert len(res.cards) == 1
     card, _ = load_card(res.cards[0].json_path)
+    if kind == "local":
+        assert card["source"]["revision_kind"] == "local-stat-hash"
+    else:
+        assert card["key"]["revision_sha"] == SHA
     s = card["structure"]
     assert s["expert_groups"][0]["n_experts"] == 4
     assert all(s["stacks"][0]["block_moe"])
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
+
+
+def test_scan_moe_partial_body_reset(tmp_path):
+    env = _hub_with(tmp_path, write_moe_repo)
+    shard = env.info["files"][0]
+    # The first ranged read of this shard (the 8-byte length prefix) is cut off after 4 bytes.
+    env.hub.inject(shard, "reset", times=1, after_bytes=4)
+    res, log = _hub_scan(env.hub, env.out)
+    assert len(res.cards) == 1
+    card, _ = load_card(res.cards[0].json_path)
+    assert card["structure"]["expert_groups"][0]["n_experts"] == 4
+    retries = [e for e in log.events if e.event == "retry" and e.path == shard]
+    assert len(retries) == 1
+    r = retries[0]
+    assert r.bytes == 4
+    assert dict(r.bytes_by_class) == {"meta": 0, "header": 4, "weight": 0}
+    _assert_zero_weight(res.totals, log.events, res.cards)
 
 
 def test_scan_pipeline(tmp_path):
     env = _hub_with(tmp_path, write_pipeline_repo)
-    res, _ = _hub_scan(env.hub, env.out)
+    res, log = _hub_scan(env.hub, env.out)
     cards = {}
     for cp in res.cards:
         c, _ = load_card(cp.json_path)
@@ -149,7 +191,7 @@ def test_scan_pipeline(tmp_path):
     mc = [c["model_card"] for c in cards.values()]
     assert all(m == mc[0] for m in mc) and mc[0]["present"] is True
     assert cards["transformer"]["config"]["path"] == "transformer/config.json"
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
     # README is read exactly once.
     assert sum(1 for p, _, _ in env.hub.cdn_reads if p == "README.md") == 0
     readme_reqs = [r for r in env.hub.requests if r.url.path.endswith("/README.md")]
@@ -183,7 +225,7 @@ def test_scan_network_retry(tmp_path):
     res, log = _hub_scan(env.hub, env.out)
     assert len(res.cards) == 1
     assert any(e.event == "retry" and e.path == shard for e in log.events)
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
 
 
 def test_scan_network_fail(tmp_path):
@@ -195,7 +237,7 @@ def test_scan_network_fail(tmp_path):
         _hub_scan(env.hub, env.out, log=log)
     assert _all_files(env.out) == []
     assert any(e.event == "error" for e in log.events)
-    assert log.totals["weight"] == 0
+    _assert_zero_weight(log.totals, log.events)
 
 
 def test_scan_bin_only(tmp_path):
@@ -209,13 +251,13 @@ def test_scan_bin_only(tmp_path):
     out = tmp_path / "out"
     with pytest.raises(NoSafetensorsError):
         _hub_scan(hub, out, log=log)
-    assert log.totals["weight"] == 0
+    _assert_zero_weight(log.totals, log.events)
     assert _all_files(out) == []
     # Local folder too.
     log2 = ByteLog()
     with pytest.raises(NoSafetensorsError):
         scan(str(root), out, log2)
-    assert log2.totals["weight"] == 0
+    _assert_zero_weight(log2.totals, log2.events)
 
 
 def test_scan_threshold(tmp_path):
@@ -225,6 +267,8 @@ def test_scan_threshold(tmp_path):
         _hub_scan(env.hub, env.out, log=log)
     assert _all_files(env.out) == []
     assert any(e.event == "error" for e in log.events)
+    assert env.hub.requests == []  # refused at preflight, before any request is sent
+    assert env.hub.cdn_reads == []
 
 
 def test_no_extra_files(tmp_path, monkeypatch):
@@ -288,8 +332,11 @@ def test_make_source(tmp_path):
 # ---------------------------------------------------------------- failure cleanup
 
 
-def test_write_failure_removes_cards_of_this_scan(tmp_path, monkeypatch):
+@pytest.mark.parametrize("nested", [False, True])
+def test_write_failure_removes_cards_of_this_scan(tmp_path, monkeypatch, nested):
     env = _hub_with(tmp_path, write_pipeline_repo)
+    if nested:
+        env.out = tmp_path / "a" / "b" / "out"
     real = scout.scan.write_card
     calls = []
 
@@ -305,6 +352,9 @@ def test_write_failure_removes_cards_of_this_scan(tmp_path, monkeypatch):
         _hub_scan(env.hub, env.out, log=log)
     assert len(calls) == 3
     assert _all_files(env.out) == []  # files and the dirs this scan created are gone
+    assert not env.out.exists()
+    if nested:
+        assert not (tmp_path / "a").exists()
     assert any(e.event == "error" for e in log.events)
 
 
@@ -399,14 +449,15 @@ def test_pipeline_non_safetensors_warning(tmp_path):
     (root / "model_index.json").write_text(json.dumps(mi))
     (root / "safety_checker").mkdir()
     (root / "safety_checker" / "pytorch_model.bin").write_bytes(b"\x00" * 16)
-    res = scan(str(root), tmp_path / "out", ByteLog())
+    log = ByteLog()
+    res = scan(str(root), tmp_path / "out", log)
     assert len(res.cards) == 3
     for cp in res.cards:
         card, _ = load_card(cp.json_path)
         assert "safety_checker: non-safetensors weights skipped" in card["structure"]["warnings"]
         comps = {c["name"]: c for c in card["pipeline"]["components"]}
         assert comps["safety_checker"]["has_weights"] is False
-    assert res.totals["weight"] == 0
+    _assert_zero_weight(res.totals, log.events, res.cards)
 
 
 def test_pipeline_without_weights(tmp_path):
@@ -444,5 +495,94 @@ def test_scan_closes_owned_client(tmp_path, monkeypatch):
     closed = []
     orig = scout.scan.HubSource.close
     monkeypatch.setattr(scout.scan.HubSource, "close", lambda self: (closed.append(self), orig(self)))
-    _hub_scan(env.hub, env.out)
-    assert len(closed) == 1
+
+    # Caller's client: scan closes its source, but the client stays open and usable.
+    client = env.hub.client()
+    try:
+        scan(REPO, env.out, ByteLog(), client=client, endpoint=HUB)
+        assert len(closed) == 1
+        assert not client.is_closed
+        assert client.get(f"{HUB}/api/models/{REPO}/revision/main").status_code == 200
+    finally:
+        client.close()
+
+    # No client given: scan's HubSource creates one, and scan closes it.
+    created = []
+    real_client = httpx.Client
+
+    def factory(*a, **kw):
+        kw.setdefault("transport", env.hub.transport())
+        c = real_client(*a, **kw)
+        created.append(c)
+        return c
+
+    monkeypatch.setattr(httpx, "Client", factory)
+    res = scan(REPO, tmp_path / "out2", ByteLog(), endpoint=HUB)
+    assert len(res.cards) == 1
+    assert len(closed) == 2
+    assert len(created) == 1 and created[0].is_closed
+
+
+# ---------------------------------------------------------------- header thread pool
+
+
+class _Boom(Exception):
+    pass
+
+
+@pytest.mark.parametrize("max_workers", [1, 2])
+def test_header_failure_cancels_pending_and_waits_for_running(tmp_path, monkeypatch, max_workers):
+    root = tmp_path / "repo"
+    info = write_dense_repo(root, n_shards=6)
+    shards = list(info["files"])
+    assert len(shards) == 6
+    first = shards[0]
+    real = scout.scan.read_header
+    lock = threading.Lock()
+    started: list[str] = []
+    finished: list[str] = []
+    other_started = threading.Event()
+    boom = _Boom("first shard failed")
+    sleep_s = 0.3
+
+    def fake(source, path, size):
+        with lock:
+            started.append(path)
+        try:
+            if path == first:
+                if max_workers > 1:
+                    # Let a sibling read get going, so there is a running read to wait for.
+                    assert other_started.wait(5)
+                raise boom
+            other_started.set()
+            time.sleep(sleep_s)
+            return real(source, path, size)
+        finally:
+            with lock:
+                finished.append(path)
+
+    monkeypatch.setattr(scout.scan, "read_header", fake)
+    out = tmp_path / "out"
+    log = ByteLog()
+    with pytest.raises(_Boom) as excinfo:
+        scan(str(root), out, log, max_workers=max_workers)
+    with lock:
+        started_at_raise = list(started)
+        finished_at_raise = list(finished)
+
+    # The original exception object propagates, unwrapped.
+    assert excinfo.value is boom
+    assert started_at_raise[0] == first
+    # Every read that started had finished before scan raised.
+    assert sorted(finished_at_raise) == sorted(started_at_raise)
+    if max_workers > 1:
+        assert len(started_at_raise) >= 2
+    # Pending reads were cancelled: at most one per worker plus the one the failed
+    # worker may have picked up before cancellation; the rest never start.
+    assert len(started_at_raise) <= max_workers + 1 < len(shards)
+    time.sleep(sleep_s * 2)
+    with lock:
+        assert started == started_at_raise
+        assert finished == finished_at_raise
+    assert _all_files(out) == []
+    assert any(e.event == "error" and "_Boom" in (e.note or "") for e in log.events)
