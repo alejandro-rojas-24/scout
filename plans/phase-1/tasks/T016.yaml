@@ -87,3 +87,6 @@ decisions:
   - "E3 transformer: exact prefix 'transformer_blocks' via _exact_prefix_checks (existence Check + depth Check, depth also type-equal); text_encoder 'layers'/'blocks' stay suffix matches as the plan says."
   - "E3 architectures: must be a list and contain 'Qwen2_5_VLForConditionalGeneration' (a str with that substring fails)."
   - "Removed the dead _set helper (it was in tests/test_exit_expectations.py, not the script). Test fixture now follows the plan layout (<tmp>/o__n/<sha>/_model.*), sets Parquet metadata, and records the API call as T015 does (orig_path None)."
+  # follow-ups after re-review PASS
+  - "E1/E2/E3: new Check '<E> every card key.repo == <target repo>' (Qwen/Qwen3-8B, Qwen/Qwen3-30B-A3B, Qwen/Qwen-Image); it needs >= 1 card and every card's key.repo to equal the repo exactly, so a fork or mirror at the same sha fails. The repo is hard-coded per expectation function, matching its DEFAULT_EXPECTATIONS key."
+  - "C10: WEIGHT_EXTENSIONS is copied from scout.bytelog.WEIGHT_EXTENSIONS rather than imported, to keep the evidence independent; test_weight_extensions_match_bytelog guards against drift. Any record (any status) whose normalised orig_path ends, case-insensitively, in a weight extension other than .safetensors is an offender in the aggregate 'C10 every wire record maps ...' Check."

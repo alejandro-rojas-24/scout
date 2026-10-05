@@ -29,10 +29,10 @@ def _stats() -> dict:
 
 def _card(component, *, config=None, model_type=None, archs=None, class_name=None, files=None, n_tensors=2,
           params_total=10, stacks=None, groups=None, index_path=None, index_total_size=None,
-          tensor_bytes_total=None, license_="apache-2.0", base_model=None, pipeline=None, sha=SHA):
+          tensor_bytes_total=None, license_="apache-2.0", base_model=None, pipeline=None, sha=SHA, repo="o/n"):
     return {
         "schema_version": "card.v0",
-        "key": {"repo": "o/n", "revision_sha": sha, "component": component},
+        "key": {"repo": repo, "revision_sha": sha, "component": component},
         "source": {"kind": "hub", "requested_revision": sha, "revision_kind": "git", "local_path": None,
                    "endpoint": "https://huggingface.co"},
         "model_card": {"present": True, "claimed": True, "base_model": base_model or [], "license": license_,
@@ -72,7 +72,7 @@ def _qwen3_8b():
     cfgraw = {"num_hidden_layers": 36}
     card = _card(None, config=cfgraw, model_type="qwen3", archs=["Qwen3ForCausalLM"], n_tensors=399,
                  params_total=8190735360, stacks=[_stack("model.layers", 36)],
-                 base_model=["Qwen/Qwen3-8B-Base"])
+                 base_model=["Qwen/Qwen3-8B-Base"], repo="Qwen/Qwen3-8B")
     card["weights"]["params_by_dtype"] = {"BF16": 8190735360}
     return _res([card])
 
@@ -83,7 +83,7 @@ def _qwen3_30b():
              "params_per_expert": 4718592, "tensors_per_expert": 3, "homogeneous": True}
     card = _card(None, config=cfgraw, model_type="qwen3_moe", n_tensors=18867, params_total=30532122624,
                  stacks=[_stack("model.layers", 48, moe=True, n_experts=128)], groups=[group],
-                 base_model=["Qwen/Qwen3-30B-A3B-Base"])
+                 base_model=["Qwen/Qwen3-30B-A3B-Base"], repo="Qwen/Qwen3-30B-A3B")
     strip = {"prefix": "model.layers", "depth": 48, "cells": [
         {"index": i, "params": 1, "signature": "s", "moe": True, "n_experts": 128} for i in range(48)]}
     view = _view(None, nodes=[{"id": "x", "kind": "expert_group", "count": 128}, {"id": "y", "kind": "stack",
@@ -99,11 +99,12 @@ def _image():
         {"name": "transformer", "library": "d", "class_name": "X", "has_weights": True},
         {"name": "vae", "library": "d", "class_name": "V", "has_weights": True}]}
     te = _card("text_encoder", config={"num_hidden_layers": 28, "vision_config": {"depth": 32}},
-               archs=["Qwen2_5_VLForConditionalGeneration"], pipeline=pipe,
+               archs=["Qwen2_5_VLForConditionalGeneration"], pipeline=pipe, repo="Qwen/Qwen-Image",
                stacks=[_stack("model.layers", 28), _stack("visual.blocks", 32)])
     tr = _card("transformer", config={"num_layers": 60}, class_name="QwenImageTransformer2DModel", pipeline=pipe,
+               repo="Qwen/Qwen-Image",
                stacks=[_stack("transformer_blocks", 60)])
-    vae = _card("vae", class_name="AutoencoderKLQwenImage", pipeline=pipe,
+    vae = _card("vae", class_name="AutoencoderKLQwenImage", pipeline=pipe, repo="Qwen/Qwen-Image",
                 files=[{"path": "vae/diffusion_pytorch_model.safetensors"}])
     return _res([te, tr, vae])
 
@@ -776,3 +777,36 @@ def test_e3_pipeline_identical_across_cards():
     assert any(not c.ok and "identical pipeline" in c.name for c in checks)
     res.cards[2]["pipeline"] = None
     assert any(not c.ok and "identical pipeline" in c.name for c in expect_qwen_image(res))
+
+
+# ---------------------------------------------------------------------------
+# follow-ups: target repo per expectation; non-safetensors weight requests
+
+
+@pytest.mark.parametrize("builder,fn,label", [(_qwen3_8b, expect_qwen3_8b, "E1"),
+                                              (_qwen3_30b, expect_qwen3_30b_a3b, "E2"),
+                                              (_image, expect_qwen_image, "E3")])
+@pytest.mark.parametrize("which", ["all", "one"])
+def test_expect_card_repo_is_target_repo(builder, fn, label, which):
+    res = copy.deepcopy(builder())
+    cards = res.cards if which == "all" else res.cards[-1:]
+    for c in cards:
+        c["key"]["repo"] = "someone/fork-of-qwen"        # same sha, same content, different repo
+    checks = fn(res)
+    assert any(not c.ok and c.name.startswith(f"{label} every card key.repo ==") for c in checks)
+
+
+def test_weight_extensions_match_bytelog():
+    from scout.bytelog import WEIGHT_EXTENSIONS
+    assert set(ee.WEIGHT_EXTENSIONS) == set(WEIGHT_EXTENSIONS)
+
+
+@pytest.mark.parametrize("ext", [e for e in ee.WEIGHT_EXTENSIONS if e != ".safetensors"] + [".BIN", ".GGUF"])
+@pytest.mark.parametrize("status", [200, 302, 404])
+def test_c10_non_safetensors_weight_request_is_offender(tmp_path, ext, status):
+    r = _common(tmp_path)
+    orig = _resolve("pytorch_model" + ext)              # right repo and pin; any status, even with a Range
+    r.wire.append({"method": "GET", "url": "https://huggingface.co" + orig, "orig_path": orig,
+                   "range": "bytes=0-7", "status": status, "location": None, "body_bytes": 0})
+    fails = _fails(common_checks(r, 10.0), "C10 every wire record maps")
+    assert fails and "non-safetensors weight file" in fails[0].actual

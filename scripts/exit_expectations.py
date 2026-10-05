@@ -215,6 +215,14 @@ def _is_weight_name(path: str) -> bool:
     return path.lower().endswith(".safetensors")
 
 
+# Same set as scout.bytelog.WEIGHT_EXTENSIONS (copied, not imported: independent evidence; a test guards drift).
+WEIGHT_EXTENSIONS: tuple[str, ...] = (
+    ".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf",
+    ".h5", ".msgpack", ".onnx", ".pb", ".npz", ".pkl",
+)
+_OTHER_WEIGHT_EXTENSIONS = tuple(e for e in WEIGHT_EXTENSIONS if e != ".safetensors")
+
+
 _RANGE_RE = re.compile(r"bytes=(\d+)-(\d+)", re.IGNORECASE)
 
 
@@ -497,6 +505,8 @@ def _c10(t: str, pin: str, cards: list[dict], wire: list[dict], expected_endpoin
             continue
         if not any(p.startswith(pre) for pre in prefixes):
             offenders.append(f"wire[{i}] {p}: not under {sorted(prefixes)}")
+        if p.lower().endswith(_OTHER_WEIGHT_EXTENSIONS):
+            offenders.append(f"wire[{i}] {p}: non-safetensors weight file (Phase 1 reads safetensors headers only)")
         entry = file_map.get(_ext_key(p))
         if not (_is_weight_name(p) or entry is not None):
             continue
@@ -531,11 +541,21 @@ def _c10(t: str, pin: str, cards: list[dict], wire: list[dict], expected_endpoin
 # E1..E3
 
 
+def _repo_check(t: str, label: str, r: TargetResult, repo: str) -> Check:
+    """Every Card's key.repo is the expectation's target repo (a fork or mirror at the same sha must fail)."""
+    def fn() -> tuple[Any, bool]:
+        cards = _list_of(r, "cards")
+        repos = [c["key"]["repo"] for c in cards]
+        return sorted(set(map(str, repos))), bool(cards) and all(x == repo for x in repos)
+    return _run(t, f"{label} every card key.repo == {repo}", repo, fn)
+
+
 def expect_qwen3_8b(r: TargetResult) -> list[Check]:
     t = r.target
     c = lambda: _card(r, None)  # noqa: E731
     out = [
         _eq(t, "E1 number of cards", 1, lambda: len(r.cards)),
+        _repo_check(t, "E1", r, "Qwen/Qwen3-8B"),
         _eq(t, "E1 card component", None, lambda: c()["key"]["component"]),
         _eq(t, "E1 config.model_type", "qwen3", lambda: c()["config"]["model_type"]),
         _eq(t, "E1 config.architectures", ["Qwen3ForCausalLM"], lambda: c()["config"]["architectures"]),
@@ -589,6 +609,7 @@ def expect_qwen3_30b_a3b(r: TargetResult) -> list[Check]:
 
     return [
         _eq(t, "E2 number of cards", 1, lambda: len(r.cards)),
+        _repo_check(t, "E2", r, "Qwen/Qwen3-30B-A3B"),
         _eq(t, "E2 config.model_type", "qwen3_moe", lambda: c()["config"]["model_type"]),
         _eq(t, "E2 n_tensors", 18867, lambda: c()["weights"]["n_tensors"]),
         _eq(t, "E2 params_total", 30532122624, lambda: c()["weights"]["params_total"]),
@@ -706,6 +727,7 @@ def expect_qwen_image(r: TargetResult) -> list[Check]:
 
     out: list[Check] = [
         _eq(t, "E3 number of cards", 3, lambda: len(r.cards)),
+        _repo_check(t, "E3", r, "Qwen/Qwen-Image"),
         _eq(t, "E3 components", {"text_encoder", "transformer", "vae"},
             lambda: {c["key"]["component"] for c in _cards(r)}),
         _run(t, "E3 all cards carry an identical pipeline", "1 distinct pipeline dict", pipeline_same),
